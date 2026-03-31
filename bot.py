@@ -68,7 +68,8 @@ def _tg_user(message) -> str:
     return f"@{u.username}" if u.username else (u.full_name or str(u.id))
 
 
-def _send_long_message(bot, chat_id, text, reply_to_id=None, max_len=4096):
+def _send_long_message(bot, chat_id, text, reply_to_id=None, max_len=4096,
+                       parse_mode=None):
     """Split text into chunks and send as separate messages."""
     while text:
         if len(text) <= max_len:
@@ -79,12 +80,12 @@ def _send_long_message(bot, chat_id, text, reply_to_id=None, max_len=4096):
                 cut = max_len
             chunk, text = text[:cut], text[cut:].lstrip("\n")
         if reply_to_id:
-            bot.send_message(chat_id, chunk,
+            bot.send_message(chat_id, chunk, parse_mode=parse_mode,
                              reply_parameters=telebot.types.ReplyParameters(
                                  message_id=reply_to_id))
             reply_to_id = None  # only reply on the first chunk
         else:
-            bot.send_message(chat_id, chunk)
+            bot.send_message(chat_id, chunk, parse_mode=parse_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -690,8 +691,10 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                     current_date = formatted_date
                     lines.append(f"\n{formatted_date}")
                 lines.append(f"  {time_short} | {e['type']:<11} | {e['achievement']}")
-            _send_long_message(bot, message.chat.id, "\n".join(lines),
-                               reply_to_id=message.message_id)
+            text = "<pre>" + "\n".join(lines) + "</pre>"
+            _send_long_message(bot, message.chat.id, text,
+                               reply_to_id=message.message_id,
+                               parse_mode="HTML")
         else:
             lines = []
             for uuid, entries in sorted(achievements.items(),
