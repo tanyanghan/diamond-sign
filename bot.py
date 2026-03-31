@@ -244,8 +244,8 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict):
         for chat_id in chat_ids:
             try:
                 bot.send_message(chat_id, msg)
-            except Exception:
-                logger.exception("Failed to send notification to chat %s", chat_id)
+            except Exception as e:
+                logger.warning("Failed to send notification to chat %s: %s", chat_id, e)
 
     return notify
 
@@ -577,6 +577,7 @@ def main():
             ("handshake operation timed out", "SSL handshake timed out"),
             ("Bad Gateway",            "Telegram returned 502 Bad Gateway"),
             ("Connection reset by peer", "connection reset by peer"),
+            ("Remote end closed connection without response", "remote end closed connection"),
         )
 
         def filter(self, record):
