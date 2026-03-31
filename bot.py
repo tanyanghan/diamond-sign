@@ -280,6 +280,40 @@ _DEATH_PHRASES = (
 )
 
 
+_DEATH_CATEGORIES = [
+    ("Combat (was slain by)", ["was slain by"]),
+    ("Shot by", ["was shot by"]),
+    ("Blown up", ["was blown up by"]),
+    ("Falls", ["fell from", "fell off", "fell out of", "fell into",
+               "fell while", "hit the ground too hard"]),
+    ("Lava", ["tried to swim in lava"]),
+    ("Fire", ["burned to death", "was burnt to", "went up in flames",
+              "walked into fire"]),
+    ("Drowning", ["drowned"]),
+    ("Withered away", ["withered away"]),
+    ("Impaled", ["was impaled"]),
+    ("Frozen", ["froze to death", "was frozen to death"]),
+    ("Lightning", ["was struck by lightning"]),
+    ("Kinetic energy", ["experienced kinetic energy"]),
+    ("Suffocation", ["suffocated"]),
+    ("Starvation", ["starved to death"]),
+    ("Cactus", ["walked into a cactus", "was pricked to death",
+                "was poked to death"]),
+    ("Dragon", ["was doomed to fall", "was roasted in dragon"]),
+    ("Sonic shriek", ["was obliterated by"]),
+    ("Explosions", ["blew up", "went off with a bang"]),
+    ("Void", ["left the confines of this world"]),
+    ("Magic", ["was killed by magic", "was killed by even more magic"]),
+]
+
+
+def _categorize_death(message: str) -> str:
+    for category, phrases in _DEATH_CATEGORIES:
+        if any(message.startswith(p) for p in phrases):
+            return category
+    return "Other"
+
+
 _pending_uuids: dict = {}  # name -> uuid, populated by UUID line, consumed by join line
 
 
@@ -681,6 +715,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             "/playtime — playtime leaderboard",
             "/achievements [player] — player achievements",
             "/deaths [player] — death history",
+            "/death_summary — deaths grouped by cause",
             "/chat_id — show this chat's ID",
         ]
         if message.chat.type == "private" and is_admin(message.from_user.id, auth):
@@ -918,6 +953,60 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             _send_long_message(bot, message.chat.id, text,
                                reply_to_id=message.message_id,
                                parse_mode="HTML")
+
+    # --- /death_summary ---
+    @bot.message_handler(commands=["death_summary"])
+    def cmd_death_summary(message):
+        if not guard(message):
+            return
+        refresh_player_names(names, _NAMES_PATH)
+        logger.info("DeathSummary: requested by %s", _tg_user(message))
+
+        if not deaths:
+            bot.reply_to(message, "No deaths recorded yet.")
+            return
+
+        # Build category -> {player_name: count}
+        categories = {}
+        grand_total = 0
+        for uuid, entries in deaths.items():
+            player_name = names.get(uuid, uuid)
+            for e in entries:
+                cat = _categorize_death(e["message"])
+                counts = categories.setdefault(cat, {})
+                counts[player_name] = counts.get(player_name, 0) + 1
+                grand_total += 1
+
+        # Format output
+        lines = [f"Death Summary ({grand_total} total)", ""]
+
+        # Use the defined category order, then "Other" last
+        ordered = [cat for cat, _ in _DEATH_CATEGORIES]
+        for cat in ordered:
+            if cat not in categories:
+                continue
+            counts = categories.pop(cat)
+            cat_total = sum(counts.values())
+            lines.append(f"{cat}: {cat_total}")
+            ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+            for player_name, count in ranked:
+                lines.append(f"  {player_name:<16} {count}")
+            lines.append("")
+
+        # Any remaining "Other" deaths
+        if "Other" in categories:
+            counts = categories["Other"]
+            cat_total = sum(counts.values())
+            lines.append(f"Other: {cat_total}")
+            ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+            for player_name, count in ranked:
+                lines.append(f"  {player_name:<16} {count}")
+            lines.append("")
+
+        text = "<pre>" + "\n".join(lines).rstrip() + "</pre>"
+        _send_long_message(bot, message.chat.id, text,
+                           reply_to_id=message.message_id,
+                           parse_mode="HTML")
 
     # --- /scan_deaths ---
     @bot.message_handler(commands=["scan_deaths"])

@@ -51,6 +51,7 @@ The bot will now send join/leave notifications to all authorised chats and respo
 | `/playtime` | Playtime leaderboard |
 | `/achievements [player]` | Show player achievements with timestamps |
 | `/deaths [player]` | Show death history |
+| `/death_summary` | Show deaths grouped by cause with per-player counts |
 | `/chat_id` | Show the current chat's ID |
 | `/authorize <chat_id>` | *(Admin)* Whitelist a group chat |
 | `/revoke <chat_id>` | *(Admin)* Remove a group from the whitelist |
