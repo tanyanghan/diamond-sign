@@ -68,6 +68,25 @@ def _tg_user(message) -> str:
     return f"@{u.username}" if u.username else (u.full_name or str(u.id))
 
 
+def _send_long_message(bot, chat_id, text, reply_to_id=None, max_len=4096):
+    """Split text into chunks and send as separate messages."""
+    while text:
+        if len(text) <= max_len:
+            chunk, text = text, ""
+        else:
+            cut = text.rfind("\n", 0, max_len)
+            if cut <= 0:
+                cut = max_len
+            chunk, text = text[:cut], text[cut:].lstrip("\n")
+        if reply_to_id:
+            bot.send_message(chat_id, chunk,
+                             reply_parameters=telebot.types.ReplyParameters(
+                                 message_id=reply_to_id))
+            reply_to_id = None  # only reply on the first chunk
+        else:
+            bot.send_message(chat_id, chunk)
+
+
 # ---------------------------------------------------------------------------
 # 2. Player Name Registry
 # ---------------------------------------------------------------------------
@@ -88,6 +107,18 @@ def load_player_names(path: Path) -> dict:
 def _save_player_names(names: dict, path: Path) -> None:
     with open(path, "w") as f:
         json.dump(names, f, indent=2)
+
+
+def refresh_player_names(names: dict, path: Path) -> None:
+    with _names_lock:
+        try:
+            if path.exists():
+                with open(path) as f:
+                    disk_names = json.load(f)
+                names.clear()
+                names.update(disk_names)
+        except Exception:
+            logger.exception("Failed to reload player_names.json")
 
 
 def register_player(uuid: str, name: str, names: dict, path: Path) -> None:
@@ -565,6 +596,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_stats(message):
         if not guard(message):
             return
+        refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
         target = args[1].strip().lower() if len(args) > 1 else None
         logger.info("Stats: requested by %s (player=%s)", _tg_user(message), target or "all")
@@ -589,6 +621,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_playtime(message):
         if not guard(message):
             return
+        refresh_player_names(names, _NAMES_PATH)
         logger.info("Playtime: requested by %s", _tg_user(message))
         all_stats = read_player_stats(STATS_DIR, names)
         if not all_stats:
@@ -603,6 +636,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_list(message):
         if not guard(message):
             return
+        refresh_player_names(names, _NAMES_PATH)
         logger.info("List: requested by %s", _tg_user(message))
         if not STATS_DIR.exists():
             bot.reply_to(message, "Stats directory not found.")
@@ -621,6 +655,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_achievements(message):
         if not guard(message):
             return
+        refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
         target = args[1].strip().lower() if len(args) > 1 else None
         logger.info("Achievements: requested by %s (player=%s)", _tg_user(message), target or "all")
@@ -643,14 +678,17 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             lines = [f"Achievements for {player_name}:"]
             for e in sorted(entries, key=lambda x: x["timestamp"]):
                 lines.append(f"  [{e['achievement']}] ({e['type']}) — {e['timestamp']}")
-            bot.reply_to(message, "\n".join(lines))
+            _send_long_message(bot, message.chat.id, "\n".join(lines),
+                               reply_to_id=message.message_id)
         else:
             lines = []
             for uuid, entries in sorted(achievements.items(),
                                         key=lambda x: names.get(x[0], x[0]).lower()):
                 player_name = names.get(uuid, uuid)
                 lines.append(f"{player_name}: {len(entries)} achievement(s)")
-            bot.reply_to(message, "Achievements summary:\n" + "\n".join(lines))
+            _send_long_message(bot, message.chat.id,
+                               "Achievements summary:\n" + "\n".join(lines),
+                               reply_to_id=message.message_id)
 
     # --- /scan_achievements ---
     @bot.message_handler(commands=["scan_achievements"])
@@ -660,6 +698,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
         if not is_admin(message.from_user.id, auth):
             return
         logger.info("ScanAchievements: requested by %s", _tg_user(message))
+        refresh_player_names(names, _NAMES_PATH)
         bot.reply_to(message, "Scanning log files for achievements...")
 
         logs_dir = LOG_PATH.parent
