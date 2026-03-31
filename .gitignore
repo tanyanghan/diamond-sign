@@ -15,6 +15,7 @@ __pycache__/
 auth.json
 player_names.json
 player_achievements.json
+player_deaths.json
 logs/
 
 # IDE

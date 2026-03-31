@@ -181,6 +181,40 @@ def record_achievement(uuid: str, achievement: str, ach_type: str,
 
 
 # ---------------------------------------------------------------------------
+# 2c. Deaths Storage
+# ---------------------------------------------------------------------------
+_DEATHS_PATH = Path(__file__).parent / "player_deaths.json"
+_deaths_lock = threading.Lock()
+
+
+def load_deaths(path: Path) -> dict:
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Failed to load player_deaths.json")
+    return {}
+
+
+def _save_deaths(deaths: dict, path: Path) -> None:
+    with open(path, "w") as f:
+        json.dump(deaths, f, indent=2)
+
+
+def record_death(uuid: str, message: str, timestamp: str,
+                 deaths: dict, path: Path) -> bool:
+    with _deaths_lock:
+        entries = deaths.setdefault(uuid, [])
+        for e in entries:
+            if e["message"] == message and e["timestamp"] == timestamp:
+                return False
+        entries.append({"message": message, "timestamp": timestamp})
+        _save_deaths(deaths, path)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 3. Online Players State
 # ---------------------------------------------------------------------------
 _online_players: set = set()
@@ -219,6 +253,31 @@ _ACH_TYPE_MAP = {
     "completed the challenge": "challenge",
 }
 _ACH_VERB_MAP = {v: k for k, v in _ACH_TYPE_MAP.items()}
+
+RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
+_DEATH_PHRASES = (
+    "was slain by", "was shot by", "was killed",
+    "was blown up by", "was squashed by", "was fireballed by",
+    "was pummeled by", "was stung by", "was impaled",
+    "was skewered by", "was struck by lightning",
+    "was burnt to", "was frozen to death", "was pricked to death",
+    "was poked to death", "was doomed to fall",
+    "was roasted in dragon", "was obliterated by",
+    "was squished",
+    "drowned", "suffocated", "starved to death",
+    "burned to death",
+    "fell from", "fell off", "fell out of", "fell into", "fell while",
+    "hit the ground too hard",
+    "tried to swim in lava",
+    "walked into",
+    "froze to death", "withered away",
+    "experienced kinetic energy",
+    "went up in flames", "went off with a bang",
+    "died", "didn't want to live",
+    "discovered the floor was lava",
+    "blew up",
+    "left the confines of this world",
+)
 
 
 _pending_uuids: dict = {}  # name -> uuid, populated by UUID line, consumed by join line
@@ -263,6 +322,16 @@ def parse_line(line: str, names: dict) -> tuple:
             "type": _ACH_TYPE_MAP[ach_type_full],
             "time": time_str,
         }
+
+    m = RE_SERVER_MSG.match(line)
+    if m:
+        time_str, name, msg = m.groups()
+        if any(msg.startswith(p) for p in _DEATH_PHRASES):
+            return "death", {
+                "player": name,
+                "message": msg,
+                "time": time_str,
+            }
 
     return None, None
 
@@ -324,7 +393,7 @@ class LogWatcher(FileSystemEventHandler):
 # 6. Notification Callback
 # ---------------------------------------------------------------------------
 def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
-                         achievements: dict):
+                         achievements: dict, deaths: dict):
     _last_event: dict = {}
     _cooldown = 3
 
@@ -359,6 +428,22 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
             chat_ids = auth.get("authorized_chat_ids", [])
             logger.info("Achievement: %s — %s — sending to %d chat(s)",
                         player, achievement, len(chat_ids))
+            _send_to_chats(msg)
+            return
+
+        if event_type == "death":
+            player = payload["player"]
+            death_msg = payload["message"]
+            time_str = payload["time"]
+            timestamp = f"{datetime.now().strftime('%Y-%m-%d')} {time_str}"
+            uuid = _uuid_by_name(player, names)
+            if uuid:
+                record_death(uuid, death_msg, timestamp, deaths, _DEATHS_PATH)
+
+            msg = f"{player} {death_msg}"
+            chat_ids = auth.get("authorized_chat_ids", [])
+            logger.info("Death: %s %s — sending to %d chat(s)",
+                        player, death_msg, len(chat_ids))
             _send_to_chats(msg)
             return
 
@@ -483,6 +568,32 @@ def _scan_log_for_achievements(file_path: Path, date_str: str,
     return count
 
 
+def _scan_log_for_deaths(file_path: Path, date_str: str,
+                         names: dict, deaths: dict) -> int:
+    count = 0
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            m = RE_UUID.match(line)
+            if m:
+                name, uuid = m.group(1), m.group(2)
+                register_player(uuid, name, names, _NAMES_PATH)
+                continue
+            m = RE_SERVER_MSG.match(line)
+            if m:
+                time_str, player, msg = m.groups()
+                if any(msg.startswith(p) for p in _DEATH_PHRASES):
+                    timestamp = f"{date_str} {time_str}"
+                    uuid = _uuid_by_name(player, names)
+                    if uuid:
+                        if record_death(uuid, msg, timestamp, deaths,
+                                        _DEATHS_PATH):
+                            count += 1
+                    else:
+                        logger.warning("Scan: no UUID for player %s, skipping death", player)
+    return count
+
+
 # ---------------------------------------------------------------------------
 # 8. Authorization System
 # ---------------------------------------------------------------------------
@@ -537,7 +648,7 @@ def _guard(message, auth: dict) -> bool:
 # 9. Bot Commands
 # ---------------------------------------------------------------------------
 def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
-                      achievements: dict) -> None:
+                      achievements: dict, deaths: dict) -> None:
 
     def guard(message) -> bool:
         return _guard(message, auth)
@@ -569,6 +680,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             "/stats [player] — player statistics",
             "/playtime — playtime leaderboard",
             "/achievements [player] — player achievements",
+            "/deaths [player] — death history",
             "/chat_id — show this chat's ID",
         ]
         if message.chat.type == "private" and is_admin(message.from_user.id, auth):
@@ -577,6 +689,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 "/revoke <chat_id> — remove a chat from whitelist",
                 "/listchats — list authorized chats",
                 "/scan_achievements — scan all logs for achievements",
+                "/scan_deaths — scan all logs for deaths",
             ]
         bot.reply_to(message, "\n".join(lines))
 
@@ -748,6 +861,105 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                          f"Scan complete. {total} new achievement(s) recorded.")
         logger.info("ScanAchievements: %d new achievement(s) found", total)
 
+    # --- /deaths ---
+    @bot.message_handler(commands=["deaths"])
+    def cmd_deaths(message):
+        if not guard(message):
+            return
+        refresh_player_names(names, _NAMES_PATH)
+        args = message.text.split(maxsplit=1)
+        target = args[1].strip().lower() if len(args) > 1 else None
+        logger.info("Deaths: requested by %s (player=%s)", _tg_user(message), target or "all")
+
+        if not deaths:
+            bot.reply_to(message, "No deaths recorded yet.")
+            return
+
+        if target:
+            uuid = None
+            for u, n in names.items():
+                if n.lower() == target:
+                    uuid = u
+                    break
+            if not uuid or uuid not in deaths:
+                bot.reply_to(message, f"No deaths found for '{target}'.")
+                return
+            player_name = names.get(uuid, uuid)
+            entries = deaths[uuid]
+            lines = [f"Deaths for {player_name} ({len(entries)} total):"]
+            sorted_entries = sorted(entries, key=lambda x: x["timestamp"])
+            current_date = None
+            for e in sorted_entries:
+                ts = e["timestamp"]
+                date_part, time_part = ts.split(" ", 1)
+                try:
+                    formatted_date = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%b-%Y")
+                except ValueError:
+                    formatted_date = date_part
+                time_short = time_part[:5]
+                if formatted_date != current_date:
+                    current_date = formatted_date
+                    lines.append(f"\n{formatted_date}")
+                lines.append(f"  {time_short} | {e['message']}")
+            text = "<pre>" + "\n".join(lines) + "</pre>"
+            _send_long_message(bot, message.chat.id, text,
+                               reply_to_id=message.message_id,
+                               parse_mode="HTML")
+        else:
+            ranked = []
+            for uuid, entries in deaths.items():
+                player_name = names.get(uuid, uuid)
+                ranked.append((player_name, len(entries)))
+            ranked.sort(key=lambda x: x[1], reverse=True)
+            lines = ["Death summary:"]
+            for player_name, count in ranked:
+                lines.append(f"  {player_name}: {count} death(s)")
+            text = "<pre>" + "\n".join(lines) + "</pre>"
+            _send_long_message(bot, message.chat.id, text,
+                               reply_to_id=message.message_id,
+                               parse_mode="HTML")
+
+    # --- /scan_deaths ---
+    @bot.message_handler(commands=["scan_deaths"])
+    def cmd_scan_deaths(message):
+        if message.chat.type != "private":
+            return
+        if not is_admin(message.from_user.id, auth):
+            return
+        logger.info("ScanDeaths: requested by %s", _tg_user(message))
+        refresh_player_names(names, _NAMES_PATH)
+        bot.reply_to(message, "Scanning log files for deaths...")
+
+        logs_dir = LOG_PATH.parent
+        total = 0
+
+        gz_files = sorted(logs_dir.glob("*.log.gz"))
+        for gz_path in gz_files:
+            m = RE_GZ_DATE.match(gz_path.name)
+            if not m:
+                continue
+            date_str = m.group(1)
+            extracted = gz_path.with_suffix("")
+            try:
+                with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
+                    with open(extracted, "w", encoding="utf-8") as out_f:
+                        out_f.write(gz_f.read())
+                total += _scan_log_for_deaths(extracted, date_str,
+                                              names, deaths)
+            except Exception as e:
+                logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
+            finally:
+                if extracted.exists():
+                    extracted.unlink()
+
+        if LOG_PATH.exists():
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            total += _scan_log_for_deaths(LOG_PATH, date_str, names, deaths)
+
+        bot.send_message(message.chat.id,
+                         f"Scan complete. {total} new death(s) recorded.")
+        logger.info("ScanDeaths: %d new death(s) found", total)
+
     # --- /chat_id ---
     @bot.message_handler(commands=["chat_id"])
     def cmd_chat_id(message):
@@ -827,11 +1039,12 @@ def main():
     auth = load_auth(_AUTH_PATH)
     names = load_player_names(_NAMES_PATH)
     achievements = load_achievements(_ACHIEVEMENTS_PATH)
+    deaths = load_deaths(_DEATHS_PATH)
 
     bot = telebot.TeleBot(BOT_TOKEN)
-    register_handlers(bot, auth, names, achievements)
+    register_handlers(bot, auth, names, achievements, deaths)
 
-    notify = make_notify_callback(bot, auth, names, achievements)
+    notify = make_notify_callback(bot, auth, names, achievements, deaths)
     watcher = LogWatcher(LOG_PATH, names, notify)
     observer = Observer()
     observer.schedule(watcher, path=str(LOG_PATH.parent), recursive=False)
