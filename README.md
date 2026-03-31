@@ -49,10 +49,12 @@ The bot will now send join/leave notifications to all authorised chats and respo
 | `/list` | List all players found in the stats directory |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
+| `/achievements [player]` | Show player achievements with timestamps |
 | `/chat_id` | Show the current chat's ID |
 | `/authorize <chat_id>` | *(Admin)* Whitelist a group chat |
 | `/revoke <chat_id>` | *(Admin)* Remove a group from the whitelist |
 | `/listchats` | *(Admin)* List all authorised chat IDs |
+| `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 
 ## Runtime state
 
@@ -60,9 +62,10 @@ The bot writes the following at runtime (all excluded from git):
 
 - `auth.json` — admin user ID and authorised chat list
 - `player_names.json` — UUID → username mappings learned from server logs
+- `player_achievements.json` — player achievements with timestamps, keyed by UUID
 - `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file is created each time the bot starts
 
-Delete `auth.json` and `player_names.json` to reset the bot to a fresh state.
+Delete `auth.json`, `player_names.json`, and `player_achievements.json` to reset the bot to a fresh state.
 
 ## Logging
 

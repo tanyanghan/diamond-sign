@@ -1,3 +1,4 @@
+import gzip
 import json
 import logging
 import os
@@ -102,6 +103,51 @@ def register_player(uuid: str, name: str, names: dict, path: Path) -> None:
         logger.info("Player registry: registered %s (%s)", name, uuid)
 
 
+def _uuid_by_name(player_name: str, names: dict) -> str | None:
+    for uuid, name in names.items():
+        if name == player_name:
+            return uuid
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 2b. Achievements Storage
+# ---------------------------------------------------------------------------
+_ACHIEVEMENTS_PATH = Path(__file__).parent / "player_achievements.json"
+_achievements_lock = threading.Lock()
+
+
+def load_achievements(path: Path) -> dict:
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Failed to load player_achievements.json")
+    return {}
+
+
+def _save_achievements(achievements: dict, path: Path) -> None:
+    with open(path, "w") as f:
+        json.dump(achievements, f, indent=2)
+
+
+def record_achievement(uuid: str, achievement: str, ach_type: str,
+                       timestamp: str, achievements: dict, path: Path) -> bool:
+    with _achievements_lock:
+        entries = achievements.setdefault(uuid, [])
+        for e in entries:
+            if e["achievement"] == achievement and e["timestamp"] == timestamp:
+                return False
+        entries.append({
+            "achievement": achievement,
+            "type": ach_type,
+            "timestamp": timestamp,
+        })
+        _save_achievements(achievements, path)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 3. Online Players State
 # ---------------------------------------------------------------------------
@@ -130,13 +176,28 @@ def get_online_players() -> list:
 RE_JOIN = re.compile(r'^\[[\d:]+\] \[Server thread/INFO\]: (\w+) joined the game')
 RE_LEAVE = re.compile(r'^\[[\d:]+\] \[Server thread/INFO\]: (\w+) left the game')
 RE_UUID = re.compile(r'^\[[\d:]+\] \[User Authenticator #\d+/INFO\]: UUID of player (\w+) is ([0-9a-f-]+)')
+RE_ACHIEVEMENT = re.compile(
+    r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) has '
+    r'(made the advancement|reached the goal|completed the challenge) '
+    r'\[(.+?)\]'
+)
+_ACH_TYPE_MAP = {
+    "made the advancement": "advancement",
+    "reached the goal": "goal",
+    "completed the challenge": "challenge",
+}
+_ACH_VERB_MAP = {v: k for k, v in _ACH_TYPE_MAP.items()}
 
 
 _pending_uuids: dict = {}  # name -> uuid, populated by UUID line, consumed by join line
 
 
 def parse_line(line: str, names: dict) -> tuple:
-    """Return (event_type, player_name) or (None, None)."""
+    """Return (event_type, payload) or (None, None).
+
+    For join/leave, payload is the player name string.
+    For achievement, payload is a dict with player, achievement, type, time.
+    """
     line = line.strip()
 
     m = RE_UUID.match(line)
@@ -160,6 +221,16 @@ def parse_line(line: str, names: dict) -> tuple:
         name = m.group(1)
         player_leave(name)
         return "leave", name
+
+    m = RE_ACHIEVEMENT.match(line)
+    if m:
+        time_str, name, ach_type_full, achievement = m.groups()
+        return "achievement", {
+            "player": name,
+            "achievement": achievement,
+            "type": _ACH_TYPE_MAP[ach_type_full],
+            "time": time_str,
+        }
 
     return None, None
 
@@ -208,9 +279,9 @@ class LogWatcher(FileSystemEventHandler):
                     new_data = f.read()
                     self._pos = f.tell()
                 for line in new_data.splitlines():
-                    event_type, name = parse_line(line, self._names)
-                    if event_type and name:
-                        self._notify(event_type, name)
+                    event_type, payload = parse_line(line, self._names)
+                    if event_type and payload:
+                        self._notify(event_type, payload)
             except FileNotFoundError:
                 pass
             except Exception:
@@ -220,11 +291,46 @@ class LogWatcher(FileSystemEventHandler):
 # ---------------------------------------------------------------------------
 # 6. Notification Callback
 # ---------------------------------------------------------------------------
-def make_notify_callback(bot: telebot.TeleBot, auth: dict):
+def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
+                         achievements: dict):
     _last_event: dict = {}
     _cooldown = 3
 
-    def notify(event_type: str, name: str) -> None:
+    def _send_to_chats(msg: str) -> None:
+        chat_ids = auth.get("authorized_chat_ids", [])
+        for chat_id in chat_ids:
+            try:
+                bot.send_message(chat_id, msg)
+            except Exception as e:
+                logger.warning("Failed to send notification to chat %s: %s", chat_id, e)
+
+    def notify(event_type: str, payload) -> None:
+        if event_type == "achievement":
+            player = payload["player"]
+            achievement = payload["achievement"]
+            ach_type = payload["type"]
+            time_str = payload["time"]
+            key = f"{player}-achievement-{achievement}"
+            now = time.time()
+            if now - _last_event.get(key, 0) < _cooldown:
+                return
+            _last_event[key] = now
+
+            timestamp = f"{datetime.now().strftime('%Y-%m-%d')} {time_str}"
+            uuid = _uuid_by_name(player, names)
+            if uuid:
+                record_achievement(uuid, achievement, ach_type, timestamp,
+                                   achievements, _ACHIEVEMENTS_PATH)
+
+            verb = _ACH_VERB_MAP[ach_type]
+            msg = f"{player} has {verb} [{achievement}]"
+            chat_ids = auth.get("authorized_chat_ids", [])
+            logger.info("Achievement: %s — %s — sending to %d chat(s)",
+                        player, achievement, len(chat_ids))
+            _send_to_chats(msg)
+            return
+
+        name = payload
         key = f"{name}-{event_type}"
         now = time.time()
         if now - _last_event.get(key, 0) < _cooldown:
@@ -241,11 +347,7 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict):
 
         chat_ids = auth.get("authorized_chat_ids", [])
         logger.info("Notification: player %s %s — sending to %d chat(s)", name, status, len(chat_ids))
-        for chat_id in chat_ids:
-            try:
-                bot.send_message(chat_id, msg)
-            except Exception as e:
-                logger.warning("Failed to send notification to chat %s: %s", chat_id, e)
+        _send_to_chats(msg)
 
     return notify
 
@@ -317,6 +419,39 @@ def _format_stats(p: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 7b. Achievement Scanning
+# ---------------------------------------------------------------------------
+RE_GZ_DATE = re.compile(r'(\d{4}-\d{2}-\d{2})-\d+\.log\.gz')
+
+
+def _scan_log_for_achievements(file_path: Path, date_str: str,
+                               names: dict, achievements: dict) -> int:
+    count = 0
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            m = RE_UUID.match(line)
+            if m:
+                name, uuid = m.group(1), m.group(2)
+                register_player(uuid, name, names, _NAMES_PATH)
+                continue
+            m = RE_ACHIEVEMENT.match(line)
+            if m:
+                time_str, player, ach_type_full, achievement = m.groups()
+                ach_type = _ACH_TYPE_MAP[ach_type_full]
+                timestamp = f"{date_str} {time_str}"
+                uuid = _uuid_by_name(player, names)
+                if uuid:
+                    if record_achievement(uuid, achievement, ach_type,
+                                          timestamp, achievements,
+                                          _ACHIEVEMENTS_PATH):
+                        count += 1
+                else:
+                    logger.warning("Scan: no UUID for player %s, skipping achievement", player)
+    return count
+
+
+# ---------------------------------------------------------------------------
 # 8. Authorization System
 # ---------------------------------------------------------------------------
 _AUTH_PATH = Path(__file__).parent / "auth.json"
@@ -369,7 +504,8 @@ def _guard(message, auth: dict) -> bool:
 # ---------------------------------------------------------------------------
 # 9. Bot Commands
 # ---------------------------------------------------------------------------
-def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict) -> None:
+def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
+                      achievements: dict) -> None:
 
     def guard(message) -> bool:
         return _guard(message, auth)
@@ -400,6 +536,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict) -> None:
             "/list — list all known players",
             "/stats [player] — player statistics",
             "/playtime — playtime leaderboard",
+            "/achievements [player] — player achievements",
             "/chat_id — show this chat's ID",
         ]
         if message.chat.type == "private" and is_admin(message.from_user.id, auth):
@@ -407,6 +544,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict) -> None:
                 "/authorize <chat_id> — whitelist a chat",
                 "/revoke <chat_id> — remove a chat from whitelist",
                 "/listchats — list authorized chats",
+                "/scan_achievements — scan all logs for achievements",
             ]
         bot.reply_to(message, "\n".join(lines))
 
@@ -477,6 +615,84 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict) -> None:
             bot.reply_to(message, "No players found in stats directory.")
             return
         bot.reply_to(message, "Known players:\n" + "\n".join(entries))
+
+    # --- /achievements ---
+    @bot.message_handler(commands=["achievements"])
+    def cmd_achievements(message):
+        if not guard(message):
+            return
+        args = message.text.split(maxsplit=1)
+        target = args[1].strip().lower() if len(args) > 1 else None
+        logger.info("Achievements: requested by %s (player=%s)", _tg_user(message), target or "all")
+
+        if not achievements:
+            bot.reply_to(message, "No achievements recorded yet.")
+            return
+
+        if target:
+            uuid = None
+            for u, n in names.items():
+                if n.lower() == target:
+                    uuid = u
+                    break
+            if not uuid or uuid not in achievements:
+                bot.reply_to(message, f"No achievements found for '{target}'.")
+                return
+            player_name = names.get(uuid, uuid)
+            entries = achievements[uuid]
+            lines = [f"Achievements for {player_name}:"]
+            for e in sorted(entries, key=lambda x: x["timestamp"]):
+                lines.append(f"  [{e['achievement']}] ({e['type']}) — {e['timestamp']}")
+            bot.reply_to(message, "\n".join(lines))
+        else:
+            lines = []
+            for uuid, entries in sorted(achievements.items(),
+                                        key=lambda x: names.get(x[0], x[0]).lower()):
+                player_name = names.get(uuid, uuid)
+                lines.append(f"{player_name}: {len(entries)} achievement(s)")
+            bot.reply_to(message, "Achievements summary:\n" + "\n".join(lines))
+
+    # --- /scan_achievements ---
+    @bot.message_handler(commands=["scan_achievements"])
+    def cmd_scan_achievements(message):
+        if message.chat.type != "private":
+            return
+        if not is_admin(message.from_user.id, auth):
+            return
+        logger.info("ScanAchievements: requested by %s", _tg_user(message))
+        bot.reply_to(message, "Scanning log files for achievements...")
+
+        logs_dir = LOG_PATH.parent
+        total = 0
+
+        gz_files = sorted(logs_dir.glob("*.log.gz"))
+        for gz_path in gz_files:
+            m = RE_GZ_DATE.match(gz_path.name)
+            if not m:
+                continue
+            date_str = m.group(1)
+            extracted = gz_path.with_suffix("")  # remove .gz
+            try:
+                with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
+                    with open(extracted, "w", encoding="utf-8") as out_f:
+                        out_f.write(gz_f.read())
+                total += _scan_log_for_achievements(extracted, date_str,
+                                                    names, achievements)
+            except Exception as e:
+                logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
+            finally:
+                if extracted.exists():
+                    extracted.unlink()
+
+        # Scan latest.log
+        if LOG_PATH.exists():
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            total += _scan_log_for_achievements(LOG_PATH, date_str,
+                                                names, achievements)
+
+        bot.send_message(message.chat.id,
+                         f"Scan complete. {total} new achievement(s) recorded.")
+        logger.info("ScanAchievements: %d new achievement(s) found", total)
 
     # --- /chat_id ---
     @bot.message_handler(commands=["chat_id"])
@@ -556,11 +772,12 @@ def main():
 
     auth = load_auth(_AUTH_PATH)
     names = load_player_names(_NAMES_PATH)
+    achievements = load_achievements(_ACHIEVEMENTS_PATH)
 
     bot = telebot.TeleBot(BOT_TOKEN)
-    register_handlers(bot, auth, names)
+    register_handlers(bot, auth, names, achievements)
 
-    notify = make_notify_callback(bot, auth)
+    notify = make_notify_callback(bot, auth, names, achievements)
     watcher = LogWatcher(LOG_PATH, names, notify)
     observer = Observer()
     observer.schedule(watcher, path=str(LOG_PATH.parent), recursive=False)

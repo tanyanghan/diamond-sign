@@ -14,6 +14,7 @@ __pycache__/
 # Bot runtime state
 auth.json
 player_names.json
+player_achievements.json
 logs/
 
 # IDE
