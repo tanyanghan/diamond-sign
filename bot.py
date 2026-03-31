@@ -676,8 +676,20 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             player_name = names.get(uuid, uuid)
             entries = achievements[uuid]
             lines = [f"Achievements for {player_name}:"]
-            for e in sorted(entries, key=lambda x: x["timestamp"]):
-                lines.append(f"  [{e['achievement']}] ({e['type']}) — {e['timestamp']}")
+            sorted_entries = sorted(entries, key=lambda x: x["timestamp"])
+            current_date = None
+            for e in sorted_entries:
+                ts = e["timestamp"]
+                date_part, time_part = ts.split(" ", 1)
+                try:
+                    formatted_date = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%b-%Y")
+                except ValueError:
+                    formatted_date = date_part
+                time_short = time_part[:5]  # HH:MM
+                if formatted_date != current_date:
+                    current_date = formatted_date
+                    lines.append(f"\n{formatted_date}")
+                lines.append(f"  {time_short} | {e['type']:<11} | {e['achievement']}")
             _send_long_message(bot, message.chat.id, "\n".join(lines),
                                reply_to_id=message.message_id)
         else:
