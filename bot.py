@@ -3,12 +3,15 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from mcrcon import MCRcon
 import telebot
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -27,6 +30,10 @@ if missing:
 
 LOG_PATH = Path(MINECRAFT_DIR) / "logs" / "latest.log"
 STATS_DIR = Path(MINECRAFT_DIR) / "world" / "stats"
+
+RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "")
+BACKUP_DIR = Path(os.path.expanduser(os.environ.get("BACKUP_DIR", "~/minecraft_backup")))
+BACKUP_COPY_CMD = os.environ.get("BACKUP_COPY_CMD", "")
 
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
@@ -629,6 +636,107 @@ def _scan_log_for_deaths(file_path: Path, date_str: str,
 
 
 # ---------------------------------------------------------------------------
+# 7d. RCON & Backup
+# ---------------------------------------------------------------------------
+def rcon_command(cmd: str) -> str:
+    with MCRcon("localhost", RCON_PASSWORD) as mcr:
+        return mcr.command(cmd)
+
+
+def _wait_for_log_line(phrase: str, timeout: float = 60) -> bool:
+    """Tail latest.log and wait for a line containing phrase. Returns True if found."""
+    deadline = time.time() + timeout
+    try:
+        pos = LOG_PATH.stat().st_size
+    except FileNotFoundError:
+        return False
+
+    while time.time() < deadline:
+        try:
+            size = LOG_PATH.stat().st_size
+            if size > pos:
+                with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(pos)
+                    new_data = f.read()
+                    pos = f.tell()
+                for line in new_data.splitlines():
+                    if phrase in line:
+                        return True
+        except FileNotFoundError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
+    """Run a full server backup. status_cb(msg) is called with progress updates."""
+    def status(msg):
+        logger.info("Backup: %s", msg)
+        if status_cb:
+            status_cb(msg)
+
+    if not RCON_PASSWORD:
+        raise RuntimeError("RCON_PASSWORD not configured")
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Disable auto-save, flush world data, then zip while world is frozen
+    status("Disabling auto-save...")
+    rcon_command("save-off")
+    if _wait_for_log_line("Automatic saving is now disabled", timeout=30):
+        status("Auto-save disabled")
+    else:
+        status("Warning: save-off confirmation not seen in log, proceeding anyway")
+
+    try:
+        status("Saving world...")
+        rcon_command("save-all")
+        if _wait_for_log_line("Saved the game", timeout=120):
+            status("World save complete")
+        else:
+            status("Warning: save-all confirmation not seen in log, proceeding anyway")
+
+        # Zip the directory
+        mc_dir = Path(MINECRAFT_DIR)
+        dir_name = mc_dir.name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_name = f"{dir_name}_{timestamp}"
+        zip_path = BACKUP_DIR / zip_name
+
+        status(f"Zipping {mc_dir} ...")
+        shutil.make_archive(str(zip_path), "zip", root_dir=str(mc_dir.parent),
+                            base_dir=dir_name)
+        final_path = Path(f"{zip_path}.zip")
+        size_mb = final_path.stat().st_size / (1024 * 1024)
+        status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
+    finally:
+        # Always re-enable auto-save, even if zip fails
+        rcon_command("save-on")
+        if _wait_for_log_line("Automatic saving is now enabled", timeout=30):
+            status("Auto-save re-enabled")
+        else:
+            status("Warning: save-on confirmation not seen in log")
+
+    # Copy off-server if configured
+    if BACKUP_COPY_CMD:
+        copy_cmd = BACKUP_COPY_CMD.replace("{file}", str(final_path))
+        status(f"Running copy command...")
+        try:
+            result = subprocess.run(copy_cmd, shell=True, capture_output=True,
+                                    text=True, timeout=600)
+            if result.returncode == 0:
+                status("Copy command completed successfully")
+            else:
+                status(f"Copy command failed (rc={result.returncode}): {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            status("Copy command timed out after 10 minutes")
+        except Exception as e:
+            status(f"Copy command error: {e}")
+
+    return str(final_path)
+
+
+# ---------------------------------------------------------------------------
 # 8. Authorization System
 # ---------------------------------------------------------------------------
 _AUTH_PATH = Path(__file__).parent / "auth.json"
@@ -725,6 +833,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 "/listchats — list authorized chats",
                 "/scan_achievements — scan all logs for achievements",
                 "/scan_deaths — scan all logs for deaths",
+                "/backup — trigger a server backup now",
             ]
         bot.reply_to(message, "\n".join(lines))
 
@@ -1049,6 +1158,35 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                          f"Scan complete. {total} new death(s) recorded.")
         logger.info("ScanDeaths: %d new death(s) found", total)
 
+    # --- /backup ---
+    _backup_lock = threading.Lock()
+
+    @bot.message_handler(commands=["backup"])
+    def cmd_backup(message):
+        if message.chat.type != "private":
+            return
+        if not is_admin(message.from_user.id, auth):
+            return
+        if not _backup_lock.acquire(blocking=False):
+            bot.reply_to(message, "A backup is already in progress.")
+            return
+        logger.info("Backup: manually triggered by %s", _tg_user(message))
+        bot.reply_to(message, "Starting backup...")
+
+        def run():
+            try:
+                def status_cb(msg):
+                    bot.send_message(message.chat.id, msg)
+                path = run_backup(bot, auth, status_cb=status_cb)
+                bot.send_message(message.chat.id, f"Backup complete: {Path(path).name}")
+            except Exception as e:
+                logger.exception("Backup failed")
+                bot.send_message(message.chat.id, f"Backup failed: {e}")
+            finally:
+                _backup_lock.release()
+
+        threading.Thread(target=run, daemon=True).start()
+
     # --- /chat_id ---
     @bot.message_handler(commands=["chat_id"])
     def cmd_chat_id(message):
@@ -1164,6 +1302,44 @@ def main():
             return True
 
     logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter())
+
+    # Daily backup scheduler (runs at 04:00)
+    _BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "4"))
+
+    def _daily_backup_loop():
+        while True:
+            now = datetime.now()
+            # Next run at _BACKUP_HOUR:00
+            target = now.replace(hour=_BACKUP_HOUR, minute=0, second=0, microsecond=0)
+            if target <= now:
+                target = target.replace(day=target.day + 1)
+            wait = (target - now).total_seconds()
+            logger.info("Daily backup scheduled in %.0f seconds (at %s)", wait,
+                        target.strftime("%Y-%m-%d %H:%M"))
+            time.sleep(wait)
+
+            if not RCON_PASSWORD:
+                logger.warning("Daily backup skipped: RCON_PASSWORD not configured")
+                continue
+
+            logger.info("Daily backup starting")
+            def status_cb(msg):
+                admin_id = auth.get("admin_user_id")
+                if admin_id:
+                    try:
+                        bot.send_message(admin_id, f"[Daily Backup] {msg}")
+                    except Exception:
+                        pass
+
+            try:
+                path = run_backup(bot, auth, status_cb=status_cb)
+                status_cb(f"Complete: {Path(path).name}")
+            except Exception as e:
+                logger.exception("Daily backup failed")
+                status_cb(f"Failed: {e}")
+
+    backup_thread = threading.Thread(target=_daily_backup_loop, daemon=True)
+    backup_thread.start()
 
     try:
         bot.infinity_polling(timeout=30, long_polling_timeout=20)

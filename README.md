@@ -1,6 +1,6 @@
 # mcnotifier
 
-A Telegram bot that monitors a Minecraft server and sends notifications when players join or leave. Also responds to commands for player status and stats.
+A Telegram bot that monitors a Minecraft server and sends notifications when players join or leave. Tracks achievements, deaths, player stats, and performs automated daily backups via RCON.
 
 ## Files
 
@@ -27,6 +27,10 @@ A Telegram bot that monitors a Minecraft server and sends notifications when pla
    Edit `.env` and fill in:
    - `BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
    - `MINECRAFT_DIR` — absolute path to the Minecraft server directory (e.g. `/home/user/Minecraft`)
+   - `RCON_PASSWORD` — RCON password (must match `server.properties` `rcon.password`)
+   - `BACKUP_HOUR` — hour of day (0–23) for daily auto-backup (default: `4`)
+   - `BACKUP_DIR` — directory for backup zip files (default: `~/minecraft_backup`)
+   - `BACKUP_COPY_CMD` — optional shell command to copy the backup off-server; `{file}` is replaced with the zip path (e.g. `scp {file} user@nas:/backups/` or `cp {file} /mnt/backup/`)
 
 3. **Run**
    ```bash
@@ -40,6 +44,60 @@ A Telegram bot that monitors a Minecraft server and sends notifications when pla
 3. In a private message to the bot, send `/authorize <chat_id>` to whitelist the group.
 
 The bot will now send join/leave notifications to all authorised chats and respond to commands there.
+
+## RCON setup
+
+The backup feature and any future server commands require RCON to be enabled on the Minecraft server.
+
+1. Edit `server.properties` and set:
+   ```
+   enable-rcon=true
+   rcon.port=25575
+   rcon.password=your_password
+   ```
+2. Restart the Minecraft server for the changes to take effect.
+3. Set the same password in `.env` as `RCON_PASSWORD`.
+
+## Backups
+
+The bot performs automated daily backups of the entire Minecraft server directory.
+
+**How it works:**
+
+1. Sends `save-off` via RCON to disable auto-save.
+2. Sends `save-all` to flush world data from memory to disk.
+3. Zips the entire `MINECRAFT_DIR` (e.g. `minecraftopia_20260401_040000.zip`).
+4. Sends `save-on` to re-enable auto-save (guaranteed even if the zip fails).
+5. Saves the zip to `BACKUP_DIR` (default: `~/minecraft_backup`).
+6. Optionally runs `BACKUP_COPY_CMD` to copy the zip off-server.
+
+Players do not need to be kicked — the save-off/save-all/save-on sequence ensures a consistent snapshot while the server stays online.
+
+**Configuration:**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RCON_PASSWORD` | Must match `server.properties` `rcon.password` | *(required for backup)* |
+| `BACKUP_HOUR` | Hour of day (0–23) for the daily auto-backup | `4` |
+| `BACKUP_DIR` | Directory where backup zips are saved | `~/minecraft_backup` |
+| `BACKUP_COPY_CMD` | Shell command to copy the zip off-server; `{file}` is replaced with the full zip path | *(empty — disabled)* |
+
+**Copy command examples:**
+
+```bash
+# Copy to a mounted NAS
+BACKUP_COPY_CMD=cp {file} /mnt/nas/minecraft_backups/
+
+# SCP to a remote server
+BACKUP_COPY_CMD=scp {file} user@backup-server:/backups/minecraft/
+
+# Rsync to a remote server
+BACKUP_COPY_CMD=rsync -az {file} user@backup-server:/backups/minecraft/
+```
+
+**Manual backup:** The admin can trigger a backup at any time via `/backup` in a private message. Progress updates are sent as the backup runs.
+
+**Daily auto-backup:** Runs automatically at the configured `BACKUP_HOUR`. Progress is sent to the admin's private chat.
 
 ## Commands
 
@@ -58,6 +116,7 @@ The bot will now send join/leave notifications to all authorised chats and respo
 | `/listchats` | *(Admin)* List all authorised chat IDs |
 | `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
+| `/backup` | *(Admin)* Trigger a server backup now |
 
 ## Runtime state
 
@@ -76,8 +135,10 @@ Delete `auth.json`, `player_names.json`, `player_achievements.json`, and `player
 Each run produces a timestamped log file under `logs/`. Logged events include:
 
 - Player join/leave notifications (player name, online/offline, number of chats notified)
+- Achievement and death notifications
 - All command requests (command name and Telegram username of requester)
 - Admin actions (claim, authorize, revoke)
 - Player registry updates (new UUID→name mappings and renames)
+- Backup progress and results
 - Minecraft log file rotation detection
 - Errors and exceptions
