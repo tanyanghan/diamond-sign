@@ -386,7 +386,43 @@ def parse_line(line: str, names: dict) -> tuple:
 # ---------------------------------------------------------------------------
 # 5. LogWatcher
 # ---------------------------------------------------------------------------
+class LogLineWaiter:
+    """A handle returned by LogWatcher.expect_line().
+
+    Register this BEFORE sending the RCON command that will produce the
+    expected log line. Then call wait() to block until the line appears
+    or the timeout expires. This eliminates the race condition of capturing
+    a file position after the command — the waiter is already listening
+    when the command is sent.
+    """
+    def __init__(self, phrase: str):
+        self.phrase = phrase
+        self._event = threading.Event()
+
+    def _signal(self):
+        """Called by LogWatcher when a matching line is found."""
+        self._event.set()
+
+    def wait(self, timeout: float = 60) -> bool:
+        """Block until the phrase is seen or timeout. Returns True if found."""
+        return self._event.wait(timeout)
+
+
 class LogWatcher(FileSystemEventHandler):
+    """Watches the Minecraft server's latest.log for player events and
+    RCON confirmations.
+
+    This is the single point of access for reading latest.log. It handles
+    log file rotation (when the server starts, it renames the old log and
+    creates a new one) by tracking the file's inode.
+
+    Two consumers:
+      - Player event notifications: parsed via parse_line() and forwarded
+        to the notify callback (joins, leaves, achievements, deaths).
+      - RCON confirmation waiters: registered via expect_line(), which
+        returns a LogLineWaiter. The waiter is signalled when a matching
+        line appears in the log.
+    """
     def __init__(self, log_path: Path, names: dict, notify_cb):
         self._path = log_path
         self._names = names
@@ -394,6 +430,9 @@ class LogWatcher(FileSystemEventHandler):
         self._pos = 0
         self._inode = None
         self._lock = threading.Lock()
+        # Waiters: list of LogLineWaiter objects waiting for specific phrases
+        self._waiters: list[LogLineWaiter] = []
+        self._waiters_lock = threading.Lock()
         self._seek_to_end()
 
     def _seek_to_end(self) -> None:
@@ -405,6 +444,7 @@ class LogWatcher(FileSystemEventHandler):
             logger.warning("Log file not found at startup: %s (server may be offline)", self._path)
 
     def _check_rotation(self) -> bool:
+        """Detect if latest.log was replaced (rotated) by checking inode."""
         try:
             inode = self._path.stat().st_ino
             if inode != self._inode:
@@ -415,6 +455,30 @@ class LogWatcher(FileSystemEventHandler):
         except FileNotFoundError:
             pass
         return False
+
+    def expect_line(self, phrase: str) -> LogLineWaiter:
+        """Register a waiter for a log line containing phrase.
+
+        Call this BEFORE sending the RCON command that produces the line.
+        The returned LogLineWaiter.wait(timeout) blocks until the line
+        appears or times out.
+        """
+        waiter = LogLineWaiter(phrase)
+        with self._waiters_lock:
+            self._waiters.append(waiter)
+        return waiter
+
+    def _check_waiters(self, line: str) -> None:
+        """Check a log line against all registered waiters."""
+        with self._waiters_lock:
+            triggered = []
+            for waiter in self._waiters:
+                if waiter.phrase in line:
+                    waiter._signal()
+                    triggered.append(waiter)
+            # Remove triggered waiters
+            for waiter in triggered:
+                self._waiters.remove(waiter)
 
     def on_modified(self, event):
         if not str(event.src_path).endswith("latest.log"):
@@ -427,6 +491,9 @@ class LogWatcher(FileSystemEventHandler):
                     new_data = f.read()
                     self._pos = f.tell()
                 for line in new_data.splitlines():
+                    # Check RCON confirmation waiters
+                    self._check_waiters(line)
+                    # Check player event notifications
                     event_type, payload = parse_line(line, self._names)
                     if event_type and payload:
                         self._notify(event_type, payload)
@@ -653,6 +720,7 @@ def _scan_log_for_deaths(file_path: Path, date_str: str,
 _backup_lock = threading.Lock()
 _bot_ref: telebot.TeleBot | None = None
 _auth_ref: dict | None = None
+_watcher_ref: LogWatcher | None = None
 
 
 def _validate_server_properties() -> list:
@@ -700,18 +768,17 @@ def _validate_server_properties() -> list:
 
 
 def _wait_for_rcon_ready(timeout: float = 120) -> bool:
-    """Monitor latest.log until RCON is listening, or timeout.
+    """Wait for RCON to be ready by watching latest.log via LogWatcher.
 
-    Watches for the line "RCON running on" in latest.log, which indicates the
-    Minecraft server's RCON listener has started and is ready to accept
-    connections. This is needed on startup because the bot may start before
-    the Minecraft server has fully initialised.
+    Watches for the line "RCON running on" which indicates the Minecraft
+    server's RCON listener has started and is ready to accept connections.
+    This is needed on startup because the bot may start before the server.
 
     Returns True if RCON is ready, False if timed out.
     """
-    pos = _log_pos()
     logger.info("Waiting for RCON to be ready (monitoring latest.log)...")
-    return _wait_for_log_line("RCON running on", pos, timeout=timeout)
+    waiter = _watcher_ref.expect_line("RCON running on")
+    return waiter.wait(timeout=timeout)
 
 
 def rcon_command(cmd: str) -> str:
@@ -733,35 +800,6 @@ def rcon_command(cmd: str) -> str:
         mcr.disconnect()
 
 
-def _log_pos() -> int:
-    """Return the current size of latest.log (call before the RCON command)."""
-    try:
-        return LOG_PATH.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
-def _wait_for_log_line(phrase: str, pos: int, timeout: float = 60) -> bool:
-    """Wait for a line containing phrase in latest.log from pos onwards."""
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        try:
-            size = LOG_PATH.stat().st_size
-            if size > pos:
-                with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(pos)
-                    new_data = f.read()
-                    pos = f.tell()
-                for line in new_data.splitlines():
-                    if phrase in line:
-                        return True
-        except FileNotFoundError:
-            pass
-        time.sleep(0.5)
-    return False
-
-
 def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     """Run a full server backup.
 
@@ -775,9 +813,10 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
       6. Start a new incremental chain: generate a fresh chain ID, rebuild
          the file manifest (mtime baseline), and write the chain marker.
 
-    The RCON log confirmation uses a pre-captured file position to avoid a
-    race condition: we record the log file position BEFORE sending the RCON
-    command, then scan forward from that position for the confirmation line.
+    RCON log confirmations are handled via LogWatcher.expect_line(): we
+    register a waiter BEFORE sending the RCON command, then block until the
+    expected log line appears. This avoids the race condition of the log line
+    being written before we start looking for it.
     """
     def status(msg):
         logger.info("Backup: %s", msg)
@@ -791,9 +830,9 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 
     # Step 1: Disable auto-save to freeze world state during backup
     status("Disabling auto-save...")
-    pos = _log_pos()
+    waiter = _watcher_ref.expect_line("Automatic saving is now disabled")
     rcon_command("save-off")
-    if _wait_for_log_line("Automatic saving is now disabled", pos, timeout=30):
+    if waiter.wait(timeout=30):
         status("Auto-save disabled")
     else:
         status("Warning: save-off confirmation not seen in log, proceeding anyway")
@@ -801,9 +840,9 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     try:
         # Step 2: Flush all pending world data to disk
         status("Saving world...")
-        pos = _log_pos()
+        waiter = _watcher_ref.expect_line("Saved the game")
         rcon_command("save-all")
-        if _wait_for_log_line("Saved the game", pos, timeout=120):
+        if waiter.wait(timeout=120):
             status("World save complete")
         else:
             status("Warning: save-all confirmation not seen in log, proceeding anyway")
@@ -839,9 +878,9 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
         # Step 4: Always re-enable auto-save, even if zip fails
-        pos = _log_pos()
+        waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
         rcon_command("save-on")
-        if _wait_for_log_line("Automatic saving is now enabled", pos, timeout=30):
+        if waiter.wait(timeout=30):
             status("Auto-save re-enabled")
         else:
             status("Warning: save-on confirmation not seen in log")
@@ -1015,17 +1054,17 @@ def run_incremental_backup() -> str | None:
         # Freeze the world state: disable auto-save and flush pending writes.
         # Same RCON sequence as full backups — ensures we're zipping consistent
         # file state, not partially-written region files.
-        pos = _log_pos()
+        waiter = _watcher_ref.expect_line("Automatic saving is now disabled")
         rcon_command("save-off")
-        if _wait_for_log_line("Automatic saving is now disabled", pos, timeout=30):
+        if waiter.wait(timeout=30):
             logger.info("Incremental backup: auto-save disabled")
         else:
             logger.warning("Incremental backup: save-off confirmation not seen, proceeding")
 
         try:
-            pos = _log_pos()
+            waiter = _watcher_ref.expect_line("Saved the game")
             rcon_command("save-all")
-            if _wait_for_log_line("Saved the game", pos, timeout=120):
+            if waiter.wait(timeout=120):
                 logger.info("Incremental backup: world save complete")
             else:
                 logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
@@ -1069,9 +1108,9 @@ def run_incremental_backup() -> str | None:
 
         finally:
             # Always re-enable auto-save
-            pos = _log_pos()
+            waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
             rcon_command("save-on")
-            if _wait_for_log_line("Automatic saving is now enabled", pos, timeout=30):
+            if waiter.wait(timeout=30):
                 logger.info("Incremental backup: auto-save re-enabled")
             else:
                 logger.warning("Incremental backup: save-on confirmation not seen")
@@ -1679,7 +1718,7 @@ def main():
 
     bot = telebot.TeleBot(BOT_TOKEN)
 
-    global _bot_ref, _auth_ref
+    global _bot_ref, _auth_ref, _watcher_ref
     _bot_ref = bot
     _auth_ref = auth
 
@@ -1687,6 +1726,7 @@ def main():
 
     notify = make_notify_callback(bot, auth, names, achievements, deaths)
     watcher = LogWatcher(LOG_PATH, names, notify)
+    _watcher_ref = watcher
     observer = Observer()
     observer.schedule(watcher, path=str(LOG_PATH.parent), recursive=False)
     observer.start()
