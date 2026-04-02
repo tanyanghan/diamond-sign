@@ -668,13 +668,17 @@ def rcon_command(cmd: str) -> str:
         mcr.disconnect()
 
 
-def _wait_for_log_line(phrase: str, timeout: float = 60) -> bool:
-    """Tail latest.log and wait for a line containing phrase. Returns True if found."""
-    deadline = time.time() + timeout
+def _log_pos() -> int:
+    """Return the current size of latest.log (call before the RCON command)."""
     try:
-        pos = LOG_PATH.stat().st_size
+        return LOG_PATH.stat().st_size
     except FileNotFoundError:
-        return False
+        return 0
+
+
+def _wait_for_log_line(phrase: str, pos: int, timeout: float = 60) -> bool:
+    """Wait for a line containing phrase in latest.log from pos onwards."""
+    deadline = time.time() + timeout
 
     while time.time() < deadline:
         try:
@@ -707,16 +711,18 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 
     # Disable auto-save, flush world data, then zip while world is frozen
     status("Disabling auto-save...")
+    pos = _log_pos()
     rcon_command("save-off")
-    if _wait_for_log_line("Automatic saving is now disabled", timeout=30):
+    if _wait_for_log_line("Automatic saving is now disabled", pos, timeout=30):
         status("Auto-save disabled")
     else:
         status("Warning: save-off confirmation not seen in log, proceeding anyway")
 
     try:
         status("Saving world...")
+        pos = _log_pos()
         rcon_command("save-all")
-        if _wait_for_log_line("Saved the game", timeout=120):
+        if _wait_for_log_line("Saved the game", pos, timeout=120):
             status("World save complete")
         else:
             status("Warning: save-all confirmation not seen in log, proceeding anyway")
@@ -736,8 +742,9 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
         # Always re-enable auto-save, even if zip fails
+        pos = _log_pos()
         rcon_command("save-on")
-        if _wait_for_log_line("Automatic saving is now enabled", timeout=30):
+        if _wait_for_log_line("Automatic saving is now enabled", pos, timeout=30):
             status("Auto-save re-enabled")
         else:
             status("Warning: save-on confirmation not seen in log")
@@ -850,15 +857,17 @@ def run_incremental_backup() -> str | None:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
         # RCON save-off / save-all / save-on for consistency
+        pos = _log_pos()
         rcon_command("save-off")
-        if _wait_for_log_line("Automatic saving is now disabled", timeout=30):
+        if _wait_for_log_line("Automatic saving is now disabled", pos, timeout=30):
             logger.info("Incremental backup: auto-save disabled")
         else:
             logger.warning("Incremental backup: save-off confirmation not seen, proceeding")
 
         try:
+            pos = _log_pos()
             rcon_command("save-all")
-            if _wait_for_log_line("Saved the game", timeout=120):
+            if _wait_for_log_line("Saved the game", pos, timeout=120):
                 logger.info("Incremental backup: world save complete")
             else:
                 logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
@@ -892,8 +901,9 @@ def run_incremental_backup() -> str | None:
             _save_manifest(new_manifest)
 
         finally:
+            pos = _log_pos()
             rcon_command("save-on")
-            if _wait_for_log_line("Automatic saving is now enabled", timeout=30):
+            if _wait_for_log_line("Automatic saving is now enabled", pos, timeout=30):
                 logger.info("Incremental backup: auto-save re-enabled")
             else:
                 logger.warning("Incremental backup: save-on confirmation not seen")
