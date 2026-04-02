@@ -7,6 +7,7 @@ A Telegram bot that monitors a Minecraft server and sends notifications when pla
 | File | Description |
 |------|-------------|
 | `bot.py` | Main bot — log watcher, Telegram handlers, stats |
+| `restore.py` | Interactive CLI tool for restoring from backup chains |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for required environment variables |
 | `.gitignore` | Excludes secrets, runtime state, and virtualenv |
@@ -58,6 +59,38 @@ The backup feature and any future server commands require RCON to be enabled on 
 2. Restart the Minecraft server for the changes to take effect.
 3. Set the same password in `.env` as `RCON_PASSWORD`.
 
+### Securing the RCON port
+
+RCON transmits passwords and commands in plaintext. If your server is network-accessible, block the RCON port from external access so only the local bot can use it.
+
+**Block external access (iptables):**
+
+```bash
+# Allow RCON on localhost only, drop all other connections to the port
+sudo iptables -A INPUT -i lo -p tcp --dport 25575 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 25575 -j DROP
+
+# Make the rules persist across reboots
+sudo apt install iptables-persistent
+sudo netfilter-persistent save
+```
+
+**Remove the block:**
+
+```bash
+# Remove the two rules (run in this order)
+sudo iptables -D INPUT -p tcp --dport 25575 -j DROP
+sudo iptables -D INPUT -i lo -p tcp --dport 25575 -j ACCEPT
+
+# Update the saved rules (or uninstall iptables-persistent entirely)
+sudo netfilter-persistent save
+
+# Optional: remove persistence package
+sudo apt remove iptables-persistent
+```
+
+You can verify the current rules with `sudo iptables -L INPUT -n --line-numbers`.
+
 ## Backups
 
 The bot performs automated daily backups of the entire Minecraft server directory.
@@ -99,6 +132,58 @@ BACKUP_COPY_CMD=rsync -az {file} user@backup-server:/backups/minecraft/
 
 **Daily auto-backup:** Runs automatically at the configured `BACKUP_HOUR`. Progress is sent to the admin's private chat.
 
+## Incremental Backups
+
+When enabled, the bot performs incremental backups while players are active. Only files that have changed since the last backup are included, saving disk space compared to repeated full backups.
+
+**How it works:**
+
+1. When the first player joins, the incremental backup cycle starts.
+2. Every `INCREMENTAL_INTERVAL_MINUTES` minutes, the bot:
+   - Compares file modification timestamps against a stored manifest.
+   - If changes are detected, runs save-off / save-all / save-on via RCON (same as full backups).
+   - Creates a zip containing only changed/added files, plus `_deletions.json` for removed files.
+3. When the last player leaves, one final incremental backup runs and the cycle stops.
+4. After a full backup, the manifest resets so the next incremental only captures changes since the full backup.
+
+**Configuration:**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `INCREMENTAL_BACKUP_ENABLED` | Enable incremental backups (`true`/`1`/`yes`) | `false` |
+| `INCREMENTAL_INTERVAL_MINUTES` | Minutes between incremental backups while players are active | `15` |
+
+**File naming:**
+
+- Full backups: `servername_20260401_040000.zip`
+- Incremental backups: `servername_incr_20260401_041500.zip`
+
+## Restoring from Backups
+
+Use `restore.py` to restore the server from a backup chain (full + incrementals).
+
+```bash
+python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
+```
+
+**Options:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--backup-dir` | Directory containing backup zip files | `BACKUP_DIR` from `.env` |
+| `--target-dir` | Directory to restore into | `MINECRAFT_DIR` from `.env` |
+| `--dry-run` | Preview what would be restored without writing files | *(off)* |
+
+**How it works:**
+
+1. Scans the backup directory for full and incremental zips.
+2. Groups incrementals under their preceding full backup.
+3. Displays an interactive numbered list of available restore points.
+4. After selecting a point, warns that the Minecraft server **must be stopped** before restoring.
+5. Extracts the full backup, then applies each incremental in order (overwriting changed files and removing deleted ones).
+
+**Important:** Always stop the Minecraft server before restoring. Restoring while the server is running will cause data corruption.
+
 ## Commands
 
 | Command | Description |
@@ -126,9 +211,10 @@ The bot writes the following at runtime (all excluded from git):
 - `player_names.json` — UUID → username mappings learned from server logs
 - `player_achievements.json` — player achievements with timestamps, keyed by UUID
 - `player_deaths.json` — player death history with timestamps, keyed by UUID
+- `backup_manifest.json` — file modification timestamps for incremental backup change detection
 - `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file is created each time the bot starts
 
-Delete `auth.json`, `player_names.json`, `player_achievements.json`, and `player_deaths.json` to reset the bot to a fresh state.
+Delete `auth.json`, `player_names.json`, `player_achievements.json`, and `player_deaths.json` to reset the bot to a fresh state. Delete `backup_manifest.json` to force the next incremental backup to capture all files.
 
 ## Logging
 

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,8 @@ STATS_DIR = Path(MINECRAFT_DIR) / "world" / "stats"
 RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "")
 BACKUP_DIR = Path(os.path.expanduser(os.environ.get("BACKUP_DIR", "~/minecraft_backup")))
 BACKUP_COPY_CMD = os.environ.get("BACKUP_COPY_CMD", "")
+INCREMENTAL_BACKUP_ENABLED = os.environ.get("INCREMENTAL_BACKUP_ENABLED", "").lower() in ("1", "true", "yes")
+INCREMENTAL_INTERVAL_MINUTES = int(os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15"))
 
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
@@ -507,6 +510,12 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
         logger.info("Notification: player %s %s — sending to %d chat(s)", name, status, len(chat_ids))
         _send_to_chats(msg)
 
+        # Incremental backup triggers
+        if event_type == "join" and count == 1:
+            _start_incremental_cycle()
+        elif event_type == "leave" and count == 0:
+            _stop_incremental_cycle(final=True)
+
     return notify
 
 
@@ -638,6 +647,11 @@ def _scan_log_for_deaths(file_path: Path, date_str: str,
 # ---------------------------------------------------------------------------
 # 7d. RCON & Backup
 # ---------------------------------------------------------------------------
+_backup_lock = threading.Lock()
+_bot_ref: telebot.TeleBot | None = None
+_auth_ref: dict | None = None
+
+
 def rcon_command(cmd: str) -> str:
     with MCRcon("localhost", RCON_PASSWORD) as mcr:
         return mcr.command(cmd)
@@ -733,7 +747,215 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         except Exception as e:
             status(f"Copy command error: {e}")
 
+    # Reset incremental manifest baseline after full backup
+    try:
+        fresh_manifest = _build_manifest(Path(MINECRAFT_DIR))
+        _save_manifest(fresh_manifest)
+        logger.info("Backup: incremental manifest reset after full backup")
+    except Exception:
+        logger.exception("Failed to reset incremental manifest after full backup")
+
     return str(final_path)
+
+
+# ---------------------------------------------------------------------------
+# 7e. Incremental Backup
+# ---------------------------------------------------------------------------
+_MANIFEST_PATH = Path(__file__).parent / "backup_manifest.json"
+_incr_timer: threading.Timer | None = None
+_incr_lock = threading.Lock()  # protects _incr_timer
+
+
+def _build_manifest(root: Path) -> dict:
+    """Walk root and return {relative_path: mtime} for every file."""
+    manifest = {}
+    backup_dir_resolved = BACKUP_DIR.resolve()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        dp = Path(dirpath)
+        # Skip the backup output directory if it's inside the server dir
+        try:
+            dp.resolve().relative_to(backup_dir_resolved)
+            continue
+        except ValueError:
+            pass
+        for fn in filenames:
+            fp = dp / fn
+            try:
+                rel = str(fp.relative_to(root)).replace("\\", "/")
+                manifest[rel] = fp.stat().st_mtime
+            except OSError:
+                pass
+    return manifest
+
+
+def _diff_manifest(old: dict, new: dict) -> tuple:
+    """Return (changed_or_added, deleted) lists of relative paths."""
+    changed = []
+    for path, mtime in new.items():
+        if path not in old or old[path] != mtime:
+            changed.append(path)
+    deleted = [path for path in old if path not in new]
+    return changed, deleted
+
+
+def _load_manifest() -> dict:
+    if _MANIFEST_PATH.exists():
+        try:
+            with open(_MANIFEST_PATH) as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Failed to load backup_manifest.json")
+    return {}
+
+
+def _save_manifest(manifest: dict) -> None:
+    with open(_MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f)
+
+
+def run_incremental_backup() -> str | None:
+    """Run an incremental backup of changed files. Returns zip path or None."""
+    if not _backup_lock.acquire(blocking=False):
+        logger.info("Incremental backup skipped: another backup is in progress")
+        return None
+
+    try:
+        mc_dir = Path(MINECRAFT_DIR)
+        old_manifest = _load_manifest()
+        new_manifest = _build_manifest(mc_dir)
+
+        changed, deleted = _diff_manifest(old_manifest, new_manifest)
+        if not changed and not deleted:
+            logger.info("Incremental backup: no changes detected, skipping")
+            return None
+
+        logger.info("Incremental backup: %d changed/added, %d deleted",
+                     len(changed), len(deleted))
+
+        if not RCON_PASSWORD:
+            logger.warning("Incremental backup skipped: RCON_PASSWORD not configured")
+            return None
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+        # RCON save-off / save-all / save-on for consistency
+        rcon_command("save-off")
+        if _wait_for_log_line("Automatic saving is now disabled", timeout=30):
+            logger.info("Incremental backup: auto-save disabled")
+        else:
+            logger.warning("Incremental backup: save-off confirmation not seen, proceeding")
+
+        try:
+            rcon_command("save-all")
+            if _wait_for_log_line("Saved the game", timeout=120):
+                logger.info("Incremental backup: world save complete")
+            else:
+                logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
+
+            # Rebuild manifest after save-all to capture flushed changes
+            new_manifest = _build_manifest(mc_dir)
+            changed, deleted = _diff_manifest(old_manifest, new_manifest)
+
+            if not changed and not deleted:
+                logger.info("Incremental backup: no changes after save-all, skipping")
+                _save_manifest(new_manifest)
+                return None
+
+            dir_name = mc_dir.name
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_name = f"{dir_name}_incr_{timestamp}"
+            zip_path = BACKUP_DIR / f"{zip_name}.zip"
+
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for rel_path in changed:
+                    full_path = mc_dir / rel_path
+                    if full_path.exists():
+                        zf.write(full_path, rel_path)
+                if deleted:
+                    zf.writestr("_deletions.json", json.dumps(deleted, indent=2))
+
+            size_mb = zip_path.stat().st_size / (1024 * 1024)
+            logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
+                        zip_path.name, size_mb, len(changed))
+
+            _save_manifest(new_manifest)
+
+        finally:
+            rcon_command("save-on")
+            if _wait_for_log_line("Automatic saving is now enabled", timeout=30):
+                logger.info("Incremental backup: auto-save re-enabled")
+            else:
+                logger.warning("Incremental backup: save-on confirmation not seen")
+
+        # Copy off-server if configured
+        if BACKUP_COPY_CMD:
+            copy_cmd = BACKUP_COPY_CMD.replace("{file}", str(zip_path))
+            try:
+                result = subprocess.run(copy_cmd, shell=True, capture_output=True,
+                                        text=True, timeout=600)
+                if result.returncode == 0:
+                    logger.info("Incremental backup: copy command completed")
+                else:
+                    logger.warning("Incremental backup: copy command failed (rc=%d): %s",
+                                   result.returncode, result.stderr.strip())
+            except subprocess.TimeoutExpired:
+                logger.warning("Incremental backup: copy command timed out")
+            except Exception as e:
+                logger.warning("Incremental backup: copy command error: %s", e)
+
+        return str(zip_path)
+
+    except Exception:
+        logger.exception("Incremental backup failed")
+        return None
+    finally:
+        _backup_lock.release()
+
+
+def _incremental_cycle():
+    """Run one incremental backup, then reschedule."""
+    global _incr_timer
+    try:
+        run_incremental_backup()
+    finally:
+        with _incr_lock:
+            if _incr_timer is not None:  # still active (not stopped)
+                _incr_timer = threading.Timer(
+                    INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
+                _incr_timer.daemon = True
+                _incr_timer.start()
+
+
+def _start_incremental_cycle():
+    """Start the incremental backup cycle if not already running."""
+    global _incr_timer
+    if not INCREMENTAL_BACKUP_ENABLED:
+        return
+    with _incr_lock:
+        if _incr_timer is not None:
+            return  # already running
+        logger.info("Incremental backup cycle started (every %d min)",
+                    INCREMENTAL_INTERVAL_MINUTES)
+        _incr_timer = threading.Timer(
+            INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
+        _incr_timer.daemon = True
+        _incr_timer.start()
+
+
+def _stop_incremental_cycle(final: bool = False):
+    """Stop the incremental backup cycle. If final=True, run one last backup."""
+    global _incr_timer
+    if not INCREMENTAL_BACKUP_ENABLED:
+        return
+    with _incr_lock:
+        if _incr_timer is None:
+            return
+        _incr_timer.cancel()
+        _incr_timer = None
+    logger.info("Incremental backup cycle stopped")
+    if final:
+        logger.info("Running final incremental backup before stop")
+        threading.Thread(target=run_incremental_backup, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1159,8 +1381,6 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
         logger.info("ScanDeaths: %d new death(s) found", total)
 
     # --- /backup ---
-    _backup_lock = threading.Lock()
-
     @bot.message_handler(commands=["backup"])
     def cmd_backup(message):
         if message.chat.type != "private":
@@ -1269,6 +1489,11 @@ def main():
     deaths = load_deaths(_DEATHS_PATH)
 
     bot = telebot.TeleBot(BOT_TOKEN)
+
+    global _bot_ref, _auth_ref
+    _bot_ref = bot
+    _auth_ref = auth
+
     register_handlers(bot, auth, names, achievements, deaths)
 
     notify = make_notify_callback(bot, auth, names, achievements, deaths)

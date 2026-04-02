@@ -16,6 +16,7 @@ auth.json
 player_names.json
 player_achievements.json
 player_deaths.json
+backup_manifest.json
 logs/
 
 # IDE
