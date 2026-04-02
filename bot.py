@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -744,6 +745,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
                 except ValueError:
                     pass
                 for fn in filenames:
+                    if fn == _CHAIN_MARKER_NAME:
+                        continue
                     fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
                     zf.write(fp, rel)
@@ -776,9 +779,12 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 
     # Reset incremental manifest baseline after full backup
     try:
-        fresh_manifest = _build_manifest(Path(MINECRAFT_DIR))
-        _save_manifest(fresh_manifest)
-        logger.info("Backup: incremental manifest reset after full backup")
+        chain_id = _new_chain_id()
+        fresh_files = _build_manifest(Path(MINECRAFT_DIR))
+        _save_manifest(fresh_files, chain_id=chain_id, base_full=final_path.name)
+        _write_chain_marker(chain_id)
+        logger.info("Backup: new chain %s established (base: %s)",
+                    chain_id, final_path.name)
     except Exception:
         logger.exception("Failed to reset incremental manifest after full backup")
 
@@ -789,8 +795,12 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 # 7e. Incremental Backup
 # ---------------------------------------------------------------------------
 _MANIFEST_PATH = Path(__file__).parent / "backup_manifest.json"
+_CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / ".mcnotifier_chain"
+_CHAIN_MARKER_NAME = ".mcnotifier_chain"
 _incr_timer: threading.Timer | None = None
 _incr_lock = threading.Lock()  # protects _incr_timer
+
+RE_INCR_CHAIN = re.compile(r'^.+?_incr_([0-9a-f]{8})_\d{8}_\d{6}\.zip$')
 
 
 def _build_manifest(root: Path) -> dict:
@@ -806,6 +816,8 @@ def _build_manifest(root: Path) -> dict:
         except ValueError:
             pass
         for fn in filenames:
+            if fn == _CHAIN_MARKER_NAME:
+                continue
             fp = dp / fn
             try:
                 rel = str(fp.relative_to(root)).replace("\\", "/")
@@ -825,19 +837,64 @@ def _diff_manifest(old: dict, new: dict) -> tuple:
     return changed, deleted
 
 
-def _load_manifest() -> dict:
+def _load_manifest() -> tuple:
+    """Return (chain_id, base_full, files_dict)."""
     if _MANIFEST_PATH.exists():
         try:
             with open(_MANIFEST_PATH) as f:
-                return json.load(f)
+                data = json.load(f)
+            return (data.get("chain_id", ""),
+                    data.get("base_full", ""),
+                    data.get("files", {}))
         except Exception:
             logger.exception("Failed to load backup_manifest.json")
-    return {}
+    return "", "", {}
 
 
-def _save_manifest(manifest: dict) -> None:
+def _save_manifest(files: dict, chain_id: str, base_full: str) -> None:
     with open(_MANIFEST_PATH, "w") as f:
-        json.dump(manifest, f)
+        json.dump({"chain_id": chain_id, "base_full": base_full,
+                    "files": files}, f)
+
+
+def _scan_existing_chain_ids() -> set:
+    """Scan BACKUP_DIR for chain IDs already used in incremental filenames."""
+    ids = set()
+    if BACKUP_DIR.exists():
+        for f in BACKUP_DIR.iterdir():
+            m = RE_INCR_CHAIN.match(f.name)
+            if m:
+                ids.add(m.group(1))
+    return ids
+
+
+def _new_chain_id() -> str:
+    """Generate a unique 8-char hex chain ID."""
+    existing = _scan_existing_chain_ids()
+    chain_id = secrets.token_hex(4)
+    while chain_id in existing:
+        chain_id = secrets.token_hex(4)
+    return chain_id
+
+
+def _write_chain_marker(chain_id: str) -> None:
+    """Write chain ID to .mcnotifier_chain in MINECRAFT_DIR."""
+    try:
+        with open(_CHAIN_MARKER_PATH, "w") as f:
+            f.write(chain_id)
+    except Exception:
+        logger.exception("Failed to write chain marker")
+
+
+def _read_chain_marker() -> str:
+    """Read chain ID from .mcnotifier_chain, returns '' if missing."""
+    try:
+        return _CHAIN_MARKER_PATH.read_text().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        logger.exception("Failed to read chain marker")
+        return ""
 
 
 def run_incremental_backup() -> str | None:
@@ -848,10 +905,16 @@ def run_incremental_backup() -> str | None:
 
     try:
         mc_dir = Path(MINECRAFT_DIR)
-        old_manifest = _load_manifest()
+        chain_id, base_full, old_files = _load_manifest()
+
+        if not chain_id:
+            logger.warning("Incremental backup skipped: no chain established. "
+                           "Run a full backup first.")
+            return None
+
         new_manifest = _build_manifest(mc_dir)
 
-        changed, deleted = _diff_manifest(old_manifest, new_manifest)
+        changed, deleted = _diff_manifest(old_files, new_manifest)
         if not changed and not deleted:
             logger.info("Incremental backup: no changes detected, skipping")
             return None
@@ -883,16 +946,16 @@ def run_incremental_backup() -> str | None:
 
             # Rebuild manifest after save-all to capture flushed changes
             new_manifest = _build_manifest(mc_dir)
-            changed, deleted = _diff_manifest(old_manifest, new_manifest)
+            changed, deleted = _diff_manifest(old_files, new_manifest)
 
             if not changed and not deleted:
                 logger.info("Incremental backup: no changes after save-all, skipping")
-                _save_manifest(new_manifest)
+                _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
                 return None
 
             dir_name = mc_dir.name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            zip_name = f"{dir_name}_incr_{timestamp}"
+            zip_name = f"{dir_name}_incr_{chain_id}_{timestamp}"
             zip_path = BACKUP_DIR / f"{zip_name}.zip"
 
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -902,12 +965,14 @@ def run_incremental_backup() -> str | None:
                         zf.write(full_path, rel_path)
                 if deleted:
                     zf.writestr("_deletions.json", json.dumps(deleted, indent=2))
+                zf.writestr("_meta.json", json.dumps({
+                    "chain_id": chain_id, "base_full": base_full}))
 
             size_mb = zip_path.stat().st_size / (1024 * 1024)
             logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
                         zip_path.name, size_mb, len(changed))
 
-            _save_manifest(new_manifest)
+            _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
 
         finally:
             pos = _log_pos()
@@ -1555,6 +1620,21 @@ def main():
                 logger.info("RCON /list: no players online")
         except Exception as e:
             logger.warning("RCON /list failed (server may be offline): %s", e)
+
+    # Validate incremental backup chain
+    chain_id, base_full, _ = _load_manifest()
+    if chain_id:
+        marker = _read_chain_marker()
+        if marker == chain_id:
+            logger.info("Backup chain %s valid (base: %s)", chain_id, base_full)
+        else:
+            logger.warning("Backup chain invalid: manifest chain %s does not match "
+                          "marker %s. Incremental backups will be skipped until "
+                          "a full backup is run.", chain_id, marker or "(missing)")
+            # Clear chain_id so incrementals are skipped
+            _save_manifest({}, chain_id="", base_full="")
+    else:
+        logger.info("No backup chain established. Run /backup to start one.")
 
     class _NetworkErrorFilter(logging.Filter):
         _TRANSIENT = (

@@ -1,8 +1,8 @@
 """Interactive CLI tool for restoring Minecraft server backups.
 
-Scans the backup directory for full and incremental backups, displays
-available restore points, and reconstructs the server state by applying
-the full backup followed by incremental backups in order.
+Scans the backup directory for full and incremental backups, groups
+incrementals by chain ID, and reconstructs the server state by applying
+the full backup followed by the correct incremental chain in order.
 
 Usage:
     python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import zipfile
@@ -23,7 +24,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 RE_FULL = re.compile(r'^(.+?)_(\d{8}_\d{6})\.zip$')
-RE_INCR = re.compile(r'^(.+?)_incr_(\d{8}_\d{6})\.zip$')
+RE_INCR = re.compile(r'^(.+?)_incr_([0-9a-f]{8})_(\d{8}_\d{6})\.zip$')
+CHAIN_MARKER_NAME = ".mcnotifier_chain"
+META_FILES = {"_deletions.json", "_meta.json"}
 
 
 def parse_timestamp(ts: str) -> str:
@@ -31,46 +34,93 @@ def parse_timestamp(ts: str) -> str:
     return f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
 
 
-def scan_backups(backup_dir: Path) -> list:
-    """Scan backup directory and return sorted list of backup entries."""
-    entries = []
+def scan_backups(backup_dir: Path) -> tuple:
+    """Scan backup directory. Returns (full_backups, incremental_backups)."""
+    fulls = {}   # filename -> entry
+    incrs = []   # list of entries
+
     for f in backup_dir.iterdir():
-        if not f.is_file() or not f.suffix == ".zip":
+        if not f.is_file() or f.suffix != ".zip":
             continue
         m = RE_INCR.match(f.name)
         if m:
-            entries.append({
+            incrs.append({
                 "path": f,
-                "type": "incremental",
-                "timestamp": m.group(2),
                 "server": m.group(1),
+                "chain_id": m.group(2),
+                "timestamp": m.group(3),
                 "size": f.stat().st_size,
             })
             continue
         m = RE_FULL.match(f.name)
         if m:
-            entries.append({
+            fulls[f.name] = {
                 "path": f,
-                "type": "full",
-                "timestamp": m.group(2),
                 "server": m.group(1),
+                "timestamp": m.group(2),
                 "size": f.stat().st_size,
-            })
-    entries.sort(key=lambda e: e["timestamp"])
-    return entries
+            }
+
+    return fulls, incrs
 
 
-def group_by_chain(entries: list) -> list:
-    """Group entries into chains, each starting with a full backup."""
+def read_incr_meta(zip_path: Path) -> dict:
+    """Read _meta.json from an incremental zip. Returns {} on failure."""
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            if "_meta.json" in zf.namelist():
+                return json.loads(zf.read("_meta.json"))
+    except Exception:
+        pass
+    return {}
+
+
+def group_by_chain(fulls: dict, incrs: list) -> list:
+    """Group incrementals by chain ID, resolve base full backup for each chain."""
+    # Group incrementals by chain_id
+    chain_map = {}  # chain_id -> list of incr entries
+    for incr in incrs:
+        chain_map.setdefault(incr["chain_id"], []).append(incr)
+
+    # Sort each chain's incrementals by timestamp
+    for chain_id in chain_map:
+        chain_map[chain_id].sort(key=lambda e: e["timestamp"])
+
     chains = []
-    current = None
-    for e in entries:
-        if e["type"] == "full":
-            current = {"full": e, "incrementals": []}
-            chains.append(current)
-        elif current is not None:
-            current["incrementals"].append(e)
-        # Skip incrementals before any full backup
+    for chain_id, chain_incrs in chain_map.items():
+        # Read _meta.json from first incremental to find base_full
+        meta = read_incr_meta(chain_incrs[0]["path"])
+        base_full_name = meta.get("base_full", "")
+        full_entry = fulls.get(base_full_name)
+
+        if not full_entry:
+            # Can't find the base full backup — skip this chain
+            continue
+
+        chains.append({
+            "chain_id": chain_id,
+            "full": full_entry,
+            "incrementals": chain_incrs,
+        })
+
+    # Also add standalone full backups (those not referenced by any chain)
+    referenced_fulls = {c["full"]["path"].name for c in chains}
+    for name, entry in fulls.items():
+        if name not in referenced_fulls:
+            chains.append({
+                "chain_id": None,
+                "full": entry,
+                "incrementals": [],
+            })
+
+    # Sort chains by full backup timestamp, then by first incremental timestamp
+    def chain_sort_key(c):
+        ts = c["full"]["timestamp"]
+        if c["incrementals"]:
+            return (ts, c["incrementals"][0]["timestamp"])
+        return (ts, "")
+
+    chains.sort(key=chain_sort_key)
     return chains
 
 
@@ -89,9 +139,13 @@ def display_restore_points(chains: list) -> list:
 
     for ci, chain in enumerate(chains):
         full = chain["full"]
-        print(f"\n  {num:3d}. [FULL] {parse_timestamp(full['timestamp'])}  "
+        chain_id = chain["chain_id"]
+        header = f"Chain {chain_id}" if chain_id else "Standalone"
+        print(f"\n  {header} (from {full['path'].name})")
+
+        print(f"  {num:3d}. [FULL] {parse_timestamp(full['timestamp'])}  "
               f"({format_size(full['size'])})")
-        points.append((ci, -1))  # -1 means restore to full only
+        points.append((ci, -1))
         num += 1
 
         for ii, incr in enumerate(chain["incrementals"]):
@@ -103,8 +157,28 @@ def display_restore_points(chains: list) -> list:
     return points
 
 
+def _scan_existing_chain_ids(backup_dir: Path) -> set:
+    """Scan backup directory for chain IDs already in use."""
+    ids = set()
+    if backup_dir.exists():
+        for f in backup_dir.iterdir():
+            m = RE_INCR.match(f.name)
+            if m:
+                ids.add(m.group(2))
+    return ids
+
+
+def _new_chain_id(backup_dir: Path) -> str:
+    """Generate a unique 8-char hex chain ID."""
+    existing = _scan_existing_chain_ids(backup_dir)
+    chain_id = secrets.token_hex(4)
+    while chain_id in existing:
+        chain_id = secrets.token_hex(4)
+    return chain_id
+
+
 def restore(chains: list, chain_idx: int, point_idx: int,
-            target_dir: Path, dry_run: bool = False) -> None:
+            target_dir: Path, backup_dir: Path, dry_run: bool = False) -> None:
     """Restore from a full backup + incremental chain up to point_idx."""
     chain = chains[chain_idx]
     full_zip = chain["full"]["path"]
@@ -125,14 +199,13 @@ def restore(chains: list, chain_idx: int, point_idx: int,
     if dry_run:
         print("\n[DRY RUN] No files will be written.")
 
-        # Show what the full backup contains
         with zipfile.ZipFile(full_zip, "r") as zf:
             print(f"\n  Full backup contains {len(zf.namelist())} files")
 
         for incr in incrementals:
             with zipfile.ZipFile(incr["path"], "r") as zf:
                 names = zf.namelist()
-                file_count = len([n for n in names if n != "_deletions.json"])
+                file_count = len([n for n in names if n not in META_FILES])
                 has_deletions = "_deletions.json" in names
                 print(f"  Incremental {incr['path'].name}: "
                       f"{file_count} changed files", end="")
@@ -167,7 +240,7 @@ def restore(chains: list, chain_idx: int, point_idx: int,
         with zipfile.ZipFile(incr_path, "r") as zf:
             # Apply changed/added files
             for name in zf.namelist():
-                if name == "_deletions.json":
+                if name in META_FILES:
                     continue
                 dest = target_dir / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -181,39 +254,47 @@ def restore(chains: list, chain_idx: int, point_idx: int,
                     del_path = target_dir / rel_path
                     if del_path.exists():
                         del_path.unlink()
-                        # Clean up empty parent directories
                         parent = del_path.parent
                         while parent != target_dir and not any(parent.iterdir()):
                             parent.rmdir()
                             parent = parent.parent
 
-        print(f"  Applied ({len([n for n in zf.namelist() if n != '_deletions.json'])} files)")
+        file_count = len([n for n in zf.namelist() if n not in META_FILES])
+        print(f"  Applied ({file_count} files)")
 
-    # Rebuild backup_manifest.json so the bot's incremental backups
-    # use the restored state as the baseline
+    # Rebuild backup_manifest.json with new chain ID
     manifest_path = Path(__file__).parent / "backup_manifest.json"
-    backup_dir = Path(os.path.expanduser(
-        os.environ.get("BACKUP_DIR", "~/minecraft_backup"))).resolve()
+    backup_dir_resolved = backup_dir.resolve()
     print("Rebuilding backup manifest...")
-    manifest = {}
+    files = {}
     for dirpath, _dirnames, filenames in os.walk(target_dir):
         dp = Path(dirpath)
-        # Skip BACKUP_DIR if it's inside the server directory
         try:
-            dp.resolve().relative_to(backup_dir)
+            dp.resolve().relative_to(backup_dir_resolved)
             continue
         except ValueError:
             pass
         for fn in filenames:
+            if fn == CHAIN_MARKER_NAME:
+                continue
             fp = dp / fn
             try:
                 rel = str(fp.relative_to(target_dir)).replace("\\", "/")
-                manifest[rel] = fp.stat().st_mtime
+                files[rel] = fp.stat().st_mtime
             except OSError:
                 pass
+
+    chain_id = _new_chain_id(backup_dir)
     with open(manifest_path, "w") as f:
-        json.dump(manifest, f)
-    print(f"  Manifest rebuilt with {len(manifest)} files.")
+        json.dump({"chain_id": chain_id, "base_full": full_zip.name,
+                    "files": files}, f)
+    print(f"  Manifest rebuilt with {len(files)} files (new chain: {chain_id})")
+
+    # Write chain marker in the restored server directory
+    marker_path = target_dir / CHAIN_MARKER_NAME
+    with open(marker_path, "w") as f:
+        f.write(chain_id)
+    print(f"  Chain marker written.")
 
     print(f"\nRestore complete. Server files are in: {target_dir}")
 
@@ -245,12 +326,12 @@ def main():
             print("Error: No --target-dir specified and MINECRAFT_DIR not set in .env")
             sys.exit(1)
 
-    entries = scan_backups(backup_dir)
-    if not entries:
+    fulls, incrs = scan_backups(backup_dir)
+    if not fulls and not incrs:
         print(f"No backup files found in {backup_dir}")
         sys.exit(1)
 
-    chains = group_by_chain(entries)
+    chains = group_by_chain(fulls, incrs)
     if not chains:
         print("No full backups found. Cannot restore from incremental backups alone.")
         sys.exit(1)
@@ -293,7 +374,7 @@ def main():
             print("\nPlease stop the Minecraft server first, then run this tool again.")
             return
 
-    restore(chains, chain_idx, point_idx, target_dir, dry_run=args.dry_run)
+    restore(chains, chain_idx, point_idx, target_dir, backup_dir, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

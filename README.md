@@ -147,6 +147,10 @@ When enabled, the bot performs incremental backups while players are active. Onl
 3. When the last player leaves, one final incremental backup runs and the cycle stops.
 4. After a full backup, the manifest resets so the next incremental only captures changes since the full backup.
 
+**Chain tracking:** Each full backup starts a new chain identified by a unique 8-character hex ID. Incremental backups embed this chain ID in their filenames and contents. This ensures that after a restore, new incrementals are correctly distinguished from old ones — even when multiple chains share the same base full backup.
+
+A `.mcnotifier_chain` marker file is written in the Minecraft server directory to detect if the server state was replaced while the bot was offline. If the marker doesn't match the manifest's chain ID on startup, incremental backups are skipped until a new full backup establishes a fresh chain.
+
 **Configuration:**
 
 | Variable | Description | Default |
@@ -157,7 +161,7 @@ When enabled, the bot performs incremental backups while players are active. Onl
 **File naming:**
 
 - Full backups: `servername_20260401_040000.zip`
-- Incremental backups: `servername_incr_20260401_041500.zip`
+- Incremental backups: `servername_incr_a1b2c3d4_20260401_041500.zip` (includes chain ID)
 
 ## Restoring from Backups
 
@@ -178,12 +182,15 @@ python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
 **How it works:**
 
 1. Scans the backup directory for full and incremental zips.
-2. Groups incrementals under their preceding full backup.
-3. Displays an interactive numbered list of available restore points.
+2. Groups incrementals by chain ID (reads `_meta.json` from each incremental zip).
+3. Displays restore points organised by chain, each linked to its base full backup.
 4. After selecting a point, warns that the Minecraft server **must be stopped** before restoring.
-5. Extracts the full backup, then applies each incremental in order (overwriting changed files and removing deleted ones).
+5. Extracts the full backup, then applies each incremental in the chain up to the selected point.
+6. Rebuilds `backup_manifest.json` and `.mcnotifier_chain` with a new chain ID so incremental backups resume cleanly.
 
 **Important:** Always stop the Minecraft server before restoring. Restoring while the server is running will cause data corruption.
+
+**If you restore by other means** (manual copy, other tools): delete `backup_manifest.json` and `.mcnotifier_chain` from the server directory to force the bot to start a fresh chain with the next full backup.
 
 ## Commands
 
@@ -212,10 +219,11 @@ The bot writes the following at runtime (all excluded from git):
 - `player_names.json` — UUID → username mappings learned from server logs
 - `player_achievements.json` — player achievements with timestamps, keyed by UUID
 - `player_deaths.json` — player death history with timestamps, keyed by UUID
-- `backup_manifest.json` — file modification timestamps for incremental backup change detection
+- `backup_manifest.json` — incremental backup state: chain ID, base full backup, and file modification timestamps
+- `<MINECRAFT_DIR>/.mcnotifier_chain` — chain validity marker written in the server directory
 - `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file is created each time the bot starts
 
-Delete `auth.json`, `player_names.json`, `player_achievements.json`, and `player_deaths.json` to reset the bot to a fresh state. Delete `backup_manifest.json` to force the next incremental backup to capture all files.
+Delete `auth.json`, `player_names.json`, `player_achievements.json`, and `player_deaths.json` to reset the bot to a fresh state. Delete `backup_manifest.json` and `.mcnotifier_chain` to force a fresh backup chain.
 
 ## Logging
 
