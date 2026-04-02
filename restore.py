@@ -50,6 +50,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from shutil import get_terminal_size
 
 from dotenv import load_dotenv
 
@@ -193,34 +194,294 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes / 1024:.1f} KB"
 
 
-def display_restore_points(chains: list) -> list:
-    """Display numbered restore points and return flat list of
-    (chain_idx, point_idx) tuples.
+def _read_key() -> str:
+    """Read a single keypress from stdin in raw mode.
 
-    point_idx == -1 means the full backup itself.
-    point_idx >= 0 means the incremental at that index within the chain.
+    Returns one of: 'UP', 'DOWN', 'LEFT', 'RIGHT', 'ENTER', 'BACKSPACE',
+    'ESC', or the character itself for printable keys.
+    Works on both Unix (termios) and Windows (msvcrt).
+    """
+    if sys.platform == 'win32':
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ('\x00', '\xe0'):  # Windows special key escape prefix
+            ch2 = msvcrt.getwch()
+            return {'H': 'UP', 'P': 'DOWN', 'K': 'LEFT', 'M': 'RIGHT'}.get(ch2, '')
+        if ch == '\r':
+            return 'ENTER'
+        if ch == '\x1b':
+            return 'ESC'
+        if ch in ('\x08', '\x7f'):
+            return 'BACKSPACE'
+        return ch
+    else:
+        import termios
+        import tty
+        import select as _select
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                # Arrow keys send a 3-byte escape sequence: ESC [ A/B/C/D
+                r, _, _ = _select.select([sys.stdin], [], [], 0.05)
+                if r:
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        r2, _, _ = _select.select([sys.stdin], [], [], 0.05)
+                        if r2:
+                            ch3 = sys.stdin.read(1)
+                            return {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT',
+                                    'D': 'LEFT'}.get(ch3, 'ESC')
+                return 'ESC'
+            if ch in ('\r', '\n'):
+                return 'ENTER'
+            if ch in ('\x7f', '\x08'):
+                return 'BACKSPACE'
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _paginate(lines: list, date_to_line: dict | None = None,
+              header: str | None = None,
+              point_lines: list | None = None) -> int | None:
+    """Interactively display paginated lines with highlight and selection.
+
+    Args:
+        lines:        All display lines to page through.
+        date_to_line: Maps 'YYYY-MM-DD' to the first line index on that date.
+        header:       Reprinted at the top of every page.
+        point_lines:  Sorted list of line indices that are selectable points.
+                      Up/Down arrows move the highlight; Enter selects.
+                      If None, operates in display-only mode.
+
+    Navigation:
+        ↑ / ↓ arrows  — move highlight between selectable points (follows
+                         across page boundaries automatically)
+        ← arrow / p   — previous page; highlight moves to first point on page
+        → arrow / n   — next page;     highlight moves to first point on page
+        Enter         — select highlighted point, or submit typed input
+        Digit / '-'   — append to input buffer (type a number or YYYY-MM-DD)
+        Backspace     — remove last char from input buffer
+        Esc           — clear input buffer
+        q             — cancel without selection
+
+    Returns: index into point_lines of the selected point, or None if cancelled.
+    Non-TTY: prints header + all lines once and returns None.
+    """
+    if not sys.stdout.isatty():
+        if header:
+            print(header)
+        print("\n".join(lines))
+        return None
+
+    import re as _re
+    _date_re = _re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+    header_lines = header.splitlines() if header else []
+    # Reserve two rows: one for the status bar, one breathing line below header
+    page_size = max(5, get_terminal_size(fallback=(80, 24)).lines
+                    - len(header_lines) - 2)
+    total_pages = max(1, (len(lines) + page_size - 1) // page_size)
+
+    def line_page(li: int) -> int:
+        """Page number (0-based) that contains line index li."""
+        return li // page_size
+
+    def first_point_on_page(p: int):
+        """Index into point_lines of the first selectable point on page p.
+        Returns None if no selectable points are on that page.
+        """
+        start, end = p * page_size, (p + 1) * page_size
+        for i, li in enumerate(point_lines):
+            if start <= li < end:
+                return i
+        return None
+
+    # Initialise page and highlight index (hi = index into point_lines)
+    if point_lines:
+        page = line_page(point_lines[0])
+        hi = 0
+    else:
+        page = 0
+        hi = -1
+
+    # Accumulates typed digits/hyphens for number or date input
+    input_buf = ""
+
+    def render():
+        term_w = get_terminal_size(fallback=(80, 24)).columns
+        # Clear screen and return cursor to top-left on every redraw so that
+        # backward page navigation doesn't leave stale content visible
+        print("\033[2J\033[H", end="", flush=True)
+
+        if header:
+            print(header)
+
+        start = page * page_size
+        end = min(start + page_size, len(lines))
+        for li in range(start, end):
+            line = lines[li]
+            if point_lines is not None and hi >= 0 and li == point_lines[hi]:
+                # Draw highlighted point with ANSI reverse video.
+                # Pad to terminal width so the bar spans the full line.
+                padded = line.ljust(term_w - 1)
+                print(f"\033[7m{padded}\033[0m")
+            else:
+                print(line)
+
+        # Compact status bar with context-sensitive navigation hints
+        is_last = end >= len(lines)
+        nav = []
+        if point_lines:
+            nav.append("↑↓ highlight  Enter select")
+        if page > 0:
+            nav.append("←/p prev")
+        if not is_last:
+            nav.append("→/n next")
+        nav.append("# num")
+        if date_to_line:
+            nav.append("YYYY-MM-DD jump")
+        nav.append("q quit")
+
+        page_str = f"Page {page + 1}/{total_pages}"
+        nav_str = "  ".join(nav)
+        if input_buf:
+            status = f"\n  {page_str}  |  Input: {input_buf}_   ({nav_str})"
+        else:
+            status = f"\n  {page_str}  |  {nav_str}"
+        print(status, end="", flush=True)
+
+    while True:
+        render()
+        key = _read_key()
+
+        if not key:
+            continue
+
+        if key == 'q':
+            print()
+            return None
+
+        elif key == 'ENTER':
+            if input_buf:
+                if date_to_line and _date_re.match(input_buf):
+                    # Jump to the first entry on or after the given date.
+                    # Dates are YYYY-MM-DD so lexicographic comparison works.
+                    candidates = [(d, li) for d, li in date_to_line.items()
+                                  if d >= input_buf]
+                    if candidates:
+                        target_line = min(candidates, key=lambda x: x[0])[1]
+                        page = line_page(target_line)
+                        if point_lines:
+                            for i, li in enumerate(point_lines):
+                                if li >= target_line:
+                                    hi = i
+                                    break
+                else:
+                    try:
+                        n = int(input_buf) - 1
+                        if point_lines and 0 <= n < len(point_lines):
+                            print()
+                            return n
+                    except ValueError:
+                        pass
+                input_buf = ""
+            elif point_lines and hi >= 0:
+                print()
+                return hi
+
+        elif key == 'BACKSPACE':
+            if input_buf:
+                input_buf = input_buf[:-1]
+
+        elif key == 'ESC':
+            input_buf = ""
+
+        elif key.isdigit() or key == '-':
+            input_buf += key
+
+        elif key == 'UP':
+            input_buf = ""
+            if point_lines and hi > 0:
+                hi -= 1
+                # Follow the highlight across page boundaries
+                page = line_page(point_lines[hi])
+
+        elif key == 'DOWN':
+            input_buf = ""
+            if point_lines and hi < len(point_lines) - 1:
+                hi += 1
+                page = line_page(point_lines[hi])
+
+        elif key in ('RIGHT', 'n', 'N'):
+            input_buf = ""
+            if page < total_pages - 1:
+                page += 1
+                if point_lines:
+                    fp = first_point_on_page(page)
+                    if fp is not None:
+                        hi = fp
+            # Already on last page: highlight stays
+
+        elif key in ('LEFT', 'p', 'P', 'b', 'B'):
+            input_buf = ""
+            if page > 0:
+                page -= 1
+                if point_lines:
+                    fp = first_point_on_page(page)
+                    if fp is not None:
+                        hi = fp
+            # Already on first page: highlight stays
+
+
+def display_restore_points(chains: list, header: str | None = None) -> tuple:
+    """Build and display paginated restore points with interactive selection.
+
+    Returns (points, selected_idx) where:
+      - points: flat list of (chain_idx, point_idx) tuples
+      - selected_idx: index into points chosen interactively, or None
+
+    point_idx == -1 selects the full backup only; >= 0 selects the
+    incremental at that index within the chain.
     """
     points = []
+    lines = []
+    # Maps 'YYYY-MM-DD' -> index of the first line in `lines` on that date
+    date_to_line: dict[str, int] = {}
+    # Line index in `lines` for each selectable point, parallel to `points`
+    point_lines: list[int] = []
     num = 1
 
     for ci, chain in enumerate(chains):
         full = chain["full"]
         chain_id = chain["chain_id"]
-        header = f"Chain {chain_id}" if chain_id else "Standalone"
-        print(f"\n  {header} (from {full['path'].name})")
+        chain_header = f"Chain {chain_id}" if chain_id else "Standalone"
+        lines.append("")
+        lines.append(f"  {chain_header} (from {full['path'].name})")
 
-        print(f"  {num:3d}. [FULL] {parse_timestamp(full['timestamp'])}  "
-              f"({format_size(full['size'])})")
+        full_date = parse_timestamp(full["timestamp"])[:10]  # 'YYYY-MM-DD'
+        date_to_line.setdefault(full_date, len(lines))
+        point_lines.append(len(lines))   # record index before appending line
+        lines.append(f"  {num:3d}. [FULL] {parse_timestamp(full['timestamp'])}  "
+                     f"({format_size(full['size'])})")
         points.append((ci, -1))
         num += 1
 
         for ii, incr in enumerate(chain["incrementals"]):
-            print(f"  {num:3d}.   └─ [INCR] {parse_timestamp(incr['timestamp'])}  "
-                  f"({format_size(incr['size'])})")
+            incr_date = parse_timestamp(incr["timestamp"])[:10]
+            date_to_line.setdefault(incr_date, len(lines))
+            point_lines.append(len(lines))   # record index before appending line
+            lines.append(f"  {num:3d}.   └─ [INCR] {parse_timestamp(incr['timestamp'])}  "
+                         f"({format_size(incr['size'])})")
             points.append((ci, ii))
             num += 1
 
-    return points
+    selected_idx = _paginate(lines, date_to_line, header=header,
+                             point_lines=point_lines)
+    return points, selected_idx
 
 
 def restore(chains: list, chain_idx: int, point_idx: int,
@@ -466,31 +727,40 @@ def main():
         print("No full backups found. Cannot restore from incremental backups alone.")
         sys.exit(1)
 
-    print("=" * 60)
-    print("  Minecraft Server Backup Restore Tool")
-    print("=" * 60)
-    print(f"\nBackup directory: {backup_dir}")
-    print(f"Target directory: {target_dir}")
-    print(f"\nAvailable restore points:")
+    header = "\n".join([
+        "=" * 60,
+        "  Minecraft Server Backup Restore Tool",
+        "=" * 60,
+        f"  Backup directory: {backup_dir}",
+        f"  Target directory: {target_dir}",
+        "",
+        "  Available restore points:",
+    ])
 
-    points = display_restore_points(chains)
+    points, selected_idx = display_restore_points(chains, header=header)
 
-    print(f"\n  Enter a number (1-{len(points)}) to select a restore point, or 'q' to quit.")
-    choice = input("\n  Selection: ").strip()
+    if selected_idx is None:
+        if not sys.stdout.isatty():
+            # Non-TTY (e.g. piped input): fall back to a text selection prompt
+            print(f"\n  Enter a number (1-{len(points)}) to restore, or 'q' to quit.")
+            choice = input("\n  Selection: ").strip()
+            if choice.lower() == "q":
+                print("Cancelled.")
+                return
+            try:
+                idx = int(choice) - 1
+                if idx < 0 or idx >= len(points):
+                    raise ValueError
+                selected_idx = idx
+            except ValueError:
+                print("Invalid selection.")
+                sys.exit(1)
+        else:
+            # TTY: user pressed q in the interactive paginator
+            print("Cancelled.")
+            return
 
-    if choice.lower() == "q":
-        print("Cancelled.")
-        return
-
-    try:
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(points):
-            raise ValueError
-    except ValueError:
-        print("Invalid selection.")
-        sys.exit(1)
-
-    chain_idx, point_idx = points[idx]
+    chain_idx, point_idx = points[selected_idx]
 
     if not args.dry_run:
         # Server offline warning — restoring while the server is running
