@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import threading
 import time
 import zipfile
@@ -19,6 +18,7 @@ from watchdog.observers import Observer
 
 from backup_utils import (
     CHAIN_MARKER_NAME, RE_INCR, build_file_manifest, new_chain_id,
+    run_copy_command,
 )
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,6 @@ STATS_DIR = Path(MINECRAFT_DIR) / "world" / "stats"
 
 RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "")
 BACKUP_DIR = Path(os.path.expanduser(os.environ.get("BACKUP_DIR", "~/minecraft_backup")))
-BACKUP_COPY_CMD = os.environ.get("BACKUP_COPY_CMD", "")
 INCREMENTAL_BACKUP_ENABLED = os.environ.get("INCREMENTAL_BACKUP_ENABLED", "").lower() in ("1", "true", "yes")
 INCREMENTAL_INTERVAL_MINUTES = int(os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15"))
 
@@ -786,20 +785,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
             status("Warning: save-on confirmation not seen in log")
 
     # Step 5: Copy off-server if configured (e.g., rsync to NAS/cloud)
-    if BACKUP_COPY_CMD:
-        copy_cmd = BACKUP_COPY_CMD.replace("{file}", str(final_path))
-        status(f"Running copy command...")
-        try:
-            result = subprocess.run(copy_cmd, shell=True, capture_output=True,
-                                    text=True, timeout=600)
-            if result.returncode == 0:
-                status("Copy command completed successfully")
-            else:
-                status(f"Copy command failed (rc={result.returncode}): {result.stderr.strip()}")
-        except subprocess.TimeoutExpired:
-            status("Copy command timed out after 10 minutes")
-        except Exception as e:
-            status(f"Copy command error: {e}")
+    run_copy_command(final_path, log_fn=status)
 
     # Step 6: Start a new incremental chain
     # Every full backup starts a fresh chain. The manifest records the mtime
@@ -1029,20 +1015,7 @@ def run_incremental_backup() -> str | None:
                 logger.warning("Incremental backup: save-on confirmation not seen")
 
         # Copy off-server if configured
-        if BACKUP_COPY_CMD:
-            copy_cmd = BACKUP_COPY_CMD.replace("{file}", str(zip_path))
-            try:
-                result = subprocess.run(copy_cmd, shell=True, capture_output=True,
-                                        text=True, timeout=600)
-                if result.returncode == 0:
-                    logger.info("Incremental backup: copy command completed")
-                else:
-                    logger.warning("Incremental backup: copy command failed (rc=%d): %s",
-                                   result.returncode, result.stderr.strip())
-            except subprocess.TimeoutExpired:
-                logger.warning("Incremental backup: copy command timed out")
-            except Exception as e:
-                logger.warning("Incremental backup: copy command error: %s", e)
+        run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
 
         return str(zip_path)
 

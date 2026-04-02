@@ -46,6 +46,7 @@ updated to reflect the new state.
 import os
 import re
 import secrets
+import subprocess
 from pathlib import Path
 
 # Name of the chain marker file placed in the Minecraft server directory.
@@ -133,3 +134,39 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None) -> dict:
             except OSError:
                 pass
     return files
+
+
+def run_copy_command(file_path: Path, log_fn=None) -> None:
+    """Run BACKUP_COPY_CMD to upload a backup file to off-server storage.
+
+    Reads BACKUP_COPY_CMD from the environment. The placeholder {file} in the
+    command is replaced with the full path to the backup zip. Does nothing if
+    BACKUP_COPY_CMD is not set.
+
+    Args:
+        file_path: Path to the backup zip file to copy.
+        log_fn:    Callback for status messages, e.g. logger.info or print.
+                   If None, messages are silently discarded.
+    """
+    cmd_template = os.environ.get("BACKUP_COPY_CMD", "")
+    if not cmd_template:
+        return
+
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    copy_cmd = cmd_template.replace("{file}", str(file_path))
+    log("Running copy command...")
+    try:
+        result = subprocess.run(copy_cmd, shell=True, capture_output=True,
+                                text=True, timeout=600)
+        if result.returncode == 0:
+            log("Copy command completed successfully")
+        else:
+            log(f"Copy command failed (rc={result.returncode}): "
+                f"{result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        log("Copy command timed out after 10 minutes")
+    except Exception as e:
+        log(f"Copy command error: {e}")

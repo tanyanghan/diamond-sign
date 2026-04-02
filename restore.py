@@ -55,7 +55,7 @@ from dotenv import load_dotenv
 
 from backup_utils import (
     CHAIN_MARKER_NAME, META_FILES, RE_FULL, RE_INCR,
-    build_file_manifest, new_chain_id,
+    build_file_manifest, new_chain_id, run_copy_command,
 )
 
 # Load .env for defaults (BACKUP_DIR, MINECRAFT_DIR)
@@ -393,6 +393,9 @@ def restore(chains: list, chain_idx: int, point_idx: int,
                     "chain_id": chain_id, "base_full": full_zip.name}))
 
             print(f"  Merged incremental created ({format_size(merged_path.stat().st_size)})")
+
+            # Upload the merged incremental to off-server storage if configured
+            run_copy_command(merged_path, log_fn=print)
 
         finally:
             # Clean up the temporary directory
