@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -1549,31 +1549,57 @@ def main():
 
     logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter())
 
-    # Daily backup scheduler (runs at 04:00)
+    # Scheduled full backup
     _BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "4"))
+    _BACKUP_SCHEDULE = os.environ.get("BACKUP_SCHEDULE", "daily").lower()
 
-    def _daily_backup_loop():
+    def _next_backup_time(now: datetime) -> datetime:
+        """Calculate the next scheduled backup time."""
+        from calendar import monthrange
+
+        target = now.replace(hour=_BACKUP_HOUR, minute=0, second=0, microsecond=0)
+
+        if _BACKUP_SCHEDULE == "weekly":
+            # Run on Monday at _BACKUP_HOUR
+            days_ahead = (7 - now.weekday()) % 7  # Monday = 0
+            target = target + timedelta(days=days_ahead)
+            if target <= now:
+                target = target + timedelta(weeks=1)
+        elif _BACKUP_SCHEDULE == "monthly":
+            # Run on the 1st of each month at _BACKUP_HOUR
+            target = target.replace(day=1)
+            if target <= now:
+                # Advance to 1st of next month
+                if now.month == 12:
+                    target = target.replace(year=now.year + 1, month=1)
+                else:
+                    target = target.replace(month=now.month + 1)
+        else:
+            # Daily (default)
+            if target <= now:
+                target = target + timedelta(days=1)
+
+        return target
+
+    def _scheduled_backup_loop():
         while True:
             now = datetime.now()
-            # Next run at _BACKUP_HOUR:00
-            target = now.replace(hour=_BACKUP_HOUR, minute=0, second=0, microsecond=0)
-            if target <= now:
-                target = target.replace(day=target.day + 1)
+            target = _next_backup_time(now)
             wait = (target - now).total_seconds()
-            logger.info("Daily backup scheduled in %.0f seconds (at %s)", wait,
-                        target.strftime("%Y-%m-%d %H:%M"))
+            logger.info("Next %s backup in %.0f seconds (at %s)", _BACKUP_SCHEDULE,
+                        wait, target.strftime("%Y-%m-%d %H:%M"))
             time.sleep(wait)
 
             if not RCON_PASSWORD:
-                logger.warning("Daily backup skipped: RCON_PASSWORD not configured")
+                logger.warning("Scheduled backup skipped: RCON_PASSWORD not configured")
                 continue
 
-            logger.info("Daily backup starting")
+            logger.info("Scheduled %s backup starting", _BACKUP_SCHEDULE)
             def status_cb(msg):
                 admin_id = auth.get("admin_user_id")
                 if admin_id:
                     try:
-                        bot.send_message(admin_id, f"[Daily Backup] {msg}")
+                        bot.send_message(admin_id, f"[Backup] {msg}")
                     except Exception:
                         pass
 
@@ -1581,10 +1607,10 @@ def main():
                 path = run_backup(bot, auth, status_cb=status_cb)
                 status_cb(f"Complete: {Path(path).name}")
             except Exception as e:
-                logger.exception("Daily backup failed")
+                logger.exception("Scheduled backup failed")
                 status_cb(f"Failed: {e}")
 
-    backup_thread = threading.Thread(target=_daily_backup_loop, daemon=True)
+    backup_thread = threading.Thread(target=_scheduled_backup_loop, daemon=True)
     backup_thread.start()
 
     try:

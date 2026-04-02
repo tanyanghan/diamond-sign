@@ -93,7 +93,7 @@ You can verify the current rules with `sudo iptables -L INPUT -n --line-numbers`
 
 ## Backups
 
-The bot performs automated daily backups of the entire Minecraft server directory.
+The bot performs automated full backups of the entire Minecraft server directory on a configurable schedule (daily, weekly, or monthly).
 
 **How it works:**
 
@@ -111,7 +111,8 @@ Players do not need to be kicked — the save-off/save-all/save-on sequence ensu
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RCON_PASSWORD` | Must match `server.properties` `rcon.password` | *(required for backup)* |
-| `BACKUP_HOUR` | Hour of day (0–23) for the daily auto-backup | `4` |
+| `BACKUP_SCHEDULE` | How often to run full backups: `daily`, `weekly` (Monday), or `monthly` (1st) | `daily` |
+| `BACKUP_HOUR` | Hour of day (0–23) for the scheduled backup | `4` |
 | `BACKUP_DIR` | Directory where backup zips are saved | `~/minecraft_backup` |
 | `BACKUP_COPY_CMD` | Shell command to copy the zip off-server; `{file}` is replaced with the full zip path | *(empty — disabled)* |
 
@@ -130,7 +131,7 @@ BACKUP_COPY_CMD=rsync -az {file} user@backup-server:/backups/minecraft/
 
 **Manual backup:** The admin can trigger a backup at any time via `/backup` in a private message. Progress updates are sent as the backup runs.
 
-**Daily auto-backup:** Runs automatically at the configured `BACKUP_HOUR`. Progress is sent to the admin's private chat.
+**Scheduled auto-backup:** Runs automatically at the configured `BACKUP_HOUR` on the schedule set by `BACKUP_SCHEDULE`. Progress is sent to the admin's private chat.
 
 ## Incremental Backups
 
