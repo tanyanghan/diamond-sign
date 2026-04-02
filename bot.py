@@ -655,9 +655,71 @@ _bot_ref: telebot.TeleBot | None = None
 _auth_ref: dict | None = None
 
 
+def _validate_server_properties() -> list:
+    """Check server.properties for RCON settings and return a list of warnings.
+
+    Verifies:
+    - enable-rcon=true (RCON must be enabled for backups and /list to work)
+    - rcon.port matches the port used by rcon_command() (25575)
+    - rcon.password matches RCON_PASSWORD from .env
+
+    Returns an empty list if everything is OK, or a list of warning strings.
+    """
+    props_path = Path(MINECRAFT_DIR) / "server.properties"
+    if not props_path.exists():
+        return [f"server.properties not found at {props_path}"]
+
+    warnings = []
+    props = {}
+    with open(props_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                # Java .properties files escape special characters with
+                # backslashes (e.g., \! \: \= \\). Unescape so we can
+                # compare against the actual values from .env.
+                value = value.strip().replace("\\!", "!").replace("\\:", ":") \
+                             .replace("\\=", "=").replace("\\\\", "\\")
+                props[key.strip()] = value
+
+    if props.get("enable-rcon", "false").lower() != "true":
+        warnings.append("server.properties: enable-rcon is not set to true")
+
+    server_port = props.get("rcon.port", "25575")
+    if server_port != "25575":
+        warnings.append(f"server.properties: rcon.port is {server_port}, "
+                        f"but bot is configured to use 25575")
+
+    server_password = props.get("rcon.password", "")
+    if server_password != RCON_PASSWORD:
+        warnings.append("server.properties: rcon.password does not match "
+                        "RCON_PASSWORD from .env")
+
+    return warnings
+
+
+def _wait_for_rcon_ready(timeout: float = 120) -> bool:
+    """Monitor latest.log until RCON is listening, or timeout.
+
+    Watches for the line "RCON running on" in latest.log, which indicates the
+    Minecraft server's RCON listener has started and is ready to accept
+    connections. This is needed on startup because the bot may start before
+    the Minecraft server has fully initialised.
+
+    Returns True if RCON is ready, False if timed out.
+    """
+    pos = _log_pos()
+    logger.info("Waiting for RCON to be ready (monitoring latest.log)...")
+    return _wait_for_log_line("RCON running on", pos, timeout=timeout)
+
+
 def rcon_command(cmd: str) -> str:
-    # MCRcon.__init__ uses signal.SIGALRM which fails in non-main threads.
-    # Bypass __init__ and set up the object manually.
+    """Send an RCON command to the Minecraft server and return the response.
+
+    MCRcon.__init__ uses signal.SIGALRM which fails in non-main threads.
+    We bypass __init__ and set up the object manually to avoid this.
+    """
     mcr = MCRcon.__new__(MCRcon)
     mcr.host = "localhost"
     mcr.password = RCON_PASSWORD
@@ -1630,10 +1692,38 @@ def main():
     observer.start()
     logger.info("Watching %s for join/leave events", LOG_PATH)
 
-    # Capture any players already online via RCON /list
+    # Validate server.properties RCON settings before attempting any RCON commands.
+    # If validation fails, skip RCON entirely — the settings are wrong and
+    # connections will fail regardless.
+    rcon_ok = False
     if RCON_PASSWORD:
+        prop_warnings = _validate_server_properties()
+        if prop_warnings:
+            for warning in prop_warnings:
+                logger.warning(warning)
+            logger.warning("RCON commands disabled due to server.properties issues")
+        else:
+            rcon_ok = True
+
+    # Capture any players already online via RCON /list.
+    # The server may already be running (bot restarted), or it may still be
+    # starting up. We try /list immediately; if it fails, we watch latest.log
+    # for the "RCON running on" line and retry. If that also times out, the
+    # server is likely not running — alert the admin.
+    if rcon_ok:
+        resp = None
         try:
             resp = rcon_command("list")
+        except Exception as e:
+            logger.warning("RCON /list failed, server may still be starting: %s", e)
+            if _wait_for_rcon_ready(timeout=120):
+                logger.info("RCON is now ready, retrying /list")
+                try:
+                    resp = rcon_command("list")
+                except Exception as e2:
+                    logger.warning("RCON /list retry failed: %s", e2)
+
+        if resp is not None:
             # Response: "There are X of a max of Y players online: p1, p2"
             m = re.match(r'There are \d+ of a max of \d+ players online:(.*)', resp)
             if m:
@@ -1650,8 +1740,21 @@ def main():
                     logger.info("RCON /list: no players online")
             else:
                 logger.info("RCON /list: no players online")
-        except Exception as e:
-            logger.warning("RCON /list failed (server may be offline): %s", e)
+        else:
+            # RCON never connected — server is likely not running.
+            # Alert the admin via Telegram so they know.
+            logger.error("Could not connect to Minecraft server RCON. "
+                         "Server may not be running.")
+            admin_id = auth.get("admin_user_id")
+            if admin_id:
+                try:
+                    bot.send_message(
+                        admin_id,
+                        "\u26a0\ufe0f Could not connect to Minecraft server RCON.\n"
+                        "The server may not be running or RCON is not ready.\n"
+                        "Backups and /list will not work until the server is up.")
+                except Exception:
+                    logger.warning("Failed to send RCON alert to admin")
 
     # Validate incremental backup chain
     chain_id, base_full, _ = _load_manifest()
