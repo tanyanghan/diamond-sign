@@ -727,17 +727,26 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         else:
             status("Warning: save-all confirmation not seen in log, proceeding anyway")
 
-        # Zip the directory
+        # Zip the directory (paths relative to MINECRAFT_DIR, matching incremental format)
         mc_dir = Path(MINECRAFT_DIR)
         dir_name = mc_dir.name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"{dir_name}_{timestamp}"
-        zip_path = BACKUP_DIR / zip_name
+        final_path = BACKUP_DIR / f"{dir_name}_{timestamp}.zip"
+        backup_dir_resolved = BACKUP_DIR.resolve()
 
         status(f"Zipping {mc_dir} ...")
-        shutil.make_archive(str(zip_path), "zip", root_dir=str(mc_dir.parent),
-                            base_dir=dir_name)
-        final_path = Path(f"{zip_path}.zip")
+        with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for dirpath, _dirnames, filenames in os.walk(mc_dir):
+                dp = Path(dirpath)
+                try:
+                    dp.resolve().relative_to(backup_dir_resolved)
+                    continue
+                except ValueError:
+                    pass
+                for fn in filenames:
+                    fp = dp / fn
+                    rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
+                    zf.write(fp, rel)
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:

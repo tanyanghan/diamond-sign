@@ -157,18 +157,7 @@ def restore(chains: list, chain_idx: int, point_idx: int,
     # Extract full backup
     print(f"Extracting full backup: {full_zip.name} ...")
     with zipfile.ZipFile(full_zip, "r") as zf:
-        # Full backups may have the server dir as a top-level folder
-        top_dirs = {name.split("/")[0] for name in zf.namelist() if "/" in name}
         zf.extractall(target_dir)
-
-        # If there's a single top-level directory, move its contents up
-        if len(top_dirs) == 1:
-            nested = target_dir / top_dirs.pop()
-            if nested.is_dir():
-                for item in nested.iterdir():
-                    shutil.move(str(item), str(target_dir / item.name))
-                nested.rmdir()
-
     print(f"  Full backup extracted.")
 
     # Apply incrementals in order
@@ -199,6 +188,32 @@ def restore(chains: list, chain_idx: int, point_idx: int,
                             parent = parent.parent
 
         print(f"  Applied ({len([n for n in zf.namelist() if n != '_deletions.json'])} files)")
+
+    # Rebuild backup_manifest.json so the bot's incremental backups
+    # use the restored state as the baseline
+    manifest_path = Path(__file__).parent / "backup_manifest.json"
+    backup_dir = Path(os.path.expanduser(
+        os.environ.get("BACKUP_DIR", "~/minecraft_backup"))).resolve()
+    print("Rebuilding backup manifest...")
+    manifest = {}
+    for dirpath, _dirnames, filenames in os.walk(target_dir):
+        dp = Path(dirpath)
+        # Skip BACKUP_DIR if it's inside the server directory
+        try:
+            dp.resolve().relative_to(backup_dir)
+            continue
+        except ValueError:
+            pass
+        for fn in filenames:
+            fp = dp / fn
+            try:
+                rel = str(fp.relative_to(target_dir)).replace("\\", "/")
+                manifest[rel] = fp.stat().st_mtime
+            except OSError:
+                pass
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f)
+    print(f"  Manifest rebuilt with {len(manifest)} files.")
 
     print(f"\nRestore complete. Server files are in: {target_dir}")
 
