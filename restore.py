@@ -1,8 +1,42 @@
 """Interactive CLI tool for restoring Minecraft server backups.
 
-Scans the backup directory for full and incremental backups, groups
-incrementals by chain ID, and reconstructs the server state by applying
-the full backup followed by the correct incremental chain in order.
+Restoration Strategy
+====================
+
+Backups are organised into "chains": one full backup + zero or more incremental
+backups that build on it. To restore to a specific point in time:
+
+  1. Extract the chain's full backup into the target directory.
+  2. Apply each incremental in chronological order up to the selected point,
+     overwriting changed files and removing deleted ones.
+
+After restoration, a new chain is established so the bot can immediately resume
+incremental backups without requiring a new full backup. How the new chain is
+created depends on the restore point:
+
+  - Restoring to a FULL backup point:
+    A new chain ID is generated referencing the original full backup. No
+    additional files are created — the full backup is already self-contained.
+
+  - Restoring to an INCREMENTAL point:
+    The original full backup alone cannot reconstruct this state (it would need
+    the incrementals replayed). To avoid forcing an expensive new full backup,
+    we create a single "merged incremental" — a zip that combines all the
+    applied incrementals into one file. This merged incremental + the original
+    full backup = the complete restored state, making the new chain
+    self-contained for future restores.
+
+    The merged incremental is given a new chain ID and the same timestamp as the
+    selected restore point. Future incrementals will chain off this new ID.
+
+Chain Discovery
+---------------
+The restore tool is fully self-contained — it doesn't rely on backup_manifest.json
+or .mcnotifier_chain to discover chains. Instead, it:
+  - Parses full/incremental backup filenames from the backup directory
+  - Reads _meta.json from inside each incremental zip to find its chain ID and
+    which full backup it belongs to
+  - Groups incrementals by chain ID and sorts them chronologically
 
 Usage:
     python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
@@ -13,6 +47,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -23,7 +58,7 @@ from backup_utils import (
     build_file_manifest, new_chain_id,
 )
 
-# Load .env for defaults
+# Load .env for defaults (BACKUP_DIR, MINECRAFT_DIR)
 load_dotenv(Path(__file__).parent / ".env")
 
 
@@ -33,13 +68,23 @@ def parse_timestamp(ts: str) -> str:
 
 
 def scan_backups(backup_dir: Path) -> tuple:
-    """Scan backup directory. Returns (full_backups, incremental_backups)."""
+    """Scan backup directory for full and incremental backup zips.
+
+    Returns (fulls, incrs) where:
+      - fulls: dict of {filename: entry} for full backups
+      - incrs: list of entries for incremental backups
+
+    Each entry contains path, server name, timestamp, size, and (for
+    incrementals) chain_id parsed from the filename.
+    """
     fulls = {}   # filename -> entry
     incrs = []   # list of entries
 
     for f in backup_dir.iterdir():
         if not f.is_file() or f.suffix != ".zip":
             continue
+        # Try incremental pattern first (it's more specific — a full backup
+        # regex would also match incremental filenames without this ordering)
         m = RE_INCR.match(f.name)
         if m:
             incrs.append({
@@ -63,7 +108,13 @@ def scan_backups(backup_dir: Path) -> tuple:
 
 
 def read_incr_meta(zip_path: Path) -> dict:
-    """Read _meta.json from an incremental zip. Returns {} on failure."""
+    """Read _meta.json from an incremental zip. Returns {} on failure.
+
+    _meta.json contains {"chain_id": "...", "base_full": "..."} which tells
+    us which chain this incremental belongs to and which full backup it
+    builds upon. This makes the restore tool self-contained — it doesn't
+    need external state files to reconstruct chains.
+    """
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             if "_meta.json" in zf.namelist():
@@ -74,25 +125,36 @@ def read_incr_meta(zip_path: Path) -> dict:
 
 
 def group_by_chain(fulls: dict, incrs: list) -> list:
-    """Group incrementals by chain ID, resolve base full backup for each chain."""
+    """Group incrementals by chain ID and resolve their base full backup.
+
+    Returns a list of chain dicts, each containing:
+      - chain_id: the 8-char hex ID (or None for standalone full backups)
+      - full: the full backup entry this chain is based on
+      - incrementals: sorted list of incremental entries in this chain
+
+    Also includes standalone full backups (those with no incrementals) so
+    they appear as restore points too.
+    """
     # Group incrementals by chain_id
     chain_map = {}  # chain_id -> list of incr entries
     for incr in incrs:
         chain_map.setdefault(incr["chain_id"], []).append(incr)
 
-    # Sort each chain's incrementals by timestamp
+    # Sort each chain's incrementals by timestamp (chronological order)
     for chain_id in chain_map:
         chain_map[chain_id].sort(key=lambda e: e["timestamp"])
 
     chains = []
     for chain_id, chain_incrs in chain_map.items():
-        # Read _meta.json from first incremental to find base_full
+        # Read _meta.json from the first incremental to find which full
+        # backup this chain is based on
         meta = read_incr_meta(chain_incrs[0]["path"])
         base_full_name = meta.get("base_full", "")
         full_entry = fulls.get(base_full_name)
 
         if not full_entry:
-            # Can't find the base full backup — skip this chain
+            # Can't find the base full backup — skip this chain entirely.
+            # This can happen if the full backup was deleted or moved.
             continue
 
         chains.append({
@@ -101,7 +163,8 @@ def group_by_chain(fulls: dict, incrs: list) -> list:
             "incrementals": chain_incrs,
         })
 
-    # Also add standalone full backups (those not referenced by any chain)
+    # Add standalone full backups (those not referenced by any chain)
+    # so they still appear as restore points
     referenced_fulls = {c["full"]["path"].name for c in chains}
     for name, entry in fulls.items():
         if name not in referenced_fulls:
@@ -131,7 +194,12 @@ def format_size(size_bytes: int) -> str:
 
 
 def display_restore_points(chains: list) -> list:
-    """Display numbered restore points and return flat list of (chain_idx, point_idx) tuples."""
+    """Display numbered restore points and return flat list of
+    (chain_idx, point_idx) tuples.
+
+    point_idx == -1 means the full backup itself.
+    point_idx >= 0 means the incremental at that index within the chain.
+    """
     points = []
     num = 1
 
@@ -155,19 +223,28 @@ def display_restore_points(chains: list) -> list:
     return points
 
 
-
 def restore(chains: list, chain_idx: int, point_idx: int,
             target_dir: Path, backup_dir: Path, dry_run: bool = False) -> None:
-    """Restore from a full backup + incremental chain up to point_idx."""
+    """Restore server state from a full backup + incremental chain.
+
+    Args:
+        chains:     List of chain dicts from group_by_chain()
+        chain_idx:  Index of the selected chain
+        point_idx:  -1 for full backup only, or index of incremental to restore to
+        target_dir: Directory to restore into (the Minecraft server directory)
+        backup_dir: Directory containing the backup zip files
+        dry_run:    If True, only preview what would be restored
+    """
     chain = chains[chain_idx]
     full_zip = chain["full"]["path"]
 
-    # Determine which incrementals to apply
+    # Determine which incrementals to apply (all up to and including point_idx)
     if point_idx == -1:
         incrementals = []
     else:
         incrementals = chain["incrementals"][:point_idx + 1]
 
+    # Show the restore plan to the user
     print(f"\nRestore plan:")
     print(f"  1. Extract full backup: {full_zip.name}")
     for i, incr in enumerate(incrementals, 2):
@@ -194,7 +271,7 @@ def restore(chains: list, chain_idx: int, point_idx: int,
                 print()
         return
 
-    # Confirm target directory
+    # Safety: confirm before overwriting an existing directory
     if target_dir.exists() and any(target_dir.iterdir()):
         resp = input(f"\nTarget directory '{target_dir}' already exists and is not empty.\n"
                      f"Overwrite? (yes/no): ").strip().lower()
@@ -206,69 +283,145 @@ def restore(chains: list, chain_idx: int, point_idx: int,
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract full backup
+    # Step 1: Extract the full backup as the base state
     print(f"Extracting full backup: {full_zip.name} ...")
     with zipfile.ZipFile(full_zip, "r") as zf:
         zf.extractall(target_dir)
     print(f"  Full backup extracted.")
 
-    # Apply incrementals in order
-    for incr in incrementals:
-        incr_path = incr["path"]
-        print(f"Applying incremental: {incr_path.name} ...")
-        with zipfile.ZipFile(incr_path, "r") as zf:
-            # Apply changed/added files
-            for name in zf.namelist():
-                if name in META_FILES:
-                    continue
-                dest = target_dir / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(name) as src, open(dest, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+    # Step 2: Apply incrementals in chronological order
+    #
+    # If restoring to an incremental point, we also extract each incremental
+    # into a temporary directory. This temp dir accumulates all changed files
+    # across all applied incrementals (later files overwrite earlier ones),
+    # producing a "merged delta" — the combined difference between the full
+    # backup and the final restored state.
+    #
+    # Why? After restoration, we need to create a new chain so the bot can
+    # resume incremental backups immediately. But the new chain's base_full
+    # points to the original full backup, which alone can't reconstruct the
+    # restored state (it would need the original incrementals replayed).
+    #
+    # Rather than creating an expensive new full backup, we zip the temp dir
+    # as a single "merged incremental" — one file that, combined with the
+    # original full backup, fully reconstructs the restored state. This makes
+    # the new chain self-contained for future restores.
+    if incrementals:
+        tmp = Path(tempfile.mkdtemp())
+        # Track deletions across all incrementals for merging
+        merged_deletions = []   # all deleted paths, in order encountered
+        re_added = set()        # paths that were re-added by a later incremental
 
-            # Apply deletions
-            if "_deletions.json" in zf.namelist():
-                deletions = json.loads(zf.read("_deletions.json"))
-                for rel_path in deletions:
-                    del_path = target_dir / rel_path
-                    if del_path.exists():
-                        del_path.unlink()
-                        parent = del_path.parent
-                        while parent != target_dir and not any(parent.iterdir()):
-                            parent.rmdir()
-                            parent = parent.parent
+        try:
+            for incr in incrementals:
+                incr_path = incr["path"]
+                print(f"Applying incremental: {incr_path.name} ...")
+                with zipfile.ZipFile(incr_path, "r") as zf:
+                    file_count = 0
+                    for name in zf.namelist():
+                        if name in META_FILES:
+                            continue
+                        # Extract changed/added files to both:
+                        # - target_dir: the actual restore destination
+                        # - tmp: accumulates the merged delta for the merged incremental
+                        for dest_root in (target_dir, tmp):
+                            dest = dest_root / name
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            with zf.open(name) as src, open(dest, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                        # Track that this file was added/updated (not deleted)
+                        re_added.add(name)
+                        file_count += 1
 
-        file_count = len([n for n in zf.namelist() if n not in META_FILES])
-        print(f"  Applied ({file_count} files)")
+                    # Process deletions: files that existed before but were
+                    # removed during this incremental period
+                    if "_deletions.json" in zf.namelist():
+                        deletions = json.loads(zf.read("_deletions.json"))
+                        for rel_path in deletions:
+                            merged_deletions.append(rel_path)
+                            # If a file was deleted, it's no longer "re-added"
+                            # (it might have been added by an earlier incremental
+                            # but then deleted by this one)
+                            re_added.discard(rel_path)
+                            # Apply the deletion to the target directory
+                            del_path = target_dir / rel_path
+                            if del_path.exists():
+                                del_path.unlink()
+                                # Clean up empty parent directories
+                                parent = del_path.parent
+                                while parent != target_dir and not any(parent.iterdir()):
+                                    parent.rmdir()
+                                    parent = parent.parent
 
-    # Rebuild backup_manifest.json
+                print(f"  Applied ({file_count} files)")
+
+            # Build the merged deletion list for the merged incremental.
+            # Only include paths that were deleted and NOT re-added by a later
+            # incremental. Example: if incr1 deletes "a.txt" and incr2 re-adds
+            # "a.txt", the merged incremental should contain a.txt (in the zip)
+            # but NOT list it in _deletions.json.
+            final_deletions = [p for p in merged_deletions if p not in re_added]
+
+            # Create the merged incremental zip.
+            # This single zip + the original full backup = the complete state
+            # at the selected restore point. Future restores of this chain only
+            # need these two files.
+            chain_id = new_chain_id(backup_dir)
+            # Reuse the timestamp from the selected restore point so the
+            # merged incremental sorts correctly alongside other backups
+            restore_ts = incrementals[point_idx]["timestamp"]
+            server_name = chain["full"]["server"]
+            merged_name = f"{server_name}_incr_{chain_id}_{restore_ts}.zip"
+            merged_path = backup_dir / merged_name
+
+            print(f"Creating merged incremental: {merged_name} ...")
+            with zipfile.ZipFile(merged_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Add all changed/added files from the temp dir
+                for dirpath, _dirnames, filenames in os.walk(tmp):
+                    dp = Path(dirpath)
+                    for fn in filenames:
+                        fp = dp / fn
+                        rel = str(fp.relative_to(tmp)).replace("\\", "/")
+                        zf.write(fp, rel)
+                # Add merged deletions list
+                if final_deletions:
+                    zf.writestr("_deletions.json",
+                                json.dumps(final_deletions, indent=2))
+                # Add chain metadata so the restore tool can discover this
+                # incremental's chain membership and base full backup
+                zf.writestr("_meta.json", json.dumps({
+                    "chain_id": chain_id, "base_full": full_zip.name}))
+
+            print(f"  Merged incremental created ({format_size(merged_path.stat().st_size)})")
+
+        finally:
+            # Clean up the temporary directory
+            shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        # Restoring to a full backup only — no incrementals to merge.
+        # Just generate a new chain ID.
+        chain_id = new_chain_id(backup_dir)
+
+    # Step 3: Rebuild backup_manifest.json and write chain marker
+    #
+    # The manifest records the mtime of every file in the restored state.
+    # The bot uses this as the baseline for detecting changes in the next
+    # incremental backup.
+    #
+    # The chain marker (.mcnotifier_chain) tells the bot which chain is
+    # active. On startup, the bot compares this against the manifest to
+    # verify the server state hasn't been replaced behind its back.
     manifest_path = Path(__file__).parent / "backup_manifest.json"
     print("Rebuilding backup manifest...")
     files = build_file_manifest(target_dir, backup_dir)
+    with open(manifest_path, "w") as f:
+        json.dump({"chain_id": chain_id, "base_full": full_zip.name,
+                    "files": files}, f)
     marker_path = target_dir / CHAIN_MARKER_NAME
-
-    if point_idx == -1:
-        # Restoring to full backup only — chain is self-contained
-        chain_id = new_chain_id(backup_dir)
-        with open(manifest_path, "w") as f:
-            json.dump({"chain_id": chain_id, "base_full": full_zip.name,
-                        "files": files}, f)
-        with open(marker_path, "w") as f:
-            f.write(chain_id)
-        print(f"  Manifest rebuilt with {len(files)} files (new chain: {chain_id})")
-        print(f"  Chain marker written.")
-    else:
-        # Restoring to incremental point — the original full backup alone
-        # is NOT sufficient to reconstruct this state. Invalidate the chain
-        # so the bot is forced to take a new full backup before incrementals
-        # can resume.
-        with open(manifest_path, "w") as f:
-            json.dump({"chain_id": "", "base_full": "", "files": files}, f)
-        if marker_path.exists():
-            marker_path.unlink()
-        print(f"  Manifest rebuilt with {len(files)} files")
-        print(f"  No chain established — a full backup is required before")
-        print(f"  incremental backups can resume.")
+    with open(marker_path, "w") as f:
+        f.write(chain_id)
+    print(f"  Manifest rebuilt with {len(files)} files (new chain: {chain_id})")
+    print(f"  Chain marker written.")
 
     print(f"\nRestore complete. Server files are in: {target_dir}")
 
@@ -337,7 +490,9 @@ def main():
     chain_idx, point_idx = points[idx]
 
     if not args.dry_run:
-        # Server offline warning
+        # Server offline warning — restoring while the server is running
+        # will cause data corruption because the server holds region files
+        # open and writes to them asynchronously
         print("\n" + "!" * 60)
         print("  WARNING: The Minecraft server MUST be stopped before")
         print("  restoring a backup. Restoring while the server is")

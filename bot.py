@@ -702,7 +702,22 @@ def _wait_for_log_line(phrase: str, pos: int, timeout: float = 60) -> bool:
 
 
 def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
-    """Run a full server backup. status_cb(msg) is called with progress updates."""
+    """Run a full server backup.
+
+    Full backup process:
+      1. RCON save-off: disable Minecraft's auto-save to prevent file writes
+         during the zip operation (avoids corrupt/partial region files).
+      2. RCON save-all: flush all pending world data from memory to disk.
+      3. Zip the entire server directory into BACKUP_DIR.
+      4. RCON save-on: re-enable auto-save (always, even if zip fails).
+      5. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
+      6. Start a new incremental chain: generate a fresh chain ID, rebuild
+         the file manifest (mtime baseline), and write the chain marker.
+
+    The RCON log confirmation uses a pre-captured file position to avoid a
+    race condition: we record the log file position BEFORE sending the RCON
+    command, then scan forward from that position for the confirmation line.
+    """
     def status(msg):
         logger.info("Backup: %s", msg)
         if status_cb:
@@ -713,7 +728,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Disable auto-save, flush world data, then zip while world is frozen
+    # Step 1: Disable auto-save to freeze world state during backup
     status("Disabling auto-save...")
     pos = _log_pos()
     rcon_command("save-off")
@@ -723,6 +738,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         status("Warning: save-off confirmation not seen in log, proceeding anyway")
 
     try:
+        # Step 2: Flush all pending world data to disk
         status("Saving world...")
         pos = _log_pos()
         rcon_command("save-all")
@@ -731,7 +747,10 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         else:
             status("Warning: save-all confirmation not seen in log, proceeding anyway")
 
-        # Zip the directory (paths relative to MINECRAFT_DIR, matching incremental format)
+        # Step 3: Zip the server directory
+        # Uses relative paths inside the zip so the restore tool can extract
+        # directly into any target directory. Skips the backup output directory
+        # (if it's inside the server dir) and the chain marker file.
         mc_dir = Path(MINECRAFT_DIR)
         dir_name = mc_dir.name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -742,12 +761,14 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for dirpath, _dirnames, filenames in os.walk(mc_dir):
                 dp = Path(dirpath)
+                # Skip the backup directory if it's inside the server directory
                 try:
                     dp.resolve().relative_to(backup_dir_resolved)
                     continue
                 except ValueError:
                     pass
                 for fn in filenames:
+                    # Chain marker is backup metadata, not server data
                     if fn == CHAIN_MARKER_NAME:
                         continue
                     fp = dp / fn
@@ -756,7 +777,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
-        # Always re-enable auto-save, even if zip fails
+        # Step 4: Always re-enable auto-save, even if zip fails
         pos = _log_pos()
         rcon_command("save-on")
         if _wait_for_log_line("Automatic saving is now enabled", pos, timeout=30):
@@ -764,7 +785,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         else:
             status("Warning: save-on confirmation not seen in log")
 
-    # Copy off-server if configured
+    # Step 5: Copy off-server if configured (e.g., rsync to NAS/cloud)
     if BACKUP_COPY_CMD:
         copy_cmd = BACKUP_COPY_CMD.replace("{file}", str(final_path))
         status(f"Running copy command...")
@@ -780,7 +801,12 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         except Exception as e:
             status(f"Copy command error: {e}")
 
-    # Reset incremental manifest baseline after full backup
+    # Step 6: Start a new incremental chain
+    # Every full backup starts a fresh chain. The manifest records the mtime
+    # of every file, which becomes the baseline for detecting changes in
+    # subsequent incremental backups. The chain marker is written to the
+    # server directory so the bot can detect if the server state is replaced
+    # while it's offline.
     try:
         chain_id = new_chain_id(BACKUP_DIR)
         fresh_files = build_file_manifest(Path(MINECRAFT_DIR), BACKUP_DIR)
@@ -797,6 +823,28 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 # ---------------------------------------------------------------------------
 # 7e. Incremental Backup
 # ---------------------------------------------------------------------------
+# Incremental backups capture only files that changed since the last backup
+# (full or incremental). They are triggered automatically while players are
+# online, on a configurable interval (INCREMENTAL_INTERVAL_MINUTES).
+#
+# How change detection works:
+#   - The manifest (backup_manifest.json) stores {relative_path: mtime} for
+#     every file in the server directory at the time of the last backup.
+#   - Before each incremental, we walk the server directory again and compare
+#     mtimes against the manifest. Files with different mtimes or new files
+#     are "changed"; files in the manifest but missing from disk are "deleted".
+#   - Only changed/added files are zipped. Deleted paths are recorded in a
+#     _deletions.json file inside the zip.
+#
+# Each incremental zip also contains _meta.json with the chain_id and
+# base_full filename, making it self-describing for the restore tool.
+#
+# The incremental cycle is player-activity-driven:
+#   - Starts when the first player joins the server
+#   - Runs every INCREMENTAL_INTERVAL_MINUTES while players are online
+#   - Stops when the last player leaves (with one final backup)
+# ---------------------------------------------------------------------------
+
 _MANIFEST_PATH = Path(__file__).parent / "backup_manifest.json"
 _CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / ".mcnotifier_chain"
 _incr_timer: threading.Timer | None = None
@@ -804,7 +852,11 @@ _incr_lock = threading.Lock()  # protects _incr_timer
 
 
 def _diff_manifest(old: dict, new: dict) -> tuple:
-    """Return (changed_or_added, deleted) lists of relative paths."""
+    """Compare two file manifests and return (changed_or_added, deleted).
+
+    Each manifest is {relative_path: mtime}. A file is "changed" if its mtime
+    differs or it's new. A file is "deleted" if it was in old but not in new.
+    """
     changed = []
     for path, mtime in new.items():
         if path not in old or old[path] != mtime:
@@ -814,7 +866,11 @@ def _diff_manifest(old: dict, new: dict) -> tuple:
 
 
 def _load_manifest() -> tuple:
-    """Return (chain_id, base_full, files_dict)."""
+    """Load backup_manifest.json. Returns (chain_id, base_full, files_dict).
+
+    Returns ("", "", {}) if the manifest is missing or corrupt, which
+    effectively means "no chain established — skip incremental backups".
+    """
     if _MANIFEST_PATH.exists():
         try:
             with open(_MANIFEST_PATH) as f:
@@ -828,14 +884,19 @@ def _load_manifest() -> tuple:
 
 
 def _save_manifest(files: dict, chain_id: str, base_full: str) -> None:
+    """Write the manifest with the current chain state and file mtimes."""
     with open(_MANIFEST_PATH, "w") as f:
         json.dump({"chain_id": chain_id, "base_full": base_full,
                     "files": files}, f)
 
 
-
 def _write_chain_marker(chain_id: str) -> None:
-    """Write chain ID to .mcnotifier_chain in MINECRAFT_DIR."""
+    """Write chain ID to .mcnotifier_chain in MINECRAFT_DIR.
+
+    This marker file lets the bot detect on startup if the server state
+    was replaced while it was offline (e.g., manual restore). If the marker
+    doesn't match the manifest's chain_id, the chain is considered invalid.
+    """
     try:
         with open(_CHAIN_MARKER_PATH, "w") as f:
             f.write(chain_id)
@@ -855,7 +916,21 @@ def _read_chain_marker() -> str:
 
 
 def run_incremental_backup() -> str | None:
-    """Run an incremental backup of changed files. Returns zip path or None."""
+    """Run an incremental backup of changed files. Returns zip path or None.
+
+    Incremental backup process:
+      1. Load the manifest to get the current chain_id and file mtime baseline.
+      2. Walk the server directory and compare mtimes to detect changes.
+      3. If changes found: RCON save-off/save-all to flush world data, then
+         re-scan to capture any newly flushed changes.
+      4. Zip only the changed/added files, plus _deletions.json and _meta.json.
+      5. Update the manifest with the new file mtimes (same chain_id).
+      6. RCON save-on to re-enable auto-save.
+      7. Run BACKUP_COPY_CMD if configured.
+
+    Returns None if: no chain established, no changes detected, another backup
+    is in progress, or the backup fails.
+    """
     if not _backup_lock.acquire(blocking=False):
         logger.info("Incremental backup skipped: another backup is in progress")
         return None
@@ -864,11 +939,15 @@ def run_incremental_backup() -> str | None:
         mc_dir = Path(MINECRAFT_DIR)
         chain_id, base_full, old_files = _load_manifest()
 
+        # A chain must be established (by a full backup or restore) before
+        # incremental backups can run. Without a chain, we don't know which
+        # full backup these incrementals belong to.
         if not chain_id:
             logger.warning("Incremental backup skipped: no chain established. "
                            "Run a full backup first.")
             return None
 
+        # First pass: quick scan to see if anything changed at all
         new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
 
         changed, deleted = _diff_manifest(old_files, new_manifest)
@@ -885,7 +964,9 @@ def run_incremental_backup() -> str | None:
 
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-        # RCON save-off / save-all / save-on for consistency
+        # Freeze the world state: disable auto-save and flush pending writes.
+        # Same RCON sequence as full backups — ensures we're zipping consistent
+        # file state, not partially-written region files.
         pos = _log_pos()
         rcon_command("save-off")
         if _wait_for_log_line("Automatic saving is now disabled", pos, timeout=30):
@@ -901,7 +982,8 @@ def run_incremental_backup() -> str | None:
             else:
                 logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
 
-            # Rebuild manifest after save-all to capture flushed changes
+            # Second pass: re-scan after save-all to capture any files that
+            # were flushed to disk by the save command
             new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
             changed, deleted = _diff_manifest(old_files, new_manifest)
 
@@ -910,18 +992,23 @@ def run_incremental_backup() -> str | None:
                 _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
                 return None
 
+            # Build the incremental zip with chain ID in the filename
             dir_name = mc_dir.name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             zip_name = f"{dir_name}_incr_{chain_id}_{timestamp}"
             zip_path = BACKUP_DIR / f"{zip_name}.zip"
 
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Add changed/added files
                 for rel_path in changed:
                     full_path = mc_dir / rel_path
                     if full_path.exists():
                         zf.write(full_path, rel_path)
+                # Record deleted files so restore can remove them too
                 if deleted:
                     zf.writestr("_deletions.json", json.dumps(deleted, indent=2))
+                # Embed chain metadata so restore.py can discover this
+                # incremental's chain membership without external state
                 zf.writestr("_meta.json", json.dumps({
                     "chain_id": chain_id, "base_full": base_full}))
 
@@ -929,9 +1016,11 @@ def run_incremental_backup() -> str | None:
             logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
                         zip_path.name, size_mb, len(changed))
 
+            # Update the manifest: same chain, but new mtime baseline
             _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
 
         finally:
+            # Always re-enable auto-save
             pos = _log_pos()
             rcon_command("save-on")
             if _wait_for_log_line("Automatic saving is now enabled", pos, timeout=30):
@@ -964,14 +1053,19 @@ def run_incremental_backup() -> str | None:
         _backup_lock.release()
 
 
+# --- Incremental backup cycle (player-activity-driven) ---
+# Uses a threading.Timer to run incremental backups at regular intervals
+# while players are online. The cycle starts when the first player joins
+# and stops when the last player leaves.
+
 def _incremental_cycle():
-    """Run one incremental backup, then reschedule."""
+    """Run one incremental backup, then reschedule if the cycle is still active."""
     global _incr_timer
     try:
         run_incremental_backup()
     finally:
         with _incr_lock:
-            if _incr_timer is not None:  # still active (not stopped)
+            if _incr_timer is not None:  # cycle still active (not stopped)
                 _incr_timer = threading.Timer(
                     INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
                 _incr_timer.daemon = True
@@ -979,7 +1073,10 @@ def _incremental_cycle():
 
 
 def _start_incremental_cycle():
-    """Start the incremental backup cycle if not already running."""
+    """Start the incremental backup cycle if not already running.
+
+    Called when the first player joins the server.
+    """
     global _incr_timer
     if not INCREMENTAL_BACKUP_ENABLED:
         return
@@ -995,7 +1092,12 @@ def _start_incremental_cycle():
 
 
 def _stop_incremental_cycle(final: bool = False):
-    """Stop the incremental backup cycle. If final=True, run one last backup."""
+    """Stop the incremental backup cycle.
+
+    Called when the last player leaves the server.
+    If final=True, runs one last incremental backup to capture any remaining
+    changes from the play session.
+    """
     global _incr_timer
     if not INCREMENTAL_BACKUP_ENABLED:
         return
