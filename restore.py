@@ -11,8 +11,6 @@ Usage:
 import argparse
 import json
 import os
-import re
-import secrets
 import shutil
 import sys
 import zipfile
@@ -20,13 +18,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from backup_utils import (
+    CHAIN_MARKER_NAME, META_FILES, RE_FULL, RE_INCR,
+    build_file_manifest, new_chain_id,
+)
+
 # Load .env for defaults
 load_dotenv(Path(__file__).parent / ".env")
-
-RE_FULL = re.compile(r'^(.+?)_(\d{8}_\d{6})\.zip$')
-RE_INCR = re.compile(r'^(.+?)_incr_([0-9a-f]{8})_(\d{8}_\d{6})\.zip$')
-CHAIN_MARKER_NAME = ".mcnotifier_chain"
-META_FILES = {"_deletions.json", "_meta.json"}
 
 
 def parse_timestamp(ts: str) -> str:
@@ -157,25 +155,6 @@ def display_restore_points(chains: list) -> list:
     return points
 
 
-def _scan_existing_chain_ids(backup_dir: Path) -> set:
-    """Scan backup directory for chain IDs already in use."""
-    ids = set()
-    if backup_dir.exists():
-        for f in backup_dir.iterdir():
-            m = RE_INCR.match(f.name)
-            if m:
-                ids.add(m.group(2))
-    return ids
-
-
-def _new_chain_id(backup_dir: Path) -> str:
-    """Generate a unique 8-char hex chain ID."""
-    existing = _scan_existing_chain_ids(backup_dir)
-    chain_id = secrets.token_hex(4)
-    while chain_id in existing:
-        chain_id = secrets.token_hex(4)
-    return chain_id
-
 
 def restore(chains: list, chain_idx: int, point_idx: int,
             target_dir: Path, backup_dir: Path, dry_run: bool = False) -> None:
@@ -262,39 +241,34 @@ def restore(chains: list, chain_idx: int, point_idx: int,
         file_count = len([n for n in zf.namelist() if n not in META_FILES])
         print(f"  Applied ({file_count} files)")
 
-    # Rebuild backup_manifest.json with new chain ID
+    # Rebuild backup_manifest.json
     manifest_path = Path(__file__).parent / "backup_manifest.json"
-    backup_dir_resolved = backup_dir.resolve()
     print("Rebuilding backup manifest...")
-    files = {}
-    for dirpath, _dirnames, filenames in os.walk(target_dir):
-        dp = Path(dirpath)
-        try:
-            dp.resolve().relative_to(backup_dir_resolved)
-            continue
-        except ValueError:
-            pass
-        for fn in filenames:
-            if fn == CHAIN_MARKER_NAME:
-                continue
-            fp = dp / fn
-            try:
-                rel = str(fp.relative_to(target_dir)).replace("\\", "/")
-                files[rel] = fp.stat().st_mtime
-            except OSError:
-                pass
-
-    chain_id = _new_chain_id(backup_dir)
-    with open(manifest_path, "w") as f:
-        json.dump({"chain_id": chain_id, "base_full": full_zip.name,
-                    "files": files}, f)
-    print(f"  Manifest rebuilt with {len(files)} files (new chain: {chain_id})")
-
-    # Write chain marker in the restored server directory
+    files = build_file_manifest(target_dir, backup_dir)
     marker_path = target_dir / CHAIN_MARKER_NAME
-    with open(marker_path, "w") as f:
-        f.write(chain_id)
-    print(f"  Chain marker written.")
+
+    if point_idx == -1:
+        # Restoring to full backup only — chain is self-contained
+        chain_id = new_chain_id(backup_dir)
+        with open(manifest_path, "w") as f:
+            json.dump({"chain_id": chain_id, "base_full": full_zip.name,
+                        "files": files}, f)
+        with open(marker_path, "w") as f:
+            f.write(chain_id)
+        print(f"  Manifest rebuilt with {len(files)} files (new chain: {chain_id})")
+        print(f"  Chain marker written.")
+    else:
+        # Restoring to incremental point — the original full backup alone
+        # is NOT sufficient to reconstruct this state. Invalidate the chain
+        # so the bot is forced to take a new full backup before incrementals
+        # can resume.
+        with open(manifest_path, "w") as f:
+            json.dump({"chain_id": "", "base_full": "", "files": files}, f)
+        if marker_path.exists():
+            marker_path.unlink()
+        print(f"  Manifest rebuilt with {len(files)} files")
+        print(f"  No chain established — a full backup is required before")
+        print(f"  incremental backups can resume.")
 
     print(f"\nRestore complete. Server files are in: {target_dir}")
 

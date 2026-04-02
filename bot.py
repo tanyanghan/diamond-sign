@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import threading
@@ -17,6 +16,10 @@ from mcrcon import MCRcon
 import telebot
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+
+from backup_utils import (
+    CHAIN_MARKER_NAME, RE_INCR, build_file_manifest, new_chain_id,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -745,7 +748,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
                 except ValueError:
                     pass
                 for fn in filenames:
-                    if fn == _CHAIN_MARKER_NAME:
+                    if fn == CHAIN_MARKER_NAME:
                         continue
                     fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
@@ -779,8 +782,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 
     # Reset incremental manifest baseline after full backup
     try:
-        chain_id = _new_chain_id()
-        fresh_files = _build_manifest(Path(MINECRAFT_DIR))
+        chain_id = new_chain_id(BACKUP_DIR)
+        fresh_files = build_file_manifest(Path(MINECRAFT_DIR), BACKUP_DIR)
         _save_manifest(fresh_files, chain_id=chain_id, base_full=final_path.name)
         _write_chain_marker(chain_id)
         logger.info("Backup: new chain %s established (base: %s)",
@@ -796,35 +799,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
 # ---------------------------------------------------------------------------
 _MANIFEST_PATH = Path(__file__).parent / "backup_manifest.json"
 _CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / ".mcnotifier_chain"
-_CHAIN_MARKER_NAME = ".mcnotifier_chain"
 _incr_timer: threading.Timer | None = None
 _incr_lock = threading.Lock()  # protects _incr_timer
-
-RE_INCR_CHAIN = re.compile(r'^.+?_incr_([0-9a-f]{8})_\d{8}_\d{6}\.zip$')
-
-
-def _build_manifest(root: Path) -> dict:
-    """Walk root and return {relative_path: mtime} for every file."""
-    manifest = {}
-    backup_dir_resolved = BACKUP_DIR.resolve()
-    for dirpath, _dirnames, filenames in os.walk(root):
-        dp = Path(dirpath)
-        # Skip the backup output directory if it's inside the server dir
-        try:
-            dp.resolve().relative_to(backup_dir_resolved)
-            continue
-        except ValueError:
-            pass
-        for fn in filenames:
-            if fn == _CHAIN_MARKER_NAME:
-                continue
-            fp = dp / fn
-            try:
-                rel = str(fp.relative_to(root)).replace("\\", "/")
-                manifest[rel] = fp.stat().st_mtime
-            except OSError:
-                pass
-    return manifest
 
 
 def _diff_manifest(old: dict, new: dict) -> tuple:
@@ -856,25 +832,6 @@ def _save_manifest(files: dict, chain_id: str, base_full: str) -> None:
         json.dump({"chain_id": chain_id, "base_full": base_full,
                     "files": files}, f)
 
-
-def _scan_existing_chain_ids() -> set:
-    """Scan BACKUP_DIR for chain IDs already used in incremental filenames."""
-    ids = set()
-    if BACKUP_DIR.exists():
-        for f in BACKUP_DIR.iterdir():
-            m = RE_INCR_CHAIN.match(f.name)
-            if m:
-                ids.add(m.group(1))
-    return ids
-
-
-def _new_chain_id() -> str:
-    """Generate a unique 8-char hex chain ID."""
-    existing = _scan_existing_chain_ids()
-    chain_id = secrets.token_hex(4)
-    while chain_id in existing:
-        chain_id = secrets.token_hex(4)
-    return chain_id
 
 
 def _write_chain_marker(chain_id: str) -> None:
@@ -912,7 +869,7 @@ def run_incremental_backup() -> str | None:
                            "Run a full backup first.")
             return None
 
-        new_manifest = _build_manifest(mc_dir)
+        new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
 
         changed, deleted = _diff_manifest(old_files, new_manifest)
         if not changed and not deleted:
@@ -945,7 +902,7 @@ def run_incremental_backup() -> str | None:
                 logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
 
             # Rebuild manifest after save-all to capture flushed changes
-            new_manifest = _build_manifest(mc_dir)
+            new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
             changed, deleted = _diff_manifest(old_files, new_manifest)
 
             if not changed and not deleted:

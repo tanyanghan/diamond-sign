@@ -7,6 +7,7 @@ A Telegram bot that monitors a Minecraft server and sends notifications when pla
 | File | Description |
 |------|-------------|
 | `bot.py` | Main bot — log watcher, Telegram handlers, stats |
+| `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
 | `restore.py` | Interactive CLI tool for restoring from backup chains |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for required environment variables |
@@ -186,7 +187,7 @@ python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
 3. Displays restore points organised by chain, each linked to its base full backup.
 4. After selecting a point, warns that the Minecraft server **must be stopped** before restoring.
 5. Extracts the full backup, then applies each incremental in the chain up to the selected point.
-6. Rebuilds `backup_manifest.json` and `.mcnotifier_chain` with a new chain ID so incremental backups resume cleanly.
+6. Rebuilds `backup_manifest.json`. If restoring to a full backup, writes a new chain ID and `.mcnotifier_chain` so incremental backups resume immediately. If restoring to an incremental point, the chain is invalidated — the bot will require a new full backup before incrementals can resume (since the original full backup alone cannot reconstruct the incremental restore state).
 
 **Important:** Always stop the Minecraft server before restoring. Restoring while the server is running will cause data corruption.
 
