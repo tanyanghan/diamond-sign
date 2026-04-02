@@ -1524,6 +1524,29 @@ def main():
     observer.start()
     logger.info("Watching %s for join/leave events", LOG_PATH)
 
+    # Capture any players already online via RCON /list
+    if RCON_PASSWORD:
+        try:
+            resp = rcon_command("list")
+            # Response: "There are X of a max of Y players online: p1, p2"
+            m = re.match(r'There are \d+ of a max of \d+ players online:(.*)', resp)
+            if m:
+                names_part = m.group(1).strip()
+                if names_part:
+                    for name in names_part.split(", "):
+                        name = name.strip()
+                        if name:
+                            player_join(name)
+                    online = get_online_players()
+                    logger.info("RCON /list: %d player(s) already online: %s",
+                                len(online), ", ".join(online))
+                else:
+                    logger.info("RCON /list: no players online")
+            else:
+                logger.info("RCON /list: no players online")
+        except Exception as e:
+            logger.warning("RCON /list failed (server may be offline): %s", e)
+
     class _NetworkErrorFilter(logging.Filter):
         _TRANSIENT = (
             ("Network is unreachable", "network unreachable"),
