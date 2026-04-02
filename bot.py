@@ -653,8 +653,19 @@ _auth_ref: dict | None = None
 
 
 def rcon_command(cmd: str) -> str:
-    with MCRcon("localhost", RCON_PASSWORD) as mcr:
+    # MCRcon.__init__ uses signal.SIGALRM which fails in non-main threads.
+    # Bypass __init__ and set up the object manually.
+    mcr = MCRcon.__new__(MCRcon)
+    mcr.host = "localhost"
+    mcr.password = RCON_PASSWORD
+    mcr.port = 25575
+    mcr.tlsmode = 0
+    mcr.timeout = 5
+    mcr.connect()
+    try:
         return mcr.command(cmd)
+    finally:
+        mcr.disconnect()
 
 
 def _wait_for_log_line(phrase: str, timeout: float = 60) -> bool:
