@@ -2,3 +2,4 @@ watchdog
 python-dotenv
 pyTelegramBotAPI
 mcrcon
+questionary
