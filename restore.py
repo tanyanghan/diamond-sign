@@ -50,7 +50,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
-import questionary
+import curses
 from dotenv import load_dotenv
 
 from backup_utils import (
@@ -193,47 +193,234 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes / 1024:.1f} KB"
 
 
+def _build_display(chains: list) -> tuple:
+    """Build display lines and points list in reverse chronological order.
+
+    Returns (display_lines, points) where:
+      - display_lines: list of (is_selectable, text, point_idx) tuples.
+        Separator lines have is_selectable=False and point_idx=None.
+      - points: flat list of (chain_idx, point_idx) tuples.  point_idx is
+        an index into this list, stored in the display_lines tuple so the
+        curses selector can return it directly.
+
+    Chains are ordered latest-first. Within each chain, incrementals appear
+    in reverse chronological order followed by the full backup.
+    """
+    points = []
+    display_lines = []
+    num = 1
+
+    for rev_idx, ci in enumerate(reversed(range(len(chains)))):
+        chain = chains[ci]
+        full = chain["full"]
+        chain_id = chain["chain_id"]
+        chain_label = f"Chain {chain_id}" if chain_id else "Standalone"
+
+        if rev_idx > 0:
+            display_lines.append((False, "", None))
+        display_lines.append(
+            (False, f"  {chain_label} (from {full['path'].name})", None))
+
+        # Incrementals in reverse chronological order (latest first)
+        for ii in reversed(range(len(chain["incrementals"]))):
+            incr = chain["incrementals"][ii]
+            label = (f"  {num:3d}.  [INCR] {parse_timestamp(incr['timestamp'])}"
+                     f"  ({format_size(incr['size'])})")
+            display_lines.append((True, label, len(points)))
+            points.append((ci, ii))
+            num += 1
+
+        # Full backup shown last within its chain
+        label = (f"  {num:3d}.  [FULL] {parse_timestamp(full['timestamp'])}"
+                 f"  ({format_size(full['size'])})")
+        display_lines.append((True, label, len(points)))
+        points.append((ci, -1))
+        num += 1
+
+    return display_lines, points
+
+
+def _curses_select(stdscr, header_text: str, display_lines: list,
+                   selectable_indices: list) -> int | None:
+    """Interactive curses-based paginated selector with highlight.
+
+    Navigation:
+        Up / Down       — move highlight between selectable restore points
+        Right / n       — next page  (highlight → first item on new page)
+        Left  / p       — previous page
+        Enter           — select the highlighted item (or submit typed number)
+        0-9             — accumulate a number; Enter jumps to that item
+        Backspace       — delete last digit from number buffer
+        Esc             — clear number buffer
+        q               — cancel
+
+    Returns the point_idx stored in the selected display_lines entry, or None.
+    """
+    curses.curs_set(0)
+    curses.use_default_colors()
+
+    header_lines = header_text.splitlines() if header_text else []
+
+    def recalc():
+        """Recompute layout after a terminal resize."""
+        my, mx = stdscr.getmaxyx()
+        ps = max(3, my - len(header_lines) - 2)  # -2: blank + status bar
+        tp = max(1, (len(display_lines) + ps - 1) // ps)
+        return my, mx, ps, tp
+
+    max_y, max_x, page_size, total_pages = recalc()
+
+    hi = 0 if selectable_indices else -1
+    page = (selectable_indices[0] // page_size) if selectable_indices else 0
+    number_buf = ""
+
+    def first_sel_on_page(p):
+        lo, hi_bound = p * page_size, (p + 1) * page_size
+        for i, di in enumerate(selectable_indices):
+            if lo <= di < hi_bound:
+                return i
+        return None
+
+    while True:
+        stdscr.erase()
+        row = 0
+
+        # -- header (fixed at top of every page) --
+        for hl in header_lines:
+            if row >= max_y:
+                break
+            try:
+                stdscr.addnstr(row, 0, hl, max_x - 1)
+            except curses.error:
+                pass
+            row += 1
+
+        # -- current page of display lines --
+        start = page * page_size
+        end = min(start + page_size, len(display_lines))
+        for di in range(start, end):
+            if row >= max_y - 1:
+                break
+            _sel, text, _pidx = display_lines[di]
+            try:
+                if _sel and hi >= 0 and di == selectable_indices[hi]:
+                    stdscr.addnstr(row, 0, text.ljust(max_x - 1),
+                                   max_x - 1, curses.A_REVERSE)
+                else:
+                    stdscr.addnstr(row, 0, text, max_x - 1)
+            except curses.error:
+                pass
+            row += 1
+
+        # -- status bar (last row) --
+        is_last = end >= len(display_lines)
+        nav = []
+        if selectable_indices:
+            nav.append("Up/Dn highlight")
+        if page > 0:
+            nav.append("Left/p prev")
+        if not is_last:
+            nav.append("Right/n next")
+        nav.append("Enter select")
+        nav.append("# jump")
+        nav.append("q quit")
+        page_str = f"Page {page + 1}/{total_pages}"
+        nav_str = "  ".join(nav)
+        if number_buf:
+            status = f"  {page_str}  |  Select: {number_buf}_  ({nav_str})"
+        else:
+            status = f"  {page_str}  |  {nav_str}"
+        try:
+            stdscr.addnstr(max_y - 1, 0, status, max_x - 1, curses.A_BOLD)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        # -- handle input --
+        if key == ord('q'):
+            return None
+
+        elif key == curses.KEY_UP:
+            number_buf = ""
+            if selectable_indices and hi > 0:
+                hi -= 1
+                page = selectable_indices[hi] // page_size
+
+        elif key == curses.KEY_DOWN:
+            number_buf = ""
+            if selectable_indices and hi < len(selectable_indices) - 1:
+                hi += 1
+                page = selectable_indices[hi] // page_size
+
+        elif key in (curses.KEY_RIGHT, ord('n'), ord('N')):
+            number_buf = ""
+            if page < total_pages - 1:
+                page += 1
+                fp = first_sel_on_page(page) if selectable_indices else None
+                if fp is not None:
+                    hi = fp
+
+        elif key in (curses.KEY_LEFT, ord('p'), ord('P'), ord('b'), ord('B')):
+            number_buf = ""
+            if page > 0:
+                page -= 1
+                fp = first_sel_on_page(page) if selectable_indices else None
+                if fp is not None:
+                    hi = fp
+
+        elif key in (ord('\n'), ord('\r'), curses.KEY_ENTER):
+            if number_buf:
+                try:
+                    n = int(number_buf) - 1
+                    if 0 <= n < len(selectable_indices):
+                        return display_lines[selectable_indices[n]][2]
+                except ValueError:
+                    pass
+                number_buf = ""
+            elif selectable_indices and hi >= 0:
+                return display_lines[selectable_indices[hi]][2]
+
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if number_buf:
+                number_buf = number_buf[:-1]
+
+        elif key == 27:  # Escape
+            number_buf = ""
+
+        elif 48 <= key <= 57:  # digits 0-9
+            number_buf += chr(key)
+
+        elif key == curses.KEY_RESIZE:
+            max_y, max_x, page_size, total_pages = recalc()
+            page = min(page, total_pages - 1)
+
+
 def display_restore_points(chains: list, header: str | None = None) -> tuple:
-    """Display restore points as an interactive questionary selection list.
+    """Display restore points interactively with curses and return the selection.
 
     Returns (points, selected_idx) where:
       - points: flat list of (chain_idx, point_idx) tuples
-      - selected_idx: index into points chosen interactively, or None if
-                      the user cancelled (Ctrl-C)
+      - selected_idx: index into points chosen by the user, or None if cancelled
 
     point_idx == -1 selects the full backup only; >= 0 selects the
     incremental at that index within the chain.
     """
-    points = []
-    choices = []
+    display_lines, points = _build_display(chains)
+    selectable_indices = [
+        i for i, (is_sel, _, _) in enumerate(display_lines) if is_sel]
 
-    for ci, chain in enumerate(chains):
-        full = chain["full"]
-        chain_id = chain["chain_id"]
-        chain_label = f"Chain {chain_id}" if chain_id else "Standalone"
-        choices.append(questionary.Separator(
-            f"\n  {chain_label} (from {full['path'].name})"))
+    def _run(stdscr):
+        return _curses_select(stdscr, header or "", display_lines,
+                              selectable_indices)
 
-        label = (f"[FULL] {parse_timestamp(full['timestamp'])}"
-                 f"  ({format_size(full['size'])})")
-        choices.append(questionary.Choice(title=label, value=len(points)))
-        points.append((ci, -1))
+    try:
+        selected = curses.wrapper(_run)
+    except KeyboardInterrupt:
+        selected = None
 
-        for ii, incr in enumerate(chain["incrementals"]):
-            label = (f"  └─ [INCR] {parse_timestamp(incr['timestamp'])}"
-                     f"  ({format_size(incr['size'])})")
-            choices.append(questionary.Choice(title=label, value=len(points)))
-            points.append((ci, ii))
-
-    if header:
-        print(header)
-
-    selected_idx = questionary.select(
-        "Select a restore point  (↑↓ move, Enter select, Ctrl-C cancel):",
-        choices=choices,
-    ).ask()  # returns None if user presses Ctrl-C
-
-    return points, selected_idx
+    return points, selected
 
 
 def restore(chains: list, chain_idx: int, point_idx: int,
