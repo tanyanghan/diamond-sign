@@ -1070,14 +1070,32 @@ def run_incremental_backup() -> str | None:
                 logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
 
             # Second pass: re-scan after save-all to capture any files that
-            # were flushed to disk by the save command
+            # were flushed to disk by the save command.  Then wait until no
+            # file in the server directory has been modified for 5 seconds,
+            # re-scanning each time a change is detected.  This guards against
+            # zipping partially-written region files — the server may still be
+            # flushing data to disk even after "Saved the game" is logged.
             new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
-            changed, deleted = _diff_manifest(old_files, new_manifest)
+            settle_seconds = 5
+            max_settle_attempts = 12  # give up after ~60 s of waiting
+            for attempt in range(max_settle_attempts):
+                time.sleep(settle_seconds)
+                check_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
+                if check_manifest == new_manifest:
+                    logger.info("Incremental backup: filesystem settled after "
+                                "%d s", settle_seconds * (attempt + 1))
+                    break
+                else:
+                    new_manifest = check_manifest
+                    logger.info("Incremental backup: files still changing, "
+                                "re-scanning (attempt %d/%d)",
+                                attempt + 1, max_settle_attempts)
+            else:
+                logger.warning("Incremental backup: filesystem did not settle "
+                               "after %d s, proceeding with current state",
+                               settle_seconds * max_settle_attempts)
 
-            if not changed and not deleted:
-                logger.info("Incremental backup: no changes after save-all, skipping")
-                _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
-                return None
+            changed, deleted = _diff_manifest(old_files, new_manifest)
 
             # Build the incremental zip with chain ID in the filename
             dir_name = mc_dir.name
