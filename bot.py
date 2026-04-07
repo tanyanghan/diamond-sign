@@ -18,7 +18,7 @@ from watchdog.observers import Observer
 
 from backup_utils import (
     CHAIN_MARKER_NAME, RE_INCR, build_file_manifest, new_chain_id,
-    run_copy_command,
+    run_copy_command, wait_for_settle,
 )
 
 # ---------------------------------------------------------------------------
@@ -807,10 +807,11 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
       1. RCON save-off: disable Minecraft's auto-save to prevent file writes
          during the zip operation (avoids corrupt/partial region files).
       2. RCON save-all: flush all pending world data from memory to disk.
-      3. Zip the entire server directory into BACKUP_DIR.
-      4. RCON save-on: re-enable auto-save (always, even if zip fails).
-      5. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
-      6. Start a new incremental chain: generate a fresh chain ID, rebuild
+      3. Wait for filesystem to settle (no mtime changes for 5 s).
+      4. Zip the entire server directory into BACKUP_DIR.
+      5. RCON save-on: re-enable auto-save (always, even if zip fails).
+      6. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
+      7. Start a new incremental chain: generate a fresh chain ID, rebuild
          the file manifest (mtime baseline), and write the chain marker.
 
     RCON log confirmations are handled via LogWatcher.expect_line(): we
@@ -847,11 +848,15 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         else:
             status("Warning: save-all confirmation not seen in log, proceeding anyway")
 
-        # Step 3: Zip the server directory
+        # Step 3: Wait for the filesystem to settle before zipping.
+        # The server may still be flushing region data to disk after save-all.
+        mc_dir = Path(MINECRAFT_DIR)
+        wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status)
+
+        # Step 4: Zip the server directory
         # Uses relative paths inside the zip so the restore tool can extract
         # directly into any target directory. Skips the backup output directory
         # (if it's inside the server dir) and the chain marker file.
-        mc_dir = Path(MINECRAFT_DIR)
         dir_name = mc_dir.name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_path = BACKUP_DIR / f"{dir_name}_{timestamp}.zip"
@@ -877,7 +882,7 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
-        # Step 4: Always re-enable auto-save, even if zip fails
+        # Step 5: Always re-enable auto-save, even if zip fails
         waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
         rcon_command("save-on")
         if waiter.wait(timeout=30):
@@ -885,10 +890,10 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         else:
             status("Warning: save-on confirmation not seen in log")
 
-    # Step 5: Copy off-server if configured (e.g., rsync to NAS/cloud)
+    # Step 6: Copy off-server if configured (e.g., rsync to NAS/cloud)
     run_copy_command(final_path, log_fn=status)
 
-    # Step 6: Start a new incremental chain
+    # Step 7: Start a new incremental chain
     # Every full backup starts a fresh chain. The manifest records the mtime
     # of every file, which becomes the baseline for detecting changes in
     # subsequent incremental backups. The chain marker is written to the
@@ -1069,32 +1074,12 @@ def run_incremental_backup() -> str | None:
             else:
                 logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
 
-            # Second pass: re-scan after save-all to capture any files that
-            # were flushed to disk by the save command.  Then wait until no
-            # file in the server directory has been modified for 5 seconds,
-            # re-scanning each time a change is detected.  This guards against
-            # zipping partially-written region files — the server may still be
-            # flushing data to disk even after "Saved the game" is logged.
-            new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
-            settle_seconds = 5
-            max_settle_attempts = 12  # give up after ~60 s of waiting
-            for attempt in range(max_settle_attempts):
-                time.sleep(settle_seconds)
-                check_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
-                if check_manifest == new_manifest:
-                    logger.info("Incremental backup: filesystem settled after "
-                                "%d s", settle_seconds * (attempt + 1))
-                    break
-                else:
-                    new_manifest = check_manifest
-                    logger.info("Incremental backup: files still changing, "
-                                "re-scanning (attempt %d/%d)",
-                                attempt + 1, max_settle_attempts)
-            else:
-                logger.warning("Incremental backup: filesystem did not settle "
-                               "after %d s, proceeding with current state",
-                               settle_seconds * max_settle_attempts)
-
+            # Second pass: re-scan after save-all and wait for the filesystem
+            # to settle before zipping.  The server may still be flushing data
+            # to disk even after "Saved the game" is logged.
+            new_manifest = wait_for_settle(
+                mc_dir, BACKUP_DIR,
+                log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
             changed, deleted = _diff_manifest(old_files, new_manifest)
 
             # Build the incremental zip with chain ID in the filename

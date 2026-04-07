@@ -100,10 +100,11 @@ The bot performs automated full backups of the entire Minecraft server directory
 
 1. Sends `save-off` via RCON to disable auto-save.
 2. Sends `save-all` to flush world data from memory to disk.
-3. Zips the entire `MINECRAFT_DIR` (e.g. `minecraftopia_20260401_040000.zip`).
-4. Sends `save-on` to re-enable auto-save (guaranteed even if the zip fails).
-5. Saves the zip to `BACKUP_DIR` (default: `~/minecraft_backup`).
-6. Optionally runs `BACKUP_COPY_CMD` to copy the zip off-server.
+3. Waits for the filesystem to settle (no file changes for 5 seconds) to ensure all data is fully written.
+4. Zips the entire `MINECRAFT_DIR` (e.g. `minecraftopia_20260401_040000.zip`).
+5. Sends `save-on` to re-enable auto-save (guaranteed even if the zip fails).
+6. Saves the zip to `BACKUP_DIR` (default: `~/minecraft_backup`).
+7. Optionally runs `BACKUP_COPY_CMD` to copy the zip off-server.
 
 Players do not need to be kicked — the save-off/save-all/save-on sequence ensures a consistent snapshot while the server stays online.
 
@@ -143,8 +144,9 @@ When enabled, the bot performs incremental backups while players are active. Onl
 1. When the first player joins, the incremental backup cycle starts.
 2. Every `INCREMENTAL_INTERVAL_MINUTES` minutes, the bot:
    - Compares file modification timestamps against a stored manifest.
-   - If changes are detected, runs save-off / save-all / save-on via RCON (same as full backups).
+   - If changes are detected, runs save-off / save-all via RCON, then waits for the filesystem to settle (no file changes for 5 seconds).
    - Creates a zip containing only changed/added files, plus `_deletions.json` for removed files.
+   - Runs save-on to re-enable auto-save.
 3. When the last player leaves, one final incremental backup runs and the cycle stops.
 4. After a full backup, the manifest resets so the next incremental only captures changes since the full backup.
 

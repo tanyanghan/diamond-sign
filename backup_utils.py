@@ -47,6 +47,7 @@ import os
 import re
 import secrets
 import subprocess
+import time
 from pathlib import Path
 
 # Name of the chain marker file placed in the Minecraft server directory.
@@ -134,6 +135,48 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None) -> dict:
             except OSError:
                 pass
     return files
+
+
+def wait_for_settle(root_dir: Path, backup_dir: Path | None = None,
+                    settle_seconds: int = 5, max_attempts: int = 12,
+                    log_fn=None) -> dict:
+    """Wait until no files in root_dir change for settle_seconds, then return
+    the final manifest.
+
+    After RCON save-all, the server may still be flushing data to disk.  This
+    function polls the filesystem by building file manifests and comparing
+    consecutive snapshots.  Once two snapshots taken settle_seconds apart are
+    identical, the filesystem is considered settled.
+
+    Args:
+        root_dir:        Directory to monitor (the Minecraft server directory).
+        backup_dir:      Passed through to build_file_manifest (excluded from scan).
+        settle_seconds:  Seconds to wait between snapshots (default 5).
+        max_attempts:    Maximum polling iterations before giving up (default 12,
+                         i.e. ~60 s total).
+        log_fn:          Callback for status messages.  If None, silent.
+
+    Returns:
+        The final file manifest {relative_path: mtime}.
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    manifest = build_file_manifest(root_dir, backup_dir)
+    for attempt in range(max_attempts):
+        time.sleep(settle_seconds)
+        check = build_file_manifest(root_dir, backup_dir)
+        if check == manifest:
+            log(f"Filesystem settled after {settle_seconds * (attempt + 1)} s")
+            return manifest
+        else:
+            manifest = check
+            log(f"Files still changing, re-scanning "
+                f"(attempt {attempt + 1}/{max_attempts})")
+    log(f"Filesystem did not settle after {settle_seconds * max_attempts} s, "
+        f"proceeding with current state")
+    return manifest
 
 
 def run_copy_command(file_path: Path, log_fn=None) -> None:
