@@ -1779,6 +1779,10 @@ def main():
                     online = get_online_players()
                     logger.info("RCON /list: %d player(s) already online: %s",
                                 len(online), ", ".join(online))
+                    # Players were online before the bot started; the join
+                    # notify callback never fired for them, so start the
+                    # incremental backup cycle here.
+                    _start_incremental_cycle()
                 else:
                     logger.info("RCON /list: no players online")
             else:
