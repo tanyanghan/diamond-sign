@@ -728,6 +728,7 @@ _watcher_ref: LogWatcher | None = None
 _pending_player_restore: dict = {}
 _pending_player_lock = threading.Lock()
 _PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missing
+_RESTORE_PLAYER_MAX_VERSIONS = 10  # cap on number of historic .dat versions shown
 
 
 def _read_server_properties() -> dict:
@@ -1111,12 +1112,12 @@ def _scan_player_data_versions(uuid: str) -> list:
             m_incr = RE_INCR.match(f.name)
             if m_incr and m_incr.group(2) == chain_id:
                 ts_str = m_incr.group(3)
-                label = f"incr {f.name}"
+                label = "incremental backup"
             elif f.name == base_full:
                 m_full = RE_FULL.match(f.name)
                 if m_full:
                     ts_str = m_full.group(2)
-                    label = f"full {f.name}"
+                    label = "full backup"
             if ts_str is None:
                 continue
             try:
@@ -1140,7 +1141,9 @@ def _scan_player_data_versions(uuid: str) -> list:
             })
 
     versions.sort(key=lambda v: v["sort_key"], reverse=True)
-    return versions
+    # Cap to the 10 most recent — older restore points are rarely useful and
+    # a long list crowds the Telegram message.
+    return versions[:_RESTORE_PLAYER_MAX_VERSIONS]
 
 
 def _format_versions_reply(username: str, uuid: str, versions: list) -> str:
