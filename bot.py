@@ -34,7 +34,8 @@ if missing:
     raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
 
 LOG_PATH = Path(MINECRAFT_DIR) / "logs" / "latest.log"
-STATS_DIR = Path(MINECRAFT_DIR) / "world" / "stats"
+# The world subdirectory name is configurable via `level-name` in
+# server.properties — use _stats_dir() at call time instead of a constant.
 
 RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "")
 BACKUP_DIR = Path(os.path.expanduser(os.environ.get("BACKUP_DIR", "~/minecraft_backup")))
@@ -765,6 +766,11 @@ def _get_level_name() -> str:
     return _read_server_properties().get("level-name", "world")
 
 
+def _stats_dir() -> Path:
+    """Return the per-player stats directory under the active world."""
+    return Path(MINECRAFT_DIR) / _get_level_name() / "stats"
+
+
 def _validate_server_properties() -> list:
     """Check server.properties for RCON settings and return a list of warnings.
 
@@ -1067,7 +1073,7 @@ def _scan_player_data_versions(uuid: str) -> list:
     """Find all available historical copies of a player's .dat file.
 
     Sources, latest first:
-      1. Live <MINECRAFT_DIR>/world/playerdata/<uuid>.dat[_old[.gz]]
+      1. Live <MINECRAFT_DIR>/<level-name>/playerdata/<uuid>.dat[_old[.gz]]
       2. The current chain's full backup (base_full) if it contains the entry
       3. Every incremental zip in BACKUP_DIR matching the current chain_id
          that contains the entry
@@ -1639,7 +1645,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
         target = args[1].strip().lower() if len(args) > 1 else None
         logger.info("Stats: requested by %s (player=%s)", _tg_user(message), target or "all")
 
-        all_stats = read_player_stats(STATS_DIR, names)
+        all_stats = read_player_stats(_stats_dir(), names)
         if not all_stats:
             bot.reply_to(message, "Stats directory not found or empty.")
             return
@@ -1661,7 +1667,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("Playtime: requested by %s", _tg_user(message))
-        all_stats = read_player_stats(STATS_DIR, names)
+        all_stats = read_player_stats(_stats_dir(), names)
         if not all_stats:
             bot.reply_to(message, "Stats directory not found or empty.")
             return
@@ -1676,12 +1682,12 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("List: requested by %s", _tg_user(message))
-        if not STATS_DIR.exists():
+        if not _stats_dir().exists():
             bot.reply_to(message, "Stats directory not found.")
             return
         entries = sorted(
             names.get(f.stem, f.stem)
-            for f in STATS_DIR.glob("*.json")
+            for f in _stats_dir().glob("*.json")
         )
         if not entries:
             bot.reply_to(message, "No players found in stats directory.")
