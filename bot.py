@@ -730,6 +730,40 @@ _pending_player_lock = threading.Lock()
 _PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missing
 
 
+def _read_server_properties() -> dict:
+    """Parse <MINECRAFT_DIR>/server.properties into a dict.
+
+    Java .properties files escape special characters with backslashes
+    (e.g., \\! \\: \\= \\\\). Values are unescaped so they compare cleanly
+    against equivalents from .env.
+
+    Returns an empty dict if the file is missing or unreadable.
+    """
+    props_path = Path(MINECRAFT_DIR) / "server.properties"
+    props: dict = {}
+    try:
+        with open(props_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    value = value.strip().replace("\\!", "!").replace("\\:", ":") \
+                                 .replace("\\=", "=").replace("\\\\", "\\")
+                    props[key.strip()] = value
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception("Failed to read server.properties")
+    return props
+
+
+def _get_level_name() -> str:
+    """Return the world directory name from server.properties' `level-name`.
+    Falls back to 'world' (the vanilla default) if the file is missing or
+    the key isn't set."""
+    return _read_server_properties().get("level-name", "world")
+
+
 def _validate_server_properties() -> list:
     """Check server.properties for RCON settings and return a list of warnings.
 
@@ -744,19 +778,8 @@ def _validate_server_properties() -> list:
     if not props_path.exists():
         return [f"server.properties not found at {props_path}"]
 
+    props = _read_server_properties()
     warnings = []
-    props = {}
-    with open(props_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                # Java .properties files escape special characters with
-                # backslashes (e.g., \! \: \= \\). Unescape so we can
-                # compare against the actual values from .env.
-                value = value.strip().replace("\\!", "!").replace("\\:", ":") \
-                             .replace("\\=", "=").replace("\\\\", "\\")
-                props[key.strip()] = value
 
     if props.get("enable-rcon", "false").lower() != "true":
         warnings.append("server.properties: enable-rcon is not set to true")
@@ -1018,12 +1041,11 @@ def _read_chain_marker() -> str:
 # Player-data restore helpers (used by /restore_player)
 # ---------------------------------------------------------------------------
 
-# Entry inside <MINECRAFT_DIR> for a player's .dat. Forward slashes match the
-# zip layout produced by run_backup / run_incremental_backup.
-_PLAYERDATA_REL = "world/playerdata"
-
-# Maps user-typed timestamp display back to a sort key. Filename timestamps
-# (YYYYMMDD_HHMMSS) sort lexicographically the same as chronologically.
+# Player-data lives at <MINECRAFT_DIR>/<level-name>/playerdata/<uuid>.dat.
+# The world subdirectory name comes from `level-name` in server.properties
+# (default "world"); read it via _get_level_name() — never hardcode.
+# Forward slashes here match the zip layout produced by run_backup /
+# run_incremental_backup.
 
 
 def _resolve_player(name: str, names: dict) -> tuple | None:
@@ -1054,8 +1076,10 @@ def _scan_player_data_versions(uuid: str) -> list:
     a sort key.
     """
     versions = []
-    entry = f"{_PLAYERDATA_REL}/{uuid}.dat"
-    playerdata_dir = Path(MINECRAFT_DIR) / _PLAYERDATA_REL
+    level_name = _get_level_name()
+    playerdata_rel = f"{level_name}/playerdata"
+    entry = f"{playerdata_rel}/{uuid}.dat"
+    playerdata_dir = Path(MINECRAFT_DIR) / level_name / "playerdata"
 
     # 1. Live files (.dat, .dat_old, .dat_old.gz). Each gets its own entry
     # because the three are independently dated working copies, not snapshots.
@@ -1274,7 +1298,8 @@ def _run_player_restore(username: str, uuid: str, version: dict,
         # Read source bytes, then atomically replace <uuid>.dat. Keep the
         # current .dat as <uuid>.dat.pre-restore-<ts> as a safety net so
         # the admin can manually undo a wrong choice.
-        target = Path(MINECRAFT_DIR) / _PLAYERDATA_REL / f"{uuid}.dat"
+        target = (Path(MINECRAFT_DIR) / _get_level_name()
+                  / "playerdata" / f"{uuid}.dat")
         source_bytes = _read_player_data_bytes(version)
 
         ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
