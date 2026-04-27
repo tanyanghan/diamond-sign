@@ -1107,6 +1107,24 @@ def _scan_player_data_versions(uuid: str) -> list:
                 "entry": None,
             })
 
+    # 1b. Pre-restore safety copies left by previous /restore_player runs.
+    # File mtime is the original .dat's save time (preserved by shutil.copy2),
+    # so it sorts naturally alongside the other live entries.
+    if playerdata_dir.exists():
+        for p in playerdata_dir.glob(f"{uuid}.dat.pre-restore-*"):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            versions.append({
+                "timestamp": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "sort_key": mtime,
+                "source": "pre-restore backup",
+                "kind": "live",
+                "path": p,
+                "entry": None,
+            })
+
     # 2 + 3. Backup chain. Skip if no chain established (e.g. fresh install).
     chain_id, base_full, _ = _load_manifest()
     if chain_id and BACKUP_DIR.exists():
@@ -1311,8 +1329,14 @@ def _run_player_restore(username: str, uuid: str, version: dict,
                   / "playerdata" / f"{uuid}.dat")
         source_bytes = _read_player_data_bytes(version)
 
-        ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
         if target.exists():
+            # Tag the safety copy with the live .dat's mtime (i.e. when the
+            # player data was last saved by the server), not datetime.now().
+            # That way the suffix matches the timestamp the version list
+            # would show for this file, making the filename self-documenting
+            # about the state it captures rather than when the restore ran.
+            ts_label = datetime.fromtimestamp(
+                target.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
             backup_path = target.with_name(f"{uuid}.dat.pre-restore-{ts_label}")
             shutil.copy2(target, backup_path)
             status(f"Saved current .dat as {backup_path.name}")
