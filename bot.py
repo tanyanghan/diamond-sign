@@ -17,7 +17,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from backup_utils import (
-    CHAIN_MARKER_NAME, RE_INCR, build_file_manifest, new_chain_id,
+    CHAIN_MARKER_NAME, RE_FULL, RE_INCR, build_file_manifest, new_chain_id,
     run_copy_command, wait_for_settle,
 )
 
@@ -722,6 +722,13 @@ _bot_ref: telebot.TeleBot | None = None
 _auth_ref: dict | None = None
 _watcher_ref: LogWatcher | None = None
 
+# /restore_player pending-state, keyed by admin user_id.
+# Forces the admin through the list -> select -> confirm sequence so a typo
+# in a single command can't trigger a destructive restore.
+_pending_player_restore: dict = {}
+_pending_player_lock = threading.Lock()
+_PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missing
+
 
 def _validate_server_properties() -> list:
     """Check server.properties for RCON settings and return a list of warnings.
@@ -1005,6 +1012,298 @@ def _read_chain_marker() -> str:
     except Exception:
         logger.exception("Failed to read chain marker")
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Player-data restore helpers (used by /restore_player)
+# ---------------------------------------------------------------------------
+
+# Entry inside <MINECRAFT_DIR> for a player's .dat. Forward slashes match the
+# zip layout produced by run_backup / run_incremental_backup.
+_PLAYERDATA_REL = "world/playerdata"
+
+# Maps user-typed timestamp display back to a sort key. Filename timestamps
+# (YYYYMMDD_HHMMSS) sort lexicographically the same as chronologically.
+
+
+def _resolve_player(name: str, names: dict) -> tuple | None:
+    """Case-insensitive name lookup. Returns (canonical_name, uuid) or None.
+
+    Minecraft usernames are case-insensitive in practice; player_names.json
+    stores the case the server logged at join time. We accept any case from
+    the admin and surface the stored canonical name.
+    """
+    target = name.lower()
+    for uuid, canonical in names.items():
+        if canonical.lower() == target:
+            return canonical, uuid
+    return None
+
+
+def _scan_player_data_versions(uuid: str) -> list:
+    """Find all available historical copies of a player's .dat file.
+
+    Sources, latest first:
+      1. Live <MINECRAFT_DIR>/world/playerdata/<uuid>.dat[_old[.gz]]
+      2. The current chain's full backup (base_full) if it contains the entry
+      3. Every incremental zip in BACKUP_DIR matching the current chain_id
+         that contains the entry
+
+    Each returned dict carries enough context for _run_player_restore to read
+    the bytes back later: ("kind", "path", "entry") plus a display label and
+    a sort key.
+    """
+    versions = []
+    entry = f"{_PLAYERDATA_REL}/{uuid}.dat"
+    playerdata_dir = Path(MINECRAFT_DIR) / _PLAYERDATA_REL
+
+    # 1. Live files (.dat, .dat_old, .dat_old.gz). Each gets its own entry
+    # because the three are independently dated working copies, not snapshots.
+    for suffix, kind, label in (
+        (".dat", "live", "live .dat"),
+        (".dat_old", "live", "live .dat_old"),
+        (".dat_old.gz", "live_gz", "live .dat_old.gz"),
+    ):
+        p = playerdata_dir / f"{uuid}{suffix}"
+        if p.exists():
+            mtime = p.stat().st_mtime
+            versions.append({
+                "timestamp": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "sort_key": mtime,
+                "source": label,
+                "kind": kind,
+                "path": p,
+                "entry": None,
+            })
+
+    # 2 + 3. Backup chain. Skip if no chain established (e.g. fresh install).
+    chain_id, base_full, _ = _load_manifest()
+    if chain_id and BACKUP_DIR.exists():
+        for f in BACKUP_DIR.iterdir():
+            if not f.is_file() or f.suffix != ".zip":
+                continue
+            ts_str = None
+            label = None
+            m_incr = RE_INCR.match(f.name)
+            if m_incr and m_incr.group(2) == chain_id:
+                ts_str = m_incr.group(3)
+                label = f"incr {f.name}"
+            elif f.name == base_full:
+                m_full = RE_FULL.match(f.name)
+                if m_full:
+                    ts_str = m_full.group(2)
+                    label = f"full {f.name}"
+            if ts_str is None:
+                continue
+            try:
+                with zipfile.ZipFile(f, "r") as zf:
+                    if entry not in zf.namelist():
+                        continue
+            except (zipfile.BadZipFile, OSError):
+                logger.warning("Skipping unreadable backup zip: %s", f.name)
+                continue
+            try:
+                ts_dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            versions.append({
+                "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "sort_key": ts_dt.timestamp(),
+                "source": label,
+                "kind": "zip",
+                "path": f,
+                "entry": entry,
+            })
+
+    versions.sort(key=lambda v: v["sort_key"], reverse=True)
+    return versions
+
+
+def _format_versions_reply(username: str, uuid: str, versions: list) -> str:
+    """Render the numbered list reply for /restore_player <username>."""
+    if not versions:
+        return (f"No player data found for {username} ({uuid}).\n"
+                f"Live file missing and no backups in the active chain.")
+    lines = [f"Player data versions for {username}  (UUID: {uuid})",
+             "Latest first. To select, send: /restore_player "
+             f"{username} <number>", ""]
+    for i, v in enumerate(versions, 1):
+        lines.append(f"  {i:3d}.  {v['timestamp']}   {v['source']}")
+    return "\n".join(lines)
+
+
+def _format_confirm_reply(username: str, uuid: str, n: int, version: dict) -> str:
+    """Render the step-2 confirmation block."""
+    return (
+        "Confirm restore:\n"
+        f"  Player:    {username}\n"
+        f"  UUID:      {uuid}\n"
+        f"  Timestamp: {version['timestamp']}\n"
+        f"  Source:    {version['source']}\n"
+        "\n"
+        "  To proceed, send:\n"
+        f"    /restore_player {username} {n} confirm"
+    )
+
+
+def _get_pending_player_restore(user_id: int,
+                                expected_username: str | None = None,
+                                expected_stage: str | None = None) -> dict | None:
+    """Lookup pending player restore for an admin, with TTL and match checks.
+
+    Returns the pending entry if it exists, hasn't expired, matches the
+    expected username (case-insensitive), and is in the expected stage.
+    Otherwise returns None and (if expired) discards the stale entry.
+    """
+    with _pending_player_lock:
+        entry = _pending_player_restore.get(user_id)
+        if entry is None:
+            return None
+        if time.time() - entry["ts"] > _PENDING_PLAYER_RESTORE_TTL:
+            _pending_player_restore.pop(user_id, None)
+            return None
+        if (expected_username is not None
+                and entry["username"].lower() != expected_username.lower()):
+            return None
+        if expected_stage is not None and entry["stage"] != expected_stage:
+            return None
+        return entry
+
+
+def _set_pending_player_restore(user_id: int, **fields) -> None:
+    """Store/update a pending player restore entry with the current timestamp."""
+    with _pending_player_lock:
+        existing = _pending_player_restore.get(user_id, {})
+        existing.update(fields)
+        existing["ts"] = time.time()
+        _pending_player_restore[user_id] = existing
+
+
+def _clear_pending_player_restore(user_id: int) -> None:
+    with _pending_player_lock:
+        _pending_player_restore.pop(user_id, None)
+
+
+def _read_player_data_bytes(version: dict) -> bytes:
+    """Pull raw .dat bytes from a version entry, transparently gunzipping
+    a .dat_old.gz source. Always returns plain (uncompressed) NBT bytes
+    suitable for writing into <uuid>.dat."""
+    kind = version["kind"]
+    if kind == "zip":
+        with zipfile.ZipFile(version["path"], "r") as zf:
+            return zf.read(version["entry"])
+    if kind == "live_gz":
+        with gzip.open(version["path"], "rb") as f:
+            return f.read()
+    return version["path"].read_bytes()
+
+
+def _player_is_online_via_rcon(username: str) -> bool:
+    """Ask the server (not the in-memory set) whether a player is online.
+
+    Reuses the same regex the bot uses at startup. The in-memory online
+    set can drift if the bot missed log lines, so RCON is the source of
+    truth for the destructive restore precondition.
+    """
+    resp = rcon_command("list")
+    m = re.match(r'There are \d+ of a max of \d+ players online:(.*)', resp)
+    if not m:
+        return False
+    names_part = m.group(1).strip()
+    if not names_part:
+        return False
+    target = username.lower()
+    for n in names_part.split(", "):
+        if n.strip().lower() == target:
+            return True
+    return False
+
+
+def _run_player_restore(username: str, uuid: str, version: dict,
+                        bot: telebot.TeleBot, chat_id: int) -> None:
+    """Background worker that performs the player .dat restore.
+
+    Holds _backup_lock for the duration to mutex with /backup and the
+    incremental cycle. Save-on is always re-enabled in a finally block,
+    even if the file replacement step raises.
+    """
+    def status(msg):
+        logger.info("RestorePlayer: %s", msg)
+        try:
+            bot.send_message(chat_id, msg)
+        except Exception:
+            logger.exception("Failed to send status message")
+
+    if not _backup_lock.acquire(blocking=False):
+        bot.send_message(chat_id, "A backup or restore is in progress.")
+        return
+
+    save_off_sent = False
+    try:
+        # Precondition: player must be offline (RCON-confirmed)
+        try:
+            if _player_is_online_via_rcon(username):
+                status(f"Player {username} is online — log them out first.")
+                return
+            status(f"RCON /list: {username} is offline")
+        except Exception as e:
+            status(f"RCON /list failed: {e}")
+            return
+
+        # Mirror the backup save-off / save-all / settle dance so any
+        # outstanding writes finish before we touch the file.
+        status("Disabling auto-save...")
+        waiter = _watcher_ref.expect_line("Automatic saving is now disabled")
+        rcon_command("save-off")
+        save_off_sent = True
+        if waiter.wait(timeout=30):
+            status("Auto-save disabled")
+        else:
+            status("Warning: save-off confirmation not seen in log, proceeding anyway")
+
+        status("Saving world...")
+        waiter = _watcher_ref.expect_line("Saved the game")
+        rcon_command("save-all")
+        if waiter.wait(timeout=120):
+            status("World save complete")
+        else:
+            status("Warning: save-all confirmation not seen in log, proceeding anyway")
+
+        wait_for_settle(Path(MINECRAFT_DIR), BACKUP_DIR, log_fn=status)
+
+        # Read source bytes, then atomically replace <uuid>.dat. Keep the
+        # current .dat as <uuid>.dat.pre-restore-<ts> as a safety net so
+        # the admin can manually undo a wrong choice.
+        target = Path(MINECRAFT_DIR) / _PLAYERDATA_REL / f"{uuid}.dat"
+        source_bytes = _read_player_data_bytes(version)
+
+        ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if target.exists():
+            backup_path = target.with_name(f"{uuid}.dat.pre-restore-{ts_label}")
+            shutil.copy2(target, backup_path)
+            status(f"Saved current .dat as {backup_path.name}")
+
+        tmp = target.with_name(f"{uuid}.dat.tmp")
+        tmp.write_bytes(source_bytes)
+        os.replace(tmp, target)
+        status(f"Restored {username}.dat from {version['source']} "
+               f"({version['timestamp']})")
+
+    except Exception as e:
+        logger.exception("RestorePlayer failed")
+        status(f"Restore failed: {e}")
+    finally:
+        if save_off_sent:
+            try:
+                waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
+                rcon_command("save-on")
+                if waiter.wait(timeout=30):
+                    status("Auto-save re-enabled")
+                else:
+                    status("Warning: save-on confirmation not seen in log")
+            except Exception:
+                logger.exception("Failed to re-enable auto-save")
+        _backup_lock.release()
 
 
 def run_incremental_backup() -> str | None:
@@ -1637,6 +1936,115 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 _backup_lock.release()
 
         threading.Thread(target=run, daemon=True).start()
+
+    # --- /restore_player ---
+    @bot.message_handler(commands=["restore_player"])
+    def cmd_restore_player(message):
+        if message.chat.type != "private":
+            return
+        if not is_admin(message.from_user.id, auth):
+            return
+
+        # Parse: /restore_player <username> [<N>] [confirm]
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message,
+                         "Usage:\n"
+                         "  /restore_player <username>\n"
+                         "  /restore_player <username> <N>\n"
+                         "  /restore_player <username> <N> confirm")
+            return
+        typed_name = args[1]
+        typed_n = args[2] if len(args) >= 3 else None
+        typed_confirm = args[3] if len(args) >= 4 else None
+        if typed_confirm is not None and typed_confirm.lower() != "confirm":
+            bot.reply_to(message, f"Unexpected argument: '{typed_confirm}' "
+                                  f"(did you mean 'confirm'?)")
+            return
+
+        # Resolve UUID and canonical name
+        resolved = _resolve_player(typed_name, names)
+        if resolved is None:
+            bot.reply_to(message, f"Unknown player: {typed_name}")
+            return
+        canonical, uuid = resolved
+        user_id = message.from_user.id
+
+        # --- Step 1: list ---
+        if typed_n is None:
+            versions = _scan_player_data_versions(uuid)
+            if not versions:
+                _clear_pending_player_restore(user_id)
+                bot.reply_to(message, _format_versions_reply(canonical, uuid, versions))
+                return
+            _set_pending_player_restore(
+                user_id, stage="listed", username=canonical, uuid=uuid,
+                versions=versions, selected_n=None)
+            logger.info("RestorePlayer: %s listed %d version(s) for %s",
+                        _tg_user(message), len(versions), canonical)
+            bot.reply_to(message, _format_versions_reply(canonical, uuid, versions))
+            return
+
+        # Steps 2 and 3 require numeric N
+        try:
+            n = int(typed_n)
+        except ValueError:
+            bot.reply_to(message, f"Invalid timestamp number: {typed_n}")
+            return
+
+        # --- Step 3: confirm + execute ---
+        if typed_confirm is not None:
+            entry = _get_pending_player_restore(
+                user_id, expected_username=canonical, expected_stage="selected")
+            if entry is None or entry.get("selected_n") != n:
+                bot.reply_to(message,
+                             f"You must select a timestamp first with "
+                             f"/restore_player {canonical} {n}")
+                return
+            # Re-scan and validate the chosen version still exists. Backup files
+            # could in theory have been deleted between selection and confirm.
+            versions = _scan_player_data_versions(uuid)
+            if not (1 <= n <= len(versions)):
+                _clear_pending_player_restore(user_id)
+                bot.reply_to(message,
+                             f"Selection {n} is no longer valid (only "
+                             f"{len(versions)} version(s) available). "
+                             f"Run /restore_player {canonical} again.")
+                return
+            version = versions[n - 1]
+            logger.info("RestorePlayer: %s confirmed restore of %s to %s "
+                        "(source: %s)", _tg_user(message), canonical,
+                        version["timestamp"], version["source"])
+            bot.reply_to(message, f"Starting restore of {canonical} to "
+                                  f"{version['timestamp']}...")
+            _clear_pending_player_restore(user_id)
+
+            def run():
+                _run_player_restore(canonical, uuid, version, bot, message.chat.id)
+
+            threading.Thread(target=run, daemon=True).start()
+            return
+
+        # --- Step 2: select ---
+        # Must have come from step 1 (or a previous step 2) for this same user.
+        entry = _get_pending_player_restore(
+            user_id, expected_username=canonical)
+        if entry is None:
+            bot.reply_to(message,
+                         f"Run /restore_player {canonical} first to see the list.")
+            return
+        versions = entry["versions"]
+        if not (1 <= n <= len(versions)):
+            bot.reply_to(message,
+                         f"Invalid selection: {n}. Choose 1-{len(versions)}.")
+            return
+        version = versions[n - 1]
+        _set_pending_player_restore(
+            user_id, stage="selected", username=canonical, uuid=uuid,
+            versions=versions, selected_n=n)
+        logger.info("RestorePlayer: %s selected version %d (%s) for %s",
+                    _tg_user(message), n, version["source"], canonical)
+        bot.reply_to(message, _format_confirm_reply(canonical, uuid, n, version))
 
     # --- /chat_id ---
     @bot.message_handler(commands=["chat_id"])

@@ -10,24 +10,32 @@ backups that build on it. To restore to a specific point in time:
   2. Apply each incremental in chronological order up to the selected point,
      overwriting changed files and removing deleted ones.
 
-After restoration, a new chain is established so the bot can immediately resume
-incremental backups without requiring a new full backup. How the new chain is
-created depends on the restore point:
+In-place vs out-of-place restore
+--------------------------------
+The chain-management work (new chain ID, merged incremental, marker file,
+manifest update) only runs when the restore is **in-place** — that is, when
+``target_dir`` resolves to the same path as the bot's ``MINECRAFT_DIR``.
 
-  - Restoring to a FULL backup point:
-    A new chain ID is generated referencing the original full backup. No
-    additional files are created — the full backup is already self-contained.
+  - In-place (target_dir == MINECRAFT_DIR):
+    A new chain is established so the bot can resume incremental backups
+    without requiring a fresh full backup.
+      * Restoring to a FULL point: a new chain ID is generated referencing
+        the original full backup; no additional zip is created.
+      * Restoring to an INCREMENTAL point: a single "merged incremental" zip
+        is created combining all applied incrementals.  Original full +
+        merged incremental fully reconstruct the restored state.  The merged
+        incremental reuses the selected restore point's timestamp.
+    The .mcnotifier_chain marker is written into target_dir and the bot's
+    backup_manifest.json is refreshed.
 
-  - Restoring to an INCREMENTAL point:
-    The original full backup alone cannot reconstruct this state (it would need
-    the incrementals replayed). To avoid forcing an expensive new full backup,
-    we create a single "merged incremental" — a zip that combines all the
-    applied incrementals into one file. This merged incremental + the original
-    full backup = the complete restored state, making the new chain
-    self-contained for future restores.
-
-    The merged incremental is given a new chain ID and the same timestamp as the
-    selected restore point. Future incrementals will chain off this new ID.
+  - Out-of-place (target_dir != MINECRAFT_DIR):
+    Files are extracted only.  No new chain is established, no merged
+    incremental zip is written, no marker file is created, and the bot's
+    backup_manifest.json is left untouched — the bot continues tracking
+    MINECRAFT_DIR's existing chain.  If the user later promotes target_dir
+    by replacing MINECRAFT_DIR's contents with it, the absent
+    .mcnotifier_chain forces the bot to take a fresh full backup, which
+    cleanly starts a new chain on the live server.
 
 Chain Discovery
 ---------------
@@ -489,142 +497,127 @@ def restore(chains: list, chain_idx: int, point_idx: int,
         zf.extractall(target_dir)
     print(f"  Full backup extracted.")
 
-    # Step 2: Apply incrementals in chronological order
-    #
-    # If restoring to an incremental point, we also extract each incremental
-    # into a temporary directory. This temp dir accumulates all changed files
-    # across all applied incrementals (later files overwrite earlier ones),
-    # producing a "merged delta" — the combined difference between the full
-    # backup and the final restored state.
-    #
-    # Why? After restoration, we need to create a new chain so the bot can
-    # resume incremental backups immediately. But the new chain's base_full
-    # points to the original full backup, which alone can't reconstruct the
-    # restored state (it would need the original incrementals replayed).
-    #
-    # Rather than creating an expensive new full backup, we zip the temp dir
-    # as a single "merged incremental" — one file that, combined with the
-    # original full backup, fully reconstructs the restored state. This makes
-    # the new chain self-contained for future restores.
-    if incrementals:
-        tmp = Path(tempfile.mkdtemp())
-        # Track deletions across all incrementals for merging
-        merged_deletions = []   # all deleted paths, in order encountered
-        re_added = set()        # paths that were re-added by a later incremental
+    # Determine whether this is an in-place restore (overwriting the live
+    # MINECRAFT_DIR the bot tracks) or an out-of-place restore (any other
+    # target).  Chain-management work — new chain ID, merged incremental,
+    # marker file, manifest update — only makes sense in-place.  Out-of-place
+    # restores just extract the files; the bot keeps tracking MINECRAFT_DIR
+    # with its existing chain.  If the user later replaces MINECRAFT_DIR with
+    # the target_dir contents, the absence of a marker forces the bot to
+    # take a fresh full backup, which is exactly what we want.
+    mc_dir_env = os.environ.get("MINECRAFT_DIR", "")
+    in_place = bool(mc_dir_env) and Path(mc_dir_env).resolve() == target_dir.resolve()
 
-        try:
-            for incr in incrementals:
-                incr_path = incr["path"]
-                print(f"Applying incremental: {incr_path.name} ...")
-                with zipfile.ZipFile(incr_path, "r") as zf:
-                    file_count = 0
-                    for name in zf.namelist():
-                        if name in META_FILES:
-                            continue
-                        # Extract changed/added files to both:
-                        # - target_dir: the actual restore destination
-                        # - tmp: accumulates the merged delta for the merged incremental
-                        for dest_root in (target_dir, tmp):
-                            dest = dest_root / name
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            with zf.open(name) as src, open(dest, "wb") as dst:
-                                shutil.copyfileobj(src, dst)
-                        # Track that this file was added/updated (not deleted)
+    # Step 2: Apply incrementals in chronological order.
+    #
+    # In-place: also accumulate all changed files in a temp directory so we
+    # can build a single "merged incremental" zip after the loop.  This makes
+    # the new chain self-contained — original full + one merged incremental
+    # reconstructs the restored state without needing the original individual
+    # incrementals.
+    #
+    # Out-of-place: just apply each incremental to target_dir and move on.
+    # No new chain is established for this target.
+    tmp = Path(tempfile.mkdtemp()) if (incrementals and in_place) else None
+    merged_deletions: list = []
+    re_added: set = set()
+
+    try:
+        for incr in incrementals:
+            incr_path = incr["path"]
+            print(f"Applying incremental: {incr_path.name} ...")
+            with zipfile.ZipFile(incr_path, "r") as zf:
+                file_count = 0
+                dest_roots = (target_dir, tmp) if tmp is not None else (target_dir,)
+                for name in zf.namelist():
+                    if name in META_FILES:
+                        continue
+                    for dest_root in dest_roots:
+                        dest = dest_root / name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(name) as src, open(dest, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    if tmp is not None:
                         re_added.add(name)
-                        file_count += 1
+                    file_count += 1
 
-                    # Process deletions: files that existed before but were
-                    # removed during this incremental period
-                    if "_deletions.json" in zf.namelist():
-                        deletions = json.loads(zf.read("_deletions.json"))
-                        for rel_path in deletions:
+                # Apply deletions to target_dir (and track them for the
+                # merged incremental, when in-place).
+                if "_deletions.json" in zf.namelist():
+                    deletions = json.loads(zf.read("_deletions.json"))
+                    for rel_path in deletions:
+                        if tmp is not None:
                             merged_deletions.append(rel_path)
-                            # If a file was deleted, it's no longer "re-added"
-                            # (it might have been added by an earlier incremental
-                            # but then deleted by this one)
                             re_added.discard(rel_path)
-                            # Apply the deletion to the target directory
-                            del_path = target_dir / rel_path
-                            if del_path.exists():
-                                del_path.unlink()
-                                # Clean up empty parent directories
-                                parent = del_path.parent
-                                while parent != target_dir and not any(parent.iterdir()):
-                                    parent.rmdir()
-                                    parent = parent.parent
+                        del_path = target_dir / rel_path
+                        if del_path.exists():
+                            del_path.unlink()
+                            parent = del_path.parent
+                            while parent != target_dir and not any(parent.iterdir()):
+                                parent.rmdir()
+                                parent = parent.parent
 
-                print(f"  Applied ({file_count} files)")
+            print(f"  Applied ({file_count} files)")
 
-            # Build the merged deletion list for the merged incremental.
-            # Only include paths that were deleted and NOT re-added by a later
-            # incremental. Example: if incr1 deletes "a.txt" and incr2 re-adds
-            # "a.txt", the merged incremental should contain a.txt (in the zip)
-            # but NOT list it in _deletions.json.
-            final_deletions = [p for p in merged_deletions if p not in re_added]
+        # Step 3 (in-place only): create merged incremental + marker + manifest.
+        if in_place:
+            if tmp is not None:
+                # Merged deletions = deleted-and-not-re-added later
+                final_deletions = [p for p in merged_deletions if p not in re_added]
+                chain_id = new_chain_id(backup_dir)
+                restore_ts = incrementals[point_idx]["timestamp"]
+                server_name = chain["full"]["server"]
+                merged_name = f"{server_name}_incr_{chain_id}_{restore_ts}.zip"
+                merged_path = backup_dir / merged_name
 
-            # Create the merged incremental zip.
-            # This single zip + the original full backup = the complete state
-            # at the selected restore point. Future restores of this chain only
-            # need these two files.
-            chain_id = new_chain_id(backup_dir)
-            # Reuse the timestamp from the selected restore point so the
-            # merged incremental sorts correctly alongside other backups
-            restore_ts = incrementals[point_idx]["timestamp"]
-            server_name = chain["full"]["server"]
-            merged_name = f"{server_name}_incr_{chain_id}_{restore_ts}.zip"
-            merged_path = backup_dir / merged_name
+                print(f"Creating merged incremental: {merged_name} ...")
+                with zipfile.ZipFile(merged_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for dirpath, _dirnames, filenames in os.walk(tmp):
+                        dp = Path(dirpath)
+                        for fn in filenames:
+                            fp = dp / fn
+                            rel = str(fp.relative_to(tmp)).replace("\\", "/")
+                            zf.write(fp, rel)
+                    if final_deletions:
+                        zf.writestr("_deletions.json",
+                                    json.dumps(final_deletions, indent=2))
+                    zf.writestr("_meta.json", json.dumps({
+                        "chain_id": chain_id, "base_full": full_zip.name}))
 
-            print(f"Creating merged incremental: {merged_name} ...")
-            with zipfile.ZipFile(merged_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Add all changed/added files from the temp dir
-                for dirpath, _dirnames, filenames in os.walk(tmp):
-                    dp = Path(dirpath)
-                    for fn in filenames:
-                        fp = dp / fn
-                        rel = str(fp.relative_to(tmp)).replace("\\", "/")
-                        zf.write(fp, rel)
-                # Add merged deletions list
-                if final_deletions:
-                    zf.writestr("_deletions.json",
-                                json.dumps(final_deletions, indent=2))
-                # Add chain metadata so the restore tool can discover this
-                # incremental's chain membership and base full backup
-                zf.writestr("_meta.json", json.dumps({
-                    "chain_id": chain_id, "base_full": full_zip.name}))
+                print(f"  Merged incremental created "
+                      f"({format_size(merged_path.stat().st_size)})")
+                run_copy_command(merged_path, log_fn=print)
+            else:
+                # Restoring to a full-only point: no incrementals applied,
+                # just give the existing full backup a new chain ID.
+                chain_id = new_chain_id(backup_dir)
 
-            print(f"  Merged incremental created ({format_size(merged_path.stat().st_size)})")
+            marker_path = target_dir / CHAIN_MARKER_NAME
+            with open(marker_path, "w") as f:
+                f.write(chain_id)
 
-            # Upload the merged incremental to off-server storage if configured
-            run_copy_command(merged_path, log_fn=print)
+            manifest_path = Path(__file__).parent / "backup_manifest.json"
+            print("Rebuilding backup manifest...")
+            files = build_file_manifest(target_dir, backup_dir)
+            with open(manifest_path, "w") as f:
+                json.dump({"chain_id": chain_id, "base_full": full_zip.name,
+                            "files": files}, f)
+            print(f"  Manifest rebuilt with {len(files)} files "
+                  f"(new chain: {chain_id})")
+            print(f"  Chain marker written to {marker_path}")
+        else:
+            print(f"\n  NOTE: Restored to {target_dir}, which is not the bot's")
+            print(f"        MINECRAFT_DIR ({mc_dir_env or 'unset'}).")
+            print(f"        No new chain was established and the bot's")
+            print(f"        backup_manifest.json was not modified — the bot")
+            print(f"        continues tracking MINECRAFT_DIR's existing chain.")
+            print(f"        If you later replace MINECRAFT_DIR with this")
+            print(f"        target_dir, the missing .mcnotifier_chain will")
+            print(f"        force a fresh full backup, starting a new chain.")
 
-        finally:
-            # Clean up the temporary directory
+    finally:
+        if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        # Restoring to a full backup only — no incrementals to merge.
-        # Just generate a new chain ID.
-        chain_id = new_chain_id(backup_dir)
-
-    # Step 3: Rebuild backup_manifest.json and write chain marker
-    #
-    # The manifest records the mtime of every file in the restored state.
-    # The bot uses this as the baseline for detecting changes in the next
-    # incremental backup.
-    #
-    # The chain marker (.mcnotifier_chain) tells the bot which chain is
-    # active. On startup, the bot compares this against the manifest to
-    # verify the server state hasn't been replaced behind its back.
-    manifest_path = Path(__file__).parent / "backup_manifest.json"
-    print("Rebuilding backup manifest...")
-    files = build_file_manifest(target_dir, backup_dir)
-    with open(manifest_path, "w") as f:
-        json.dump({"chain_id": chain_id, "base_full": full_zip.name,
-                    "files": files}, f)
-    marker_path = target_dir / CHAIN_MARKER_NAME
-    with open(marker_path, "w") as f:
-        f.write(chain_id)
-    print(f"  Manifest rebuilt with {len(files)} files (new chain: {chain_id})")
-    print(f"  Chain marker written.")
 
     print(f"\nRestore complete. Server files are in: {target_dir}")
 

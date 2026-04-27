@@ -2,6 +2,8 @@
 
 A Telegram bot that monitors a Minecraft server and sends notifications when players join or leave. Tracks achievements, deaths, player stats, and performs automated backups via RCON. Full backups run on a configurable daily, weekly, or monthly schedule, while incremental backups capture changes every few minutes (configurable) as players explore the world. Restoration to any backup point is done through an interactive CLI tool and requires the server to be offline.
 
+> **Platform support:** mcnotifier is designed for and tested only on **Linux Minecraft Java servers**. Running against a Windows-hosted Minecraft server is not supported — Windows file locking causes backup zips to fail with `PermissionError` on files the server holds open (e.g. `session.lock`), and Java's buffered writes to `latest.log` make RCON confirmation waiters unreliable on Windows. The bot itself can run on any platform where Python and `watchdog` work, but the Minecraft server it monitors should be on Linux.
+
 ## Files
 
 | File | Description |
@@ -189,11 +191,24 @@ python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
 3. Displays restore points organised by chain, each linked to its base full backup.
 4. After selecting a point, warns that the Minecraft server **must be stopped** before restoring.
 5. Extracts the full backup, then applies each incremental in the chain up to the selected point.
-6. Rebuilds `backup_manifest.json` and `.mcnotifier_chain` with a new chain ID. When restoring to an incremental point, creates a **merged incremental** zip that combines all applied incrementals into a single file — so the new chain only needs the original full backup + one merged incremental for future restores.
+6. **In-place restore** (`--target-dir` is `MINECRAFT_DIR`, the default): rebuilds `backup_manifest.json` and writes `.mcnotifier_chain` with a new chain ID. When restoring to an incremental point, creates a **merged incremental** zip that combines all applied incrementals into a single file — so the new chain only needs the original full backup + one merged incremental for future restores.
+7. **Out-of-place restore** (`--target-dir` points elsewhere): only extracts files. No new chain is established, no merged incremental is created, no marker file is written, and the bot's `backup_manifest.json` is left untouched. The bot continues tracking `MINECRAFT_DIR` with its existing chain. If you later promote the target directory by replacing `MINECRAFT_DIR`'s contents with it, the absent `.mcnotifier_chain` will force the bot to take a fresh full backup on next `/backup`, cleanly starting a new chain.
 
-**Important:** Always stop the Minecraft server before restoring. Restoring while the server is running will cause data corruption.
+**Important:** Always stop the Minecraft server before restoring in-place. Restoring while the server is running will cause data corruption.
 
 **If you restore by other means** (manual copy, other tools): delete `backup_manifest.json` and `.mcnotifier_chain` from the server directory to force the bot to start a fresh chain with the next full backup.
+
+### Restoring a single player's data
+
+The admin can roll back one player's `<uuid>.dat` without restoring the whole world via the `/restore_player` Telegram command. The command runs in three enforced steps so a single mistyped message can never trigger a destructive restore:
+
+1. `/restore_player <username>` — bot replies with a numbered, latest-first list of every available `.dat` version it can find for that player. Sources include the live `world/playerdata/` folder (`<uuid>.dat`, `<uuid>.dat_old`, `<uuid>.dat_old.gz`) and every backup zip in the active chain that contains the player's `.dat`.
+2. `/restore_player <username> <N>` — bot replies with a confirmation block showing the player name, UUID, timestamp, and source for selection `N`, plus the exact `confirm` command to send.
+3. `/restore_player <username> <N> confirm` — bot performs the restore: verifies the player is offline (via RCON `/list`), runs `save-off` / `save-all`, waits for the filesystem to settle, then atomically replaces `<uuid>.dat` with the chosen version. The previous `.dat` is preserved alongside as `<uuid>.dat.pre-restore-<timestamp>` so the admin can manually undo. `save-on` is always re-enabled, even if the restore step fails.
+
+Steps must be executed in order (and within 5 minutes of each other); jumping straight to step 3 is rejected. The selection state is per-admin and lives only in memory — restarting the bot clears it.
+
+The player must be offline before the restore proceeds; the command refuses with a message asking the admin to log them out first.
 
 ## Commands
 
@@ -213,6 +228,7 @@ python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
 | `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
 | `/backup` | *(Admin)* Trigger a server backup now |
+| `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore a single player's `.dat` file from any backup or live working copy |
 
 ## Runtime state
 
