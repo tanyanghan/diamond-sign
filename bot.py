@@ -767,8 +767,20 @@ def _get_level_name() -> str:
 
 
 def _stats_dir() -> Path:
-    """Return the per-player stats directory under the active world."""
-    return Path(MINECRAFT_DIR) / _get_level_name() / "stats"
+    """Return the per-player stats directory under the active world.
+
+    Minecraft 26.1+ moved player stats from <world>/stats to
+    <world>/players/stats. Prefer the new layout but fall back to the old
+    one if it's still present (older servers, mid-migration).
+    """
+    world = Path(MINECRAFT_DIR) / _get_level_name()
+    new_path = world / "players" / "stats"
+    old_path = world / "stats"
+    if new_path.is_dir():
+        return new_path
+    if old_path.is_dir():
+        return old_path
+    return new_path  # default to new layout when neither exists yet
 
 
 def _validate_server_properties() -> list:
@@ -1048,11 +1060,29 @@ def _read_chain_marker() -> str:
 # Player-data restore helpers (used by /restore_player)
 # ---------------------------------------------------------------------------
 
-# Player-data lives at <MINECRAFT_DIR>/<level-name>/playerdata/<uuid>.dat.
-# The world subdirectory name comes from `level-name` in server.properties
-# (default "world"); read it via _get_level_name() — never hardcode.
+# Player-data lives under the active world directory (named by `level-name`
+# in server.properties — read via _get_level_name(), never hardcoded).
+# Minecraft 26.1+ moved player data:
+#   - Old layout (<= 1.21): <world>/playerdata/<uuid>.dat
+#   - New layout (>= 26.1): <world>/players/data/<uuid>.dat
+# We always read live files from whichever directory exists (preferring the
+# new layout) and write restore output to the same one. Backup zips may use
+# either layout depending on when they were created, so the version scanner
+# checks both internal entry paths in each zip.
 # Forward slashes here match the zip layout produced by run_backup /
 # run_incremental_backup.
+
+
+def _live_playerdata_dir() -> Path:
+    """Return the live world's playerdata directory (new layout preferred)."""
+    world = Path(MINECRAFT_DIR) / _get_level_name()
+    new_path = world / "players" / "data"
+    old_path = world / "playerdata"
+    if new_path.is_dir():
+        return new_path
+    if old_path.is_dir():
+        return old_path
+    return new_path  # default to new layout when neither exists yet
 
 
 def _resolve_player(name: str, names: dict) -> tuple | None:
@@ -1073,10 +1103,14 @@ def _scan_player_data_versions(uuid: str) -> list:
     """Find all available historical copies of a player's .dat file.
 
     Sources, latest first:
-      1. Live <MINECRAFT_DIR>/<level-name>/playerdata/<uuid>.dat[_old[.gz]]
+      1. Live <world>/players/data/<uuid>.dat[_old[.gz]]  (or pre-26.1 path)
       2. The current chain's full backup (base_full) if it contains the entry
       3. Every incremental zip in BACKUP_DIR matching the current chain_id
          that contains the entry
+
+    Backup zips may have been created with either the old (1.21 and earlier)
+    or the new (26.1+) on-disk layout. We probe both possible internal entry
+    paths in each zip and record whichever exists.
 
     Each returned dict carries enough context for _run_player_restore to read
     the bytes back later: ("kind", "path", "entry") plus a display label and
@@ -1084,9 +1118,11 @@ def _scan_player_data_versions(uuid: str) -> list:
     """
     versions = []
     level_name = _get_level_name()
-    playerdata_rel = f"{level_name}/playerdata"
-    entry = f"{playerdata_rel}/{uuid}.dat"
-    playerdata_dir = Path(MINECRAFT_DIR) / level_name / "playerdata"
+    candidate_entries = (
+        f"{level_name}/players/data/{uuid}.dat",   # new (26.1+)
+        f"{level_name}/playerdata/{uuid}.dat",     # old (<= 1.21)
+    )
+    playerdata_dir = _live_playerdata_dir()
 
     # 1. Live files (.dat, .dat_old, .dat_old.gz). Each gets its own entry
     # because the three are independently dated working copies, not snapshots.
@@ -1146,8 +1182,11 @@ def _scan_player_data_versions(uuid: str) -> list:
                 continue
             try:
                 with zipfile.ZipFile(f, "r") as zf:
-                    if entry not in zf.namelist():
-                        continue
+                    names = zf.namelist()
+                found_entry = next(
+                    (e for e in candidate_entries if e in names), None)
+                if found_entry is None:
+                    continue
             except (zipfile.BadZipFile, OSError):
                 logger.warning("Skipping unreadable backup zip: %s", f.name)
                 continue
@@ -1161,7 +1200,7 @@ def _scan_player_data_versions(uuid: str) -> list:
                 "source": label,
                 "kind": "zip",
                 "path": f,
-                "entry": entry,
+                "entry": found_entry,
             })
 
     versions.sort(key=lambda v: v["sort_key"], reverse=True)
@@ -1324,9 +1363,10 @@ def _run_player_restore(username: str, uuid: str, version: dict,
 
         # Read source bytes, then atomically replace <uuid>.dat. Keep the
         # current .dat as <uuid>.dat.pre-restore-<ts> as a safety net so
-        # the admin can manually undo a wrong choice.
-        target = (Path(MINECRAFT_DIR) / _get_level_name()
-                  / "playerdata" / f"{uuid}.dat")
+        # the admin can manually undo a wrong choice.  The target follows
+        # the live layout (new in 26.1+, falls back to old) regardless of
+        # which layout the source bytes came from.
+        target = _live_playerdata_dir() / f"{uuid}.dat"
         source_bytes = _read_player_data_bytes(version)
 
         if target.exists():
