@@ -1161,23 +1161,25 @@ def _scan_player_data_versions(uuid: str) -> list:
                 "entry": None,
             })
 
-    # 2 + 3. Backup chain. Skip if no chain established (e.g. fresh install).
+    # 2 + 3. All backup zips in BACKUP_DIR — current chain and previous chains.
     chain_id, base_full, _ = _load_manifest()
-    if chain_id and BACKUP_DIR.exists():
+    if BACKUP_DIR.exists():
         for f in BACKUP_DIR.iterdir():
             if not f.is_file() or f.suffix != ".zip":
                 continue
             ts_str = None
             label = None
             m_incr = RE_INCR.match(f.name)
-            if m_incr and m_incr.group(2) == chain_id:
+            if m_incr:
                 ts_str = m_incr.group(3)
-                label = "incremental backup"
-            elif f.name == base_full:
+                is_current = chain_id and m_incr.group(2) == chain_id
+                label = "incremental backup" if is_current else "incremental backup (old chain)"
+            else:
                 m_full = RE_FULL.match(f.name)
                 if m_full:
                     ts_str = m_full.group(2)
-                    label = "full backup"
+                    is_current = chain_id and f.name == base_full
+                    label = "full backup" if is_current else "full backup (old chain)"
             if ts_str is None:
                 continue
             try:
