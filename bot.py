@@ -729,7 +729,7 @@ _watcher_ref: LogWatcher | None = None
 _pending_player_restore: dict = {}
 _pending_player_lock = threading.Lock()
 _PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missing
-_RESTORE_PLAYER_MAX_VERSIONS = 10  # cap on number of historic .dat versions shown
+_RESTORE_PLAYER_PAGE_SIZE = 10  # versions shown per page in /restore_player listing
 
 
 def _read_server_properties() -> dict:
@@ -1206,21 +1206,24 @@ def _scan_player_data_versions(uuid: str) -> list:
             })
 
     versions.sort(key=lambda v: v["sort_key"], reverse=True)
-    # Cap to the 10 most recent — older restore points are rarely useful and
-    # a long list crowds the Telegram message.
-    return versions[:_RESTORE_PLAYER_MAX_VERSIONS]
+    return versions
 
 
-def _format_versions_reply(username: str, uuid: str, versions: list) -> str:
-    """Render the numbered list reply for /restore_player <username>."""
+def _format_versions_reply(username: str, uuid: str, versions: list,
+                           offset: int = 0) -> str:
+    """Render one page of the numbered list reply for /restore_player <username>."""
     if not versions:
         return (f"No player data found for {username} ({uuid}).\n"
                 f"Live file missing and no backups in the active chain.")
+    page = versions[offset:offset + _RESTORE_PLAYER_PAGE_SIZE]
     lines = [f"Player data versions for {username}  (UUID: {uuid})",
              "Latest first. To select, send: /restore_player "
              f"{username} <number>", ""]
-    for i, v in enumerate(versions, 1):
+    for i, v in enumerate(page, offset + 1):
         lines.append(f"  {i:3d}.  {v['timestamp']}   {v['source']}")
+    remaining = len(versions) - (offset + _RESTORE_PLAYER_PAGE_SIZE)
+    if remaining > 0:
+        lines.append(f"\n{remaining} more. Send: /restore_player {username} more")
     return "\n".join(lines)
 
 
@@ -2051,6 +2054,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             bot.reply_to(message,
                          "Usage:\n"
                          "  /restore_player <username>\n"
+                         "  /restore_player <username> more\n"
                          "  /restore_player <username> <N>\n"
                          "  /restore_player <username> <N> confirm")
             return
@@ -2079,17 +2083,37 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 return
             _set_pending_player_restore(
                 user_id, stage="listed", username=canonical, uuid=uuid,
-                versions=versions, selected_n=None)
+                versions=versions, selected_n=None, page_offset=0)
             logger.info("RestorePlayer: %s listed %d version(s) for %s",
                         _tg_user(message), len(versions), canonical)
-            bot.reply_to(message, _format_versions_reply(canonical, uuid, versions))
+            bot.reply_to(message, _format_versions_reply(canonical, uuid, versions, offset=0))
+            return
+
+        # --- "more": show next page of the listing ---
+        if typed_n.lower() == "more":
+            entry = _get_pending_player_restore(user_id, expected_username=canonical)
+            if entry is None:
+                bot.reply_to(message,
+                             f"Run /restore_player {canonical} first to see the list.")
+                return
+            new_offset = entry.get("page_offset", 0) + _RESTORE_PLAYER_PAGE_SIZE
+            versions = entry["versions"]
+            if new_offset >= len(versions):
+                bot.reply_to(message, f"No more versions for {canonical}.")
+                return
+            _set_pending_player_restore(user_id, page_offset=new_offset)
+            logger.info("RestorePlayer: %s paged to offset %d for %s",
+                        _tg_user(message), new_offset, canonical)
+            bot.reply_to(message,
+                         _format_versions_reply(canonical, uuid, versions, offset=new_offset))
             return
 
         # Steps 2 and 3 require numeric N
         try:
             n = int(typed_n)
         except ValueError:
-            bot.reply_to(message, f"Invalid timestamp number: {typed_n}")
+            bot.reply_to(message, f"Invalid selection: '{typed_n}'. "
+                                  "Use a number or 'more'.")
             return
 
         # --- Step 3: confirm + execute ---
