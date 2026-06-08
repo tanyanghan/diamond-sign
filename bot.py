@@ -1144,17 +1144,19 @@ def _scan_player_data_versions(uuid: str) -> list:
             })
 
     # 1b. Pre-restore safety copies left by previous /restore_player runs.
-    # File mtime is the original .dat's save time (preserved by shutil.copy2),
-    # so it sorts naturally alongside the other live entries.
+    # The timestamp in the filename is the authoritative save time — the
+    # filesystem mtime reflects when the copy was made, not the save itself.
     if playerdata_dir.exists():
         for p in playerdata_dir.glob(f"{uuid}.dat.pre-restore-*"):
+            suffix = p.name[len(f"{uuid}.dat.pre-restore-"):]
             try:
-                mtime = p.stat().st_mtime
-            except OSError:
+                ts_dt = datetime.strptime(suffix, "%Y%m%d_%H%M%S")
+            except ValueError:
                 continue
+            sort_key = ts_dt.timestamp()
             versions.append({
-                "timestamp": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                "sort_key": mtime,
+                "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "sort_key": sort_key,
                 "source": "pre-restore backup",
                 "kind": "live",
                 "path": p,
