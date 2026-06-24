@@ -29,9 +29,15 @@ logger = logging.getLogger("mcnotifier")
 
 # `list` response: "There are 2/10 players online:" followed by a names line.
 _RE_LIST_HEADER = re.compile(r'There are (\d+)/\d+ players online:?')
-# `save query` readiness marker, then a line of "path:bytes, path:bytes, ...".
+# `save query` readiness marker. The "path:bytes, ..." list follows on the
+# next (unprefixed) line(s).
 _SAVE_READY = "Files are now ready to be copied"
-_RE_FILE_TOKEN = re.compile(r'([^,:]+):(\d+)')
+# BDS log line prefix, e.g. "[2026-06-24 02:03:56:398 INFO] ".
+_RE_LOG_PREFIX = re.compile(r'^\[[^\]]*\]\s*')
+
+
+def _strip_prefix(line: str) -> str:
+    return _RE_LOG_PREFIX.sub("", line.strip())
 
 
 class BedrockBackend(ServerBackend):
@@ -104,7 +110,7 @@ class BedrockBackend(ServerBackend):
         def log(msg):
             if log_fn:
                 log_fn(msg)
-        waiter = self._watcher.expect_line("Changes to the level are resumed")
+        waiter = self._watcher.expect_line("are resumed")
         self.send_command("save resume")
         if waiter.wait(timeout=30):
             log("Save resumed")
@@ -139,10 +145,16 @@ class BedrockBackend(ServerBackend):
 
     def _scan_query_output(self):
         """Find the most recent `save query` result. Returns [(Path, bytes)] when
-        the snapshot is ready, else None."""
+        the snapshot is ready, else None.
+
+        Console layout (the list is on its own unprefixed line after the marker):
+            [.. INFO] Data saved. Files are now ready to be copied.
+            Bedrock level/db/003678.ldb:2117709, Bedrock level/level.dat:3042, ...
+        Paths can contain spaces and slashes, so each comma-separated token is
+        split on its LAST colon (path : byte-length). Paths are relative to the
+        world's parent (the `worlds/` directory).
+        """
         lines = self._tail()
-        # Find the last readiness marker, then collect file tokens from the lines
-        # after it (the list may share the marker's line or follow it).
         idx = None
         for i in range(len(lines) - 1, -1, -1):
             if _SAVE_READY in lines[i]:
@@ -150,27 +162,31 @@ class BedrockBackend(ServerBackend):
                 break
         if idx is None:
             return None
-        tokens = []
-        for line in lines[idx:]:
-            found = _RE_FILE_TOKEN.findall(line)
-            if found:
-                tokens.extend(found)
-            elif tokens:
-                break  # list ended
-        if not tokens:
-            return None
+        # The listing is the unprefixed line(s) after the marker; a new log
+        # message (starts with "[") or a blank line ends it.
         result = []
-        for rel, length in tokens:
-            path = self._resolve_listed_path(rel.strip())
-            if path is not None:
-                result.append((path, int(length)))
+        for line in lines[idx + 1:]:
+            s = line.strip()
+            if not s or s.startswith("["):
+                break
+            for token in s.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                rel, sep, length = token.rpartition(":")
+                if not sep or not length.strip().isdigit():
+                    continue
+                path = self._resolve_listed_path(rel.strip())
+                if path is not None:
+                    result.append((path, int(length.strip())))
         return result or None
 
     def _resolve_listed_path(self, rel: str):
-        """Resolve a `save query` path (relative to the world or server root) to
-        an absolute path under minecraft_dir."""
+        """Resolve a `save query` path (e.g. "Bedrock level/db/003678.ldb",
+        relative to the worlds/ directory) to an absolute path under
+        minecraft_dir."""
         mc = self.config.minecraft_dir
-        for base in (mc, mc / "worlds"):
+        for base in (mc / "worlds", mc):
             p = base / rel
             if p.exists():
                 return p
@@ -181,13 +197,14 @@ class BedrockBackend(ServerBackend):
         """Parse the most recent `list` response from console.log."""
         lines = self._tail()
         for i in range(len(lines) - 1, -1, -1):
-            m = _RE_LIST_HEADER.search(lines[i])
+            stripped = _strip_prefix(lines[i])
+            m = _RE_LIST_HEADER.search(stripped)
             if m:
                 if int(m.group(1)) == 0:
                     return []
-                # Names are on the same line after ':' or on the next line.
-                after = lines[i].split(":", 1)[1].strip() if ":" in lines[i] else ""
+                # Names follow the ':' on this line, or on the next line.
+                after = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
                 if not after and i + 1 < len(lines):
-                    after = lines[i + 1].strip()
+                    after = _strip_prefix(lines[i + 1])
                 return [n.strip() for n in after.split(", ") if n.strip()]
         return []

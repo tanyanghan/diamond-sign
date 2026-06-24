@@ -794,6 +794,27 @@ def _stats_dir() -> Path:
     return new_path  # default to new layout when neither exists yet
 
 
+def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> None:
+    """Add ``fp`` to the zip under ``rel``, honouring an optional snapshot map.
+
+    ``ready_map`` is None for Java (copy the file whole). For Bedrock it maps a
+    relative path to the byte length reported by ``save query``:
+      - listed file  -> copied truncated to that length (the consistent snapshot;
+        Bedrock keeps appending past it),
+      - unlisted file under a world ``db/`` directory -> skipped (a stale LevelDB
+        fragment not part of the snapshot),
+      - anything else (server.properties, packs, level.dat, ...) -> copied whole.
+    """
+    if ready_map is not None:
+        if rel in ready_map:
+            with open(fp, "rb") as src:
+                zf.writestr(rel, src.read(ready_map[rel]))
+            return
+        if "/db/" in rel:
+            return
+    zf.write(fp, rel)
+
+
 def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     """Run a full server backup.
 
@@ -832,37 +853,36 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     backup_dir_resolved = BACKUP_DIR.resolve()
 
     try:
-        # Step 2: Get the consistent file set to copy.
+        # Step 2: Get the consistent file set to copy. Java returns None (copy
+        # the whole settled directory); Bedrock returns snapshot byte-lengths so
+        # the walk truncates listed files and skips stale, unlisted db/ files.
         ready = BACKEND.files_ready(status)
+        ready_map = None
         if ready is None:
             # Java: the server may still be flushing to disk after save-all,
             # so wait for the filesystem to settle before zipping.
             wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status)
+        else:
+            ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
+                         for p, n in ready}
 
         status(f"Zipping {mc_dir} ...")
         with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            if ready is None:
-                for dirpath, _dirnames, filenames in os.walk(mc_dir):
-                    dp = Path(dirpath)
-                    # Skip the backup directory if it's inside the server directory
-                    try:
-                        dp.resolve().relative_to(backup_dir_resolved)
+            for dirpath, _dirnames, filenames in os.walk(mc_dir):
+                dp = Path(dirpath)
+                # Skip the backup directory if it's inside the server directory
+                try:
+                    dp.resolve().relative_to(backup_dir_resolved)
+                    continue
+                except ValueError:
+                    pass
+                for fn in filenames:
+                    # Chain marker is backup metadata, not server data
+                    if fn == CHAIN_MARKER_NAME:
                         continue
-                    except ValueError:
-                        pass
-                    for fn in filenames:
-                        # Chain marker is backup metadata, not server data
-                        if fn == CHAIN_MARKER_NAME:
-                            continue
-                        fp = dp / fn
-                        rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
-                        zf.write(fp, rel)
-            else:
-                # Bedrock: copy each file truncated to its snapshot length.
-                for fp, max_bytes in ready:
+                    fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
-                    with open(fp, "rb") as src:
-                        zf.writestr(rel, src.read(max_bytes))
+                    _add_world_file_to_zip(zf, fp, rel, ready_map)
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
@@ -1374,17 +1394,13 @@ def run_incremental_backup() -> str | None:
             zip_path = BACKUP_DIR / f"{zip_name}.zip"
 
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Add changed/added files. On Bedrock, truncate any file with a
-                # known snapshot length to that length for a consistent copy.
+                # Add changed/added files. On Bedrock, listed files are truncated
+                # to their snapshot length and stale unlisted db/ files skipped.
                 for rel_path in changed:
                     full_path = mc_dir / rel_path
                     if not full_path.exists():
                         continue
-                    if ready_map is not None and rel_path in ready_map:
-                        with open(full_path, "rb") as src:
-                            zf.writestr(rel_path, src.read(ready_map[rel_path]))
-                    else:
-                        zf.write(full_path, rel_path)
+                    _add_world_file_to_zip(zf, full_path, rel_path, ready_map)
                 # Record deleted files so restore can remove them too
                 if deleted:
                     zf.writestr("_deletions.json", json.dumps(deleted, indent=2))
