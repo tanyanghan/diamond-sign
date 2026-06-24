@@ -388,8 +388,8 @@ def _parse_line_java(line: str, names: dict) -> tuple:
 # Bedrock Dedicated Server console lines (terser than Java's log). Names may
 # contain spaces, so capture up to the ", xuid:" delimiter. BDS emits no death
 # or achievement lines, so only join/leave are parsed.
-RE_BEDROCK_CONNECT = re.compile(r'Player connected:\s*(.+?),\s*xuid:\s*(\S+)')
-RE_BEDROCK_DISCONNECT = re.compile(r'Player disconnected:\s*(.+?),\s*xuid:\s*(\S+)')
+RE_BEDROCK_CONNECT = re.compile(r'Player connected:\s*(.+?),\s*xuid:\s*(\d+)')
+RE_BEDROCK_DISCONNECT = re.compile(r'Player disconnected:\s*(.+?),\s*xuid:\s*(\d+)')
 
 
 def _parse_line_bedrock(line: str, names: dict) -> tuple:
