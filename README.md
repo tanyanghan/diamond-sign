@@ -1,14 +1,18 @@
 # mcnotifier
 
-A Telegram bot that monitors a Minecraft server and sends notifications when players join or leave. Tracks achievements, deaths, player stats, and performs automated backups via RCON. Full backups run on a configurable daily, weekly, or monthly schedule, while incremental backups capture changes every few minutes (configurable) as players explore the world. Restoration to any backup point is done through an interactive CLI tool and requires the server to be offline.
+A Telegram bot that monitors a Minecraft server and sends notifications when players join or leave. Tracks achievements, deaths, player stats, and performs automated backups. Full backups run on a configurable daily, weekly, or monthly schedule, while incremental backups capture changes every few minutes (configurable) as players explore the world. Restoration to any backup point is done through an interactive CLI tool and requires the server to be offline.
 
-> **Platform support:** mcnotifier is designed for and tested only on **Linux Minecraft Java servers**. Running against a Windows-hosted Minecraft server is not supported — Windows file locking causes backup zips to fail with `PermissionError` on files the server holds open (e.g. `session.lock`), and Java's buffered writes to `latest.log` make RCON confirmation waiters unreliable on Windows. The bot itself can run on any platform where Python and `watchdog` work, but the Minecraft server it monitors should be on Linux.
+Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITION`). Java uses RCON; Bedrock — which has no RCON — injects commands through the tmux/screen session hosting the server. See [Bedrock servers](#bedrock-servers) for the differences and feature limitations.
+
+> **Platform support:** mcnotifier is designed for and tested only on **Linux Minecraft servers**. Running against a Windows-hosted Minecraft server is not supported — Windows file locking causes backup zips to fail with `PermissionError` on files the server holds open (e.g. `session.lock`), and buffered log writes make confirmation waiters unreliable on Windows. The bot itself can run on any platform where Python and `watchdog` work, but the Minecraft server it monitors should be on Linux.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `bot.py` | Main bot — log watcher, Telegram handlers, stats |
+| `bot.py` | Main bot — log watcher, Telegram handlers, stats, orchestration |
+| `config.py` | Central config (`ServerConfig`) and world-layout helpers |
+| `backends/` | Edition backends: `base` (interface), `java` (RCON), `bedrock` (tmux/screen), `mux` (multiplexer detection) |
 | `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
 | `restore.py` | Interactive CLI tool for restoring from backup chains |
 | `requirements.txt` | Python dependencies |
@@ -31,7 +35,9 @@ A Telegram bot that monitors a Minecraft server and sends notifications when pla
    Edit `.env` and fill in:
    - `BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
    - `MINECRAFT_DIR` — absolute path to the Minecraft server directory (e.g. `/home/user/Minecraft`)
-   - `RCON_PASSWORD` — RCON password (must match `server.properties` `rcon.password`)
+   - `SERVER_EDITION` — `java` (default) or `bedrock`
+   - `RCON_PASSWORD` — **Java only:** RCON password (must match `server.properties` `rcon.password`)
+   - `MUX_SESSION` / `CONSOLE_LOG` — **Bedrock only:** see [Bedrock servers](#bedrock-servers)
    - `BACKUP_HOUR` — hour of day (0–23) for daily auto-backup (default: `4`)
    - `BACKUP_DIR` — directory for backup zip files (default: `~/minecraft_backup`)
    - `BACKUP_COPY_CMD` — optional shell command to copy the backup off-server; `{file}` is replaced with the zip path (e.g. `scp {file} user@nas:/backups/` or `cp {file} /mnt/backup/`)
@@ -93,6 +99,23 @@ sudo apt remove iptables-persistent
 ```
 
 You can verify the current rules with `sudo iptables -L INPUT -n --line-numbers`.
+
+## Bedrock servers
+
+Bedrock Dedicated Server (BDS) has **no RCON**, and its console is much terser than Java's. Set `SERVER_EDITION=bedrock` and run the server inside a terminal multiplexer so the bot can drive it.
+
+**Command injection (tmux / screen / byobu).** The bot types commands on the server's stdin via the tmux or screen session hosting it (byobu wraps either). It auto-detects the session, or you can pin it with `MUX_SESSION`. If no tmux/screen session is found, the bot logs a clear message and exits — Bedrock cannot run without one.
+
+**Capturing output.** BDS writes to stdout, not `logs/latest.log`. Launch the server so its output is captured to a file the bot tails (default `MINECRAFT_DIR/console.log`, override with `CONSOLE_LOG`). For example, inside your byobu/tmux/screen window:
+```bash
+./bedrock_server 2>&1 | tee -a console.log
+```
+
+**Backups.** Instead of Java's `save-off` / `save-all` / `save-on`, the bot uses `save hold` → poll `save query` → `save resume`. `save query` reports each file with the exact number of bytes that belong to the snapshot, and the bot copies each file truncated to that length (BDS keeps appending past the snapshot point). Full and incremental backups and the [restore tool](#restoring-from-backups) work the same as Java otherwise.
+
+**Feature limitations (current).** BDS does not emit death or achievement events, and player data lives in the world LevelDB rather than per-player `.dat` files. So on Bedrock:
+- Join/leave notifications, full + incremental backups, and whole-world restore work.
+- `/deaths`, `/death_summary`, `/achievements`, the `/scan_*` commands, and `/restore_player` reply that they are not available on this edition.
 
 ## Backups
 

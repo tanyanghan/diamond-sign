@@ -10,8 +10,6 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
-from mcrcon import MCRcon
 import telebot
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -20,27 +18,30 @@ from backup_utils import (
     CHAIN_MARKER_NAME, RE_FULL, RE_INCR, build_file_manifest, new_chain_id,
     run_copy_command, wait_for_settle,
 )
+from config import load_config, get_level_name, EDITION_BEDROCK
+from backends import (
+    make_backend, BackendUnavailable, CAP_PLAYER_RESTORE,
+    EVENT_DEATH, EVENT_ACHIEVEMENT,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Config
 # ---------------------------------------------------------------------------
-load_dotenv(Path(__file__).parent / ".env")
+# All environment reading lives in config.load_config(); the rest of the module
+# reads from CONFIG (and a few thin aliases kept to minimise churn). The world
+# subdirectory name is configurable via `level-name` in server.properties — use
+# _stats_dir() / _get_level_name() at call time instead of a constant.
+CONFIG = load_config()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MINECRAFT_DIR = os.environ.get("MINECRAFT_DIR")
+BOT_TOKEN = CONFIG.bot_token
+MINECRAFT_DIR = CONFIG.minecraft_dir          # Path
+LOG_PATH = CONFIG.log_path                     # Java: logs/latest.log; Bedrock: console.log
+BACKUP_DIR = CONFIG.backup_dir
+INCREMENTAL_BACKUP_ENABLED = CONFIG.incremental_enabled
+INCREMENTAL_INTERVAL_MINUTES = CONFIG.incremental_interval_minutes
 
-missing = [k for k, v in {"BOT_TOKEN": BOT_TOKEN, "MINECRAFT_DIR": MINECRAFT_DIR}.items() if not v]
-if missing:
-    raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
-
-LOG_PATH = Path(MINECRAFT_DIR) / "logs" / "latest.log"
-# The world subdirectory name is configurable via `level-name` in
-# server.properties — use _stats_dir() at call time instead of a constant.
-
-RCON_PASSWORD = os.environ.get("RCON_PASSWORD", "")
-BACKUP_DIR = Path(os.path.expanduser(os.environ.get("BACKUP_DIR", "~/minecraft_backup")))
-INCREMENTAL_BACKUP_ENABLED = os.environ.get("INCREMENTAL_BACKUP_ENABLED", "").lower() in ("1", "true", "yes")
-INCREMENTAL_INTERVAL_MINUTES = int(os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15"))
+# Server backend (Java RCON / Bedrock mux). Constructed in main().
+BACKEND = None
 
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
@@ -331,7 +332,7 @@ def _categorize_death(message: str) -> str:
 _pending_uuids: dict = {}  # name -> uuid, populated by UUID line, consumed by join line
 
 
-def parse_line(line: str, names: dict) -> tuple:
+def _parse_line_java(line: str, names: dict) -> tuple:
     """Return (event_type, payload) or (None, None).
 
     For join/leave, payload is the player name string.
@@ -384,6 +385,42 @@ def parse_line(line: str, names: dict) -> tuple:
     return None, None
 
 
+# Bedrock Dedicated Server console lines (terser than Java's log). Names may
+# contain spaces, so capture up to the ", xuid:" delimiter. BDS emits no death
+# or achievement lines, so only join/leave are parsed.
+RE_BEDROCK_CONNECT = re.compile(r'Player connected:\s*(.+?),\s*xuid:\s*(\S+)')
+RE_BEDROCK_DISCONNECT = re.compile(r'Player disconnected:\s*(.+?),\s*xuid:\s*(\S+)')
+
+
+def _parse_line_bedrock(line: str, names: dict) -> tuple:
+    """Return (event_type, payload) or (None, None) for a Bedrock console line.
+
+    Only join/leave are available on Bedrock (see RE_BEDROCK_*). The player's
+    xuid is used as the registry key (Bedrock has no per-player UUID file).
+    """
+    line = line.strip()
+    m = RE_BEDROCK_CONNECT.search(line)
+    if m:
+        name, xuid = m.group(1).strip(), m.group(2).strip()
+        if xuid:
+            register_player(xuid, name, names, _NAMES_PATH)
+        player_join(name)
+        return "join", name
+    m = RE_BEDROCK_DISCONNECT.search(line)
+    if m:
+        name = m.group(1).strip()
+        player_leave(name)
+        return "leave", name
+    return None, None
+
+
+def parse_line(line: str, names: dict) -> tuple:
+    """Dispatch line parsing to the edition-specific parser."""
+    if CONFIG.edition == EDITION_BEDROCK:
+        return _parse_line_bedrock(line, names)
+    return _parse_line_java(line, names)
+
+
 # ---------------------------------------------------------------------------
 # 5. LogWatcher
 # ---------------------------------------------------------------------------
@@ -426,6 +463,7 @@ class LogWatcher(FileSystemEventHandler):
     """
     def __init__(self, log_path: Path, names: dict, notify_cb):
         self._path = log_path
+        self._filename = log_path.name  # "latest.log" (Java) or "console.log" (Bedrock)
         self._names = names
         self._notify = notify_cb
         self._pos = 0
@@ -482,7 +520,7 @@ class LogWatcher(FileSystemEventHandler):
                 self._waiters.remove(waiter)
 
     def on_modified(self, event):
-        if not str(event.src_path).endswith("latest.log"):
+        if not str(event.src_path).endswith(self._filename):
             return
         with self._lock:
             self._check_rotation()
@@ -732,38 +770,11 @@ _PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missi
 _RESTORE_PLAYER_MAX_VERSIONS = 10  # cap on number of historic .dat versions shown
 
 
-def _read_server_properties() -> dict:
-    """Parse <MINECRAFT_DIR>/server.properties into a dict.
-
-    Java .properties files escape special characters with backslashes
-    (e.g., \\! \\: \\= \\\\). Values are unescaped so they compare cleanly
-    against equivalents from .env.
-
-    Returns an empty dict if the file is missing or unreadable.
-    """
-    props_path = Path(MINECRAFT_DIR) / "server.properties"
-    props: dict = {}
-    try:
-        with open(props_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    value = value.strip().replace("\\!", "!").replace("\\:", ":") \
-                                 .replace("\\=", "=").replace("\\\\", "\\")
-                    props[key.strip()] = value
-    except FileNotFoundError:
-        pass
-    except Exception:
-        logger.exception("Failed to read server.properties")
-    return props
-
-
 def _get_level_name() -> str:
     """Return the world directory name from server.properties' `level-name`.
     Falls back to 'world' (the vanilla default) if the file is missing or
     the key isn't set."""
-    return _read_server_properties().get("level-name", "world")
+    return get_level_name(MINECRAFT_DIR)
 
 
 def _stats_dir() -> Path:
@@ -783,166 +794,85 @@ def _stats_dir() -> Path:
     return new_path  # default to new layout when neither exists yet
 
 
-def _validate_server_properties() -> list:
-    """Check server.properties for RCON settings and return a list of warnings.
-
-    Verifies:
-    - enable-rcon=true (RCON must be enabled for backups and /list to work)
-    - rcon.port matches the port used by rcon_command() (25575)
-    - rcon.password matches RCON_PASSWORD from .env
-
-    Returns an empty list if everything is OK, or a list of warning strings.
-    """
-    props_path = Path(MINECRAFT_DIR) / "server.properties"
-    if not props_path.exists():
-        return [f"server.properties not found at {props_path}"]
-
-    props = _read_server_properties()
-    warnings = []
-
-    if props.get("enable-rcon", "false").lower() != "true":
-        warnings.append("server.properties: enable-rcon is not set to true")
-
-    server_port = props.get("rcon.port", "25575")
-    if server_port != "25575":
-        warnings.append(f"server.properties: rcon.port is {server_port}, "
-                        f"but bot is configured to use 25575")
-
-    server_password = props.get("rcon.password", "")
-    if server_password != RCON_PASSWORD:
-        warnings.append("server.properties: rcon.password does not match "
-                        "RCON_PASSWORD from .env")
-
-    return warnings
-
-
-def _wait_for_rcon_ready(timeout: float = 120) -> bool:
-    """Wait for RCON to be ready by watching latest.log via LogWatcher.
-
-    Watches for the line "RCON running on" which indicates the Minecraft
-    server's RCON listener has started and is ready to accept connections.
-    This is needed on startup because the bot may start before the server.
-
-    Returns True if RCON is ready, False if timed out.
-    """
-    logger.info("Waiting for RCON to be ready (monitoring latest.log)...")
-    waiter = _watcher_ref.expect_line("RCON running on")
-    return waiter.wait(timeout=timeout)
-
-
-def rcon_command(cmd: str) -> str:
-    """Send an RCON command to the Minecraft server and return the response.
-
-    MCRcon.__init__ uses signal.SIGALRM which fails in non-main threads.
-    We bypass __init__ and set up the object manually to avoid this.
-    """
-    mcr = MCRcon.__new__(MCRcon)
-    mcr.host = "localhost"
-    mcr.password = RCON_PASSWORD
-    mcr.port = 25575
-    mcr.tlsmode = 0
-    mcr.timeout = 5
-    mcr.connect()
-    try:
-        return mcr.command(cmd)
-    finally:
-        mcr.disconnect()
-
-
 def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     """Run a full server backup.
 
     Full backup process:
-      1. RCON save-off: disable Minecraft's auto-save to prevent file writes
-         during the zip operation (avoids corrupt/partial region files).
-      2. RCON save-all: flush all pending world data from memory to disk.
-      3. Wait for filesystem to settle (no mtime changes for 5 s).
-      4. Zip the entire server directory into BACKUP_DIR.
-      5. RCON save-on: re-enable auto-save (always, even if zip fails).
-      6. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
-      7. Start a new incremental chain: generate a fresh chain ID, rebuild
+      1. begin_save: freeze the world and flush pending writes
+         (Java: save-off + save-all; Bedrock: save hold).
+      2. Determine the consistent file set (files_ready):
+         - Java returns None -> wait for the filesystem to settle, then zip the
+           whole server directory.
+         - Bedrock returns [(path, max_bytes), ...] -> zip each file truncated
+           to its snapshot length.
+      3. end_save: resume normal saving (always, even if zip fails).
+      4. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
+      5. Start a new incremental chain: generate a fresh chain ID, rebuild
          the file manifest (mtime baseline), and write the chain marker.
-
-    RCON log confirmations are handled via LogWatcher.expect_line(): we
-    register a waiter BEFORE sending the RCON command, then block until the
-    expected log line appears. This avoids the race condition of the log line
-    being written before we start looking for it.
     """
     def status(msg):
         logger.info("Backup: %s", msg)
         if status_cb:
             status_cb(msg)
 
-    if not RCON_PASSWORD:
-        raise RuntimeError("RCON_PASSWORD not configured")
+    if not BACKEND.is_available():
+        raise RuntimeError("Server backend not available")
 
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Disable auto-save to freeze world state during backup
-    status("Disabling auto-save...")
-    waiter = _watcher_ref.expect_line("Automatic saving is now disabled")
-    rcon_command("save-off")
-    if waiter.wait(timeout=30):
-        status("Auto-save disabled")
-    else:
-        status("Warning: save-off confirmation not seen in log, proceeding anyway")
+    # Step 1: Freeze the world and flush pending writes (edition-specific).
+    BACKEND.begin_save(status)
+
+    mc_dir = Path(MINECRAFT_DIR)
+    # Uses relative paths inside the zip so the restore tool can extract
+    # directly into any target directory.
+    dir_name = mc_dir.name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_path = BACKUP_DIR / f"{dir_name}_{timestamp}.zip"
+    backup_dir_resolved = BACKUP_DIR.resolve()
 
     try:
-        # Step 2: Flush all pending world data to disk
-        status("Saving world...")
-        waiter = _watcher_ref.expect_line("Saved the game")
-        rcon_command("save-all")
-        if waiter.wait(timeout=120):
-            status("World save complete")
-        else:
-            status("Warning: save-all confirmation not seen in log, proceeding anyway")
-
-        # Step 3: Wait for the filesystem to settle before zipping.
-        # The server may still be flushing region data to disk after save-all.
-        mc_dir = Path(MINECRAFT_DIR)
-        wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status)
-
-        # Step 4: Zip the server directory
-        # Uses relative paths inside the zip so the restore tool can extract
-        # directly into any target directory. Skips the backup output directory
-        # (if it's inside the server dir) and the chain marker file.
-        dir_name = mc_dir.name
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_path = BACKUP_DIR / f"{dir_name}_{timestamp}.zip"
-        backup_dir_resolved = BACKUP_DIR.resolve()
+        # Step 2: Get the consistent file set to copy.
+        ready = BACKEND.files_ready(status)
+        if ready is None:
+            # Java: the server may still be flushing to disk after save-all,
+            # so wait for the filesystem to settle before zipping.
+            wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status)
 
         status(f"Zipping {mc_dir} ...")
         with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for dirpath, _dirnames, filenames in os.walk(mc_dir):
-                dp = Path(dirpath)
-                # Skip the backup directory if it's inside the server directory
-                try:
-                    dp.resolve().relative_to(backup_dir_resolved)
-                    continue
-                except ValueError:
-                    pass
-                for fn in filenames:
-                    # Chain marker is backup metadata, not server data
-                    if fn == CHAIN_MARKER_NAME:
+            if ready is None:
+                for dirpath, _dirnames, filenames in os.walk(mc_dir):
+                    dp = Path(dirpath)
+                    # Skip the backup directory if it's inside the server directory
+                    try:
+                        dp.resolve().relative_to(backup_dir_resolved)
                         continue
-                    fp = dp / fn
+                    except ValueError:
+                        pass
+                    for fn in filenames:
+                        # Chain marker is backup metadata, not server data
+                        if fn == CHAIN_MARKER_NAME:
+                            continue
+                        fp = dp / fn
+                        rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
+                        zf.write(fp, rel)
+            else:
+                # Bedrock: copy each file truncated to its snapshot length.
+                for fp, max_bytes in ready:
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
-                    zf.write(fp, rel)
+                    with open(fp, "rb") as src:
+                        zf.writestr(rel, src.read(max_bytes))
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
-        # Step 5: Always re-enable auto-save, even if zip fails
-        waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
-        rcon_command("save-on")
-        if waiter.wait(timeout=30):
-            status("Auto-save re-enabled")
-        else:
-            status("Warning: save-on confirmation not seen in log")
+        # Step 3: Always resume normal saving, even if zip fails
+        BACKEND.end_save(status)
 
-    # Step 6: Copy off-server if configured (e.g., rsync to NAS/cloud)
+    # Step 4: Copy off-server if configured (e.g., rsync to NAS/cloud)
     run_copy_command(final_path, log_fn=status)
 
-    # Step 7: Start a new incremental chain
+    # Step 5: Start a new incremental chain
     # Every full backup starts a fresh chain. The manifest records the mtime
     # of every file, which becomes the baseline for detecting changes in
     # subsequent incremental backups. The chain marker is written to the
@@ -1288,34 +1218,15 @@ def _read_player_data_bytes(version: dict) -> bytes:
     return version["path"].read_bytes()
 
 
-def _player_is_online_via_rcon(username: str) -> bool:
-    """Ask the server (not the in-memory set) whether a player is online.
-
-    Reuses the same regex the bot uses at startup. The in-memory online
-    set can drift if the bot missed log lines, so RCON is the source of
-    truth for the destructive restore precondition.
-    """
-    resp = rcon_command("list")
-    m = re.match(r'There are \d+ of a max of \d+ players online:(.*)', resp)
-    if not m:
-        return False
-    names_part = m.group(1).strip()
-    if not names_part:
-        return False
-    target = username.lower()
-    for n in names_part.split(", "):
-        if n.strip().lower() == target:
-            return True
-    return False
-
-
 def _run_player_restore(username: str, uuid: str, version: dict,
                         bot: telebot.TeleBot, chat_id: int) -> None:
     """Background worker that performs the player .dat restore.
 
     Holds _backup_lock for the duration to mutex with /backup and the
-    incremental cycle. Save-on is always re-enabled in a finally block,
+    incremental cycle. Saving is always re-enabled in a finally block,
     even if the file replacement step raises.
+
+    Only reached on editions with CAP_PLAYER_RESTORE (Java); the caller gates.
     """
     def status(msg):
         logger.info("RestorePlayer: %s", msg)
@@ -1328,36 +1239,23 @@ def _run_player_restore(username: str, uuid: str, version: dict,
         bot.send_message(chat_id, "A backup or restore is in progress.")
         return
 
-    save_off_sent = False
+    save_started = False
     try:
-        # Precondition: player must be offline (RCON-confirmed)
+        # Precondition: player must be offline (confirmed by the server, not
+        # the bot's in-memory set, which can drift if log lines were missed).
         try:
-            if _player_is_online_via_rcon(username):
+            if BACKEND.is_player_online(username):
                 status(f"Player {username} is online — log them out first.")
                 return
-            status(f"RCON /list: {username} is offline")
+            status(f"{username} is offline")
         except Exception as e:
-            status(f"RCON /list failed: {e}")
+            status(f"Online check failed: {e}")
             return
 
-        # Mirror the backup save-off / save-all / settle dance so any
-        # outstanding writes finish before we touch the file.
-        status("Disabling auto-save...")
-        waiter = _watcher_ref.expect_line("Automatic saving is now disabled")
-        rcon_command("save-off")
-        save_off_sent = True
-        if waiter.wait(timeout=30):
-            status("Auto-save disabled")
-        else:
-            status("Warning: save-off confirmation not seen in log, proceeding anyway")
-
-        status("Saving world...")
-        waiter = _watcher_ref.expect_line("Saved the game")
-        rcon_command("save-all")
-        if waiter.wait(timeout=120):
-            status("World save complete")
-        else:
-            status("Warning: save-all confirmation not seen in log, proceeding anyway")
+        # Mirror the backup freeze/flush dance so any outstanding writes finish
+        # before we touch the file.
+        BACKEND.begin_save(status)
+        save_started = True
 
         wait_for_settle(Path(MINECRAFT_DIR), BACKUP_DIR, log_fn=status)
 
@@ -1391,14 +1289,9 @@ def _run_player_restore(username: str, uuid: str, version: dict,
         logger.exception("RestorePlayer failed")
         status(f"Restore failed: {e}")
     finally:
-        if save_off_sent:
+        if save_started:
             try:
-                waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
-                rcon_command("save-on")
-                if waiter.wait(timeout=30):
-                    status("Auto-save re-enabled")
-                else:
-                    status("Warning: save-on confirmation not seen in log")
+                BACKEND.end_save(status)
             except Exception:
                 logger.exception("Failed to re-enable auto-save")
         _backup_lock.release()
@@ -1447,36 +1340,31 @@ def run_incremental_backup() -> str | None:
         logger.info("Incremental backup: %d changed/added, %d deleted",
                      len(changed), len(deleted))
 
-        if not RCON_PASSWORD:
-            logger.warning("Incremental backup skipped: RCON_PASSWORD not configured")
+        if not BACKEND.is_available():
+            logger.warning("Incremental backup skipped: server backend not available")
             return None
 
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        inc_log = lambda msg: logger.info("Incremental backup: %s", msg)
 
-        # Freeze the world state: disable auto-save and flush pending writes.
-        # Same RCON sequence as full backups — ensures we're zipping consistent
-        # file state, not partially-written region files.
-        waiter = _watcher_ref.expect_line("Automatic saving is now disabled")
-        rcon_command("save-off")
-        if waiter.wait(timeout=30):
-            logger.info("Incremental backup: auto-save disabled")
-        else:
-            logger.warning("Incremental backup: save-off confirmation not seen, proceeding")
+        # Freeze the world state and flush pending writes (edition-specific) —
+        # ensures we zip consistent file state, not partially-written files.
+        BACKEND.begin_save(inc_log)
 
         try:
-            waiter = _watcher_ref.expect_line("Saved the game")
-            rcon_command("save-all")
-            if waiter.wait(timeout=120):
-                logger.info("Incremental backup: world save complete")
+            # Determine the consistent file set, then re-scan to capture any
+            # changes flushed by the save before computing the final diff.
+            ready = BACKEND.files_ready(inc_log)
+            if ready is None:
+                # Java: the server may still be flushing after the save, so wait
+                # for the filesystem to settle before diffing.
+                new_manifest = wait_for_settle(mc_dir, BACKUP_DIR, log_fn=inc_log)
+                ready_map = None
             else:
-                logger.warning("Incremental backup: save-all confirmation not seen, proceeding")
-
-            # Second pass: re-scan after save-all and wait for the filesystem
-            # to settle before zipping.  The server may still be flushing data
-            # to disk even after "Saved the game" is logged.
-            new_manifest = wait_for_settle(
-                mc_dir, BACKUP_DIR,
-                log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
+                # Bedrock: snapshot lengths are authoritative; no settle needed.
+                new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
+                ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
+                             for p, n in ready}
             changed, deleted = _diff_manifest(old_files, new_manifest)
 
             # Build the incremental zip with chain ID in the filename
@@ -1486,10 +1374,16 @@ def run_incremental_backup() -> str | None:
             zip_path = BACKUP_DIR / f"{zip_name}.zip"
 
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Add changed/added files
+                # Add changed/added files. On Bedrock, truncate any file with a
+                # known snapshot length to that length for a consistent copy.
                 for rel_path in changed:
                     full_path = mc_dir / rel_path
-                    if full_path.exists():
+                    if not full_path.exists():
+                        continue
+                    if ready_map is not None and rel_path in ready_map:
+                        with open(full_path, "rb") as src:
+                            zf.writestr(rel_path, src.read(ready_map[rel_path]))
+                    else:
                         zf.write(full_path, rel_path)
                 # Record deleted files so restore can remove them too
                 if deleted:
@@ -1507,13 +1401,8 @@ def run_incremental_backup() -> str | None:
             _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
 
         finally:
-            # Always re-enable auto-save
-            waiter = _watcher_ref.expect_line("Automatic saving is now enabled")
-            rcon_command("save-on")
-            if waiter.wait(timeout=30):
-                logger.info("Incremental backup: auto-save re-enabled")
-            else:
-                logger.warning("Incremental backup: save-on confirmation not seen")
+            # Always resume normal saving
+            BACKEND.end_save(inc_log)
 
         # Copy off-server if configured
         run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
@@ -1671,20 +1560,26 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             "/list — list all known players",
             "/stats [player] — player statistics",
             "/playtime — playtime leaderboard",
-            "/achievements [player] — player achievements",
-            "/deaths [player] — death history",
-            "/death_summary — deaths grouped by cause",
-            "/chat_id — show this chat's ID",
         ]
+        if BACKEND.supports(EVENT_ACHIEVEMENT):
+            lines.append("/achievements [player] — player achievements")
+        if BACKEND.supports(EVENT_DEATH):
+            lines += [
+                "/deaths [player] — death history",
+                "/death_summary — deaths grouped by cause",
+            ]
+        lines.append("/chat_id — show this chat's ID")
         if message.chat.type == "private" and is_admin(message.from_user.id, auth):
             lines += [
                 "/authorize <chat_id> — whitelist a chat",
                 "/revoke <chat_id> — remove a chat from whitelist",
                 "/listchats — list authorized chats",
-                "/scan_achievements — scan all logs for achievements",
-                "/scan_deaths — scan all logs for deaths",
-                "/backup — trigger a server backup now",
             ]
+            if BACKEND.supports(EVENT_ACHIEVEMENT):
+                lines.append("/scan_achievements — scan all logs for achievements")
+            if BACKEND.supports(EVENT_DEATH):
+                lines.append("/scan_deaths — scan all logs for deaths")
+            lines.append("/backup — trigger a server backup now")
         bot.reply_to(message, "\n".join(lines))
 
     # --- /status ---
@@ -1763,6 +1658,9 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_achievements(message):
         if not guard(message):
             return
+        if not BACKEND.supports(EVENT_ACHIEVEMENT):
+            bot.reply_to(message, "Achievements are not tracked on this server edition.")
+            return
         refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
         target = args[1].strip().lower() if len(args) > 1 else None
@@ -1819,6 +1717,9 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
         if not is_admin(message.from_user.id, auth):
             return
+        if not BACKEND.supports(EVENT_ACHIEVEMENT):
+            bot.reply_to(message, "Achievements are not tracked on this server edition.")
+            return
         logger.info("ScanAchievements: requested by %s", _tg_user(message))
         refresh_player_names(names, _NAMES_PATH)
         bot.reply_to(message, "Scanning log files for achievements...")
@@ -1859,6 +1760,9 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     @bot.message_handler(commands=["deaths"])
     def cmd_deaths(message):
         if not guard(message):
+            return
+        if not BACKEND.supports(EVENT_DEATH):
+            bot.reply_to(message, "Deaths are not tracked on this server edition.")
             return
         refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
@@ -1918,6 +1822,9 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_death_summary(message):
         if not guard(message):
             return
+        if not BACKEND.supports(EVENT_DEATH):
+            bot.reply_to(message, "Deaths are not tracked on this server edition.")
+            return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("DeathSummary: requested by %s", _tg_user(message))
 
@@ -1973,6 +1880,9 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
         if message.chat.type != "private":
             return
         if not is_admin(message.from_user.id, auth):
+            return
+        if not BACKEND.supports(EVENT_DEATH):
+            bot.reply_to(message, "Deaths are not tracked on this server edition.")
             return
         logger.info("ScanDeaths: requested by %s", _tg_user(message))
         refresh_player_names(names, _NAMES_PATH)
@@ -2041,6 +1951,10 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
         if message.chat.type != "private":
             return
         if not is_admin(message.from_user.id, auth):
+            return
+        if not BACKEND.supports(CAP_PLAYER_RESTORE):
+            bot.reply_to(message, "Per-player restore is not available on this "
+                                  "server edition.")
             return
 
         # Parse: /restore_player <username> [<N>] [confirm]
@@ -2227,15 +2141,31 @@ def main():
 
     bot = telebot.TeleBot(BOT_TOKEN)
 
-    global _bot_ref, _auth_ref, _watcher_ref
+    global _bot_ref, _auth_ref, _watcher_ref, BACKEND
     _bot_ref = bot
     _auth_ref = auth
+
+    # Construct the edition-specific backend. Bedrock raises BackendUnavailable
+    # if no tmux/screen session is hosting the server — exit gracefully.
+    try:
+        BACKEND = make_backend(CONFIG)
+    except BackendUnavailable as e:
+        logger.error("Cannot start backend for edition '%s': %s", CONFIG.edition, e)
+        admin_id = auth.get("admin_user_id")
+        if admin_id:
+            try:
+                bot.send_message(admin_id, f"⚠️ mcnotifier cannot start: {e}")
+            except Exception:
+                pass
+        return
+    logger.info("Server edition: %s", CONFIG.edition)
 
     register_handlers(bot, auth, names, achievements, deaths)
 
     notify = make_notify_callback(bot, auth, names, achievements, deaths)
     watcher = LogWatcher(LOG_PATH, names, notify)
     _watcher_ref = watcher
+    BACKEND.attach_watcher(watcher)
     observer = Observer()
     observer.schedule(watcher, path=str(LOG_PATH.parent), recursive=False)
     observer.start()
@@ -2244,70 +2174,52 @@ def main():
     # Validate server.properties RCON settings before attempting any RCON commands.
     # If validation fails, skip RCON entirely — the settings are wrong and
     # connections will fail regardless.
-    rcon_ok = False
-    if RCON_PASSWORD:
-        prop_warnings = _validate_server_properties()
-        if prop_warnings:
-            for warning in prop_warnings:
-                logger.warning(warning)
-            logger.warning("RCON commands disabled due to server.properties issues")
-        else:
-            rcon_ok = True
+    backend_available = BACKEND.is_available(log_warnings=True)
 
     # Capture any players already online via RCON /list.
     # The server may already be running (bot restarted), or it may still be
     # starting up. We try /list immediately; if it fails, we watch latest.log
     # for the "RCON running on" line and retry. If that also times out, the
     # server is likely not running — alert the admin.
-    if rcon_ok:
-        resp = None
+    if backend_available:
+        online = None
         try:
-            resp = rcon_command("list")
+            online = BACKEND.query_online_players()
         except Exception as e:
-            logger.warning("RCON /list failed, server may still be starting: %s", e)
-            if _wait_for_rcon_ready(timeout=120):
-                logger.info("RCON is now ready, retrying /list")
+            logger.warning("Online query failed, server may still be starting: %s", e)
+            if BACKEND.wait_for_ready(timeout=120):
+                logger.info("Server is now ready, retrying online query")
                 try:
-                    resp = rcon_command("list")
+                    online = BACKEND.query_online_players()
                 except Exception as e2:
-                    logger.warning("RCON /list retry failed: %s", e2)
+                    logger.warning("Online query retry failed: %s", e2)
 
-        if resp is not None:
-            # Response: "There are X of a max of Y players online: p1, p2"
-            m = re.match(r'There are \d+ of a max of \d+ players online:(.*)', resp)
-            if m:
-                names_part = m.group(1).strip()
-                if names_part:
-                    for name in names_part.split(", "):
-                        name = name.strip()
-                        if name:
-                            player_join(name)
-                    online = get_online_players()
-                    logger.info("RCON /list: %d player(s) already online: %s",
-                                len(online), ", ".join(online))
-                    # Players were online before the bot started; the join
-                    # notify callback never fired for them, so start the
-                    # incremental backup cycle here.
-                    _start_incremental_cycle()
-                else:
-                    logger.info("RCON /list: no players online")
+        if online is not None:
+            for name in online:
+                player_join(name)
+            current = get_online_players()
+            if current:
+                logger.info("%d player(s) already online: %s",
+                            len(current), ", ".join(current))
+                # The join notify callback never fired for these players, so
+                # start the incremental backup cycle here.
+                _start_incremental_cycle()
             else:
-                logger.info("RCON /list: no players online")
+                logger.info("No players online")
         else:
-            # RCON never connected — server is likely not running.
-            # Alert the admin via Telegram so they know.
-            logger.error("Could not connect to Minecraft server RCON. "
+            # Never connected — server is likely not running. Alert the admin.
+            logger.error("Could not connect to the Minecraft server. "
                          "Server may not be running.")
             admin_id = auth.get("admin_user_id")
             if admin_id:
                 try:
                     bot.send_message(
                         admin_id,
-                        "\u26a0\ufe0f Could not connect to Minecraft server RCON.\n"
-                        "The server may not be running or RCON is not ready.\n"
+                        "\u26a0\ufe0f Could not connect to the Minecraft server.\n"
+                        "The server may not be running or not ready yet.\n"
                         "Backups and /list will not work until the server is up.")
                 except Exception:
-                    logger.warning("Failed to send RCON alert to admin")
+                    logger.warning("Failed to send connection alert to admin")
 
     # Validate incremental backup chain
     chain_id, base_full, _ = _load_manifest()
@@ -2350,8 +2262,8 @@ def main():
     logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter())
 
     # Scheduled full backup
-    _BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "4"))
-    _BACKUP_SCHEDULE = os.environ.get("BACKUP_SCHEDULE", "daily").lower()
+    _BACKUP_HOUR = CONFIG.backup_hour
+    _BACKUP_SCHEDULE = CONFIG.backup_schedule
 
     def _next_backup_time(now: datetime) -> datetime:
         """Calculate the next scheduled backup time."""
@@ -2390,8 +2302,8 @@ def main():
                         wait, target.strftime("%Y-%m-%d %H:%M"))
             time.sleep(wait)
 
-            if not RCON_PASSWORD:
-                logger.warning("Scheduled backup skipped: RCON_PASSWORD not configured")
+            if not BACKEND.is_available():
+                logger.warning("Scheduled backup skipped: server backend not available")
                 continue
 
             logger.info("Scheduled %s backup starting", _BACKUP_SCHEDULE)
