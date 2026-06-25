@@ -104,7 +104,22 @@ You can verify the current rules with `sudo iptables -L INPUT -n --line-numbers`
 
 Bedrock Dedicated Server (BDS) has **no RCON**, and its console is much terser than Java's. Set `SERVER_EDITION=bedrock` and run the server inside a terminal multiplexer so the bot can drive it.
 
-**Command injection (tmux / screen / byobu).** The bot types commands on the server's stdin via the tmux or screen session hosting it (byobu wraps either). It auto-detects the session, or you can pin it with `MUX_SESSION`. If no tmux/screen session is found, the bot logs a clear message and exits — Bedrock cannot run without one.
+**Command injection (tmux / screen / byobu).** The bot types commands on the server's stdin via the tmux or screen session hosting it (byobu wraps either). It auto-detects the session, or you can pin it with `MUX_SESSION`. If no tmux/screen session is found, the bot logs a clear message and exits — Bedrock cannot run without one. The bot must run as the **same user** that owns the session (it can only see that user's tmux/screen sessions).
+
+**Setting `MUX_SESSION`.** This is the session **name** to target, not the multiplexer type — `MUX_SESSION=tmux` is wrong. Leave it blank to auto-detect the first live session, or set one of:
+
+- `MUX_SESSION=<session>` — e.g. `MUX_SESSION=1`
+- `MUX_SESSION=<session>:<window>` — pin a specific window (recommended)
+- `MUX_SESSION=<session>:<window>.<pane>` — pin a window and pane
+
+Pinning the window is recommended because byobu uses **grouped tmux sessions** (e.g. `1` and `1-8` sharing the same windows), where the active-window pointer is shared and shifts as you navigate byobu — so a bare session target can send a command to whatever window you happen to be viewing. Find the session and window with:
+
+```bash
+tmux list-sessions                 # session names, e.g. "1"
+tmux list-windows -t 1             # window index + name, e.g. "0: bedrock"
+```
+
+If BDS runs in the window named `bedrock` of session `1`, set `MUX_SESSION=1:bedrock` (the window **name** is more robust than its index `1:0`, which shifts if windows are reordered). On startup the log shows `Detected tmux session for command injection: 1:bedrock`. For `screen`, the form is `MUX_SESSION=<session>:<window-number>`.
 
 **Capturing output.** BDS writes to stdout, not `logs/latest.log`. Launch the server so its output is captured to a file the bot tails (default `MINECRAFT_DIR/console.log`, override with `CONSOLE_LOG`). For example, inside your byobu/tmux/screen window:
 ```bash
