@@ -1453,9 +1453,12 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             "Available commands:",
             "/status — show online players",
             "/list — list all known players",
-            "/stats [player] — player statistics",
-            "/playtime — playtime leaderboard",
         ]
+        if CONFIG.edition != EDITION_BEDROCK:  # Bedrock has no per-player stats
+            lines += [
+                "/stats [player] — player statistics",
+                "/playtime — playtime leaderboard",
+            ]
         if BACKEND.supports(EVENT_ACHIEVEMENT):
             lines.append("/achievements [player] — player achievements")
         if BACKEND.supports(EVENT_DEATH):
@@ -1494,6 +1497,10 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_stats(message):
         if not guard(message):
             return
+        if CONFIG.edition == EDITION_BEDROCK:
+            bot.reply_to(message, "Player statistics are not available on Bedrock "
+                                  "(BDS keeps no per-player stats files).")
+            return
         refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
         target = args[1].strip().lower() if len(args) > 1 else None
@@ -1519,6 +1526,10 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_playtime(message):
         if not guard(message):
             return
+        if CONFIG.edition == EDITION_BEDROCK:
+            bot.reply_to(message, "Playtime stats are not available on Bedrock "
+                                  "(BDS keeps no per-player stats files).")
+            return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("Playtime: requested by %s", _tg_user(message))
         all_stats = read_player_stats(_stats_dir(), names)
@@ -1536,6 +1547,15 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("List: requested by %s", _tg_user(message))
+        # Bedrock has no per-player stats files; the known-players source is the
+        # name registry the bot builds from join events.
+        if CONFIG.edition == EDITION_BEDROCK:
+            entries = sorted(set(names.values()))
+            if not entries:
+                bot.reply_to(message, "No players seen yet.")
+                return
+            bot.reply_to(message, "Known players:\n" + "\n".join(entries))
+            return
         if not _stats_dir().exists():
             bot.reply_to(message, "Stats directory not found.")
             return
