@@ -1,0 +1,29 @@
+"""Server backends and the factory that selects one by edition."""
+
+from config import EDITION_JAVA, EDITION_BEDROCK
+from .base import (
+    ServerBackend, BackendUnavailable, NotSupported,
+    EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT, CAP_PLAYER_RESTORE,
+)
+
+
+def make_backend(config) -> ServerBackend:
+    """Construct the backend for ``config.edition``.
+
+    May raise ``BackendUnavailable`` (e.g. Bedrock with no tmux/screen session),
+    which ``main()`` handles by exiting with a clear message.
+    """
+    if config.edition == EDITION_BEDROCK:
+        from .bedrock import BedrockBackend
+        return BedrockBackend(config)
+    if config.edition == EDITION_JAVA:
+        from .java import JavaBackend
+        return JavaBackend(config)
+    raise ValueError(f"Unknown edition: {config.edition}")
+
+
+__all__ = [
+    "ServerBackend", "BackendUnavailable", "NotSupported", "make_backend",
+    "EVENT_JOIN", "EVENT_LEAVE", "EVENT_DEATH", "EVENT_ACHIEVEMENT",
+    "CAP_PLAYER_RESTORE",
+]
