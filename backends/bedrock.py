@@ -73,18 +73,53 @@ class BedrockBackend(ServerBackend):
         self._mux.send(cmd)
         return ""
 
+    def _send_confirmed(self, cmd: str, success_phrase: str, timeout: float = 30,
+                        retries: int = 3, log=None) -> bool:
+        """Send ``cmd`` and wait for ``success_phrase`` in the console.
+
+        BDS injection over tmux/screen can occasionally drop characters (we have
+        seen ``save hold`` arrive as ``ave``), which BDS reports as
+        ``Unknown command``. If we see that — or nothing within ``timeout`` —
+        resend, up to ``retries`` times. Returns True once confirmed.
+        """
+        for attempt in range(1, retries + 1):
+            ok = self._watcher.expect_line(success_phrase)
+            err = self._watcher.expect_line("Unknown command")
+            self.send_command(cmd)
+            deadline = time.time() + timeout
+            confirmed = False
+            while time.time() < deadline:
+                if ok.wait(0.25):
+                    confirmed = True
+                    break
+                if err.triggered():  # garbled command echoed back by BDS
+                    break
+            self._watcher.cancel(ok)
+            self._watcher.cancel(err)
+            if confirmed:
+                return True
+            if attempt < retries and log:
+                log(f"'{cmd}' not confirmed (attempt {attempt}/{retries}), retrying")
+        return False
+
     # --- backup freeze/flush ---
     def begin_save(self, log_fn=None) -> None:
         def log(msg):
             if log_fn:
                 log_fn(msg)
         log("Holding save...")
-        waiter = self._watcher.expect_line("Saving...")
-        self.send_command("save hold")
-        if waiter.wait(timeout=30):
+        if self._send_confirmed("save hold", "Saving...", retries=2, log=log):
+            log("Save held")
+            return
+        # Not confirmed — a previous backup may have left a stale hold. Clear it
+        # with a resume, then try once more.
+        log("Clearing any stale save-hold, retrying...")
+        self.send_command("save resume")
+        time.sleep(1)
+        if self._send_confirmed("save hold", "Saving...", retries=2, log=log):
             log("Save held")
         else:
-            log("Warning: 'save hold' acknowledgement not seen, proceeding anyway")
+            log("Warning: 'save hold' not confirmed after retries, proceeding anyway")
 
     def files_ready(self, log_fn=None):
         """Poll `save query` until the snapshot is ready; return [(path, bytes)].
@@ -110,12 +145,10 @@ class BedrockBackend(ServerBackend):
         def log(msg):
             if log_fn:
                 log_fn(msg)
-        waiter = self._watcher.expect_line("are resumed")
-        self.send_command("save resume")
-        if waiter.wait(timeout=30):
+        if self._send_confirmed("save resume", "are resumed", retries=3, log=log):
             log("Save resumed")
         else:
-            log("Warning: 'save resume' acknowledgement not seen")
+            log("Warning: 'save resume' not confirmed after retries")
 
     # --- server-side queries ---
     def query_online_players(self) -> list[str]:
