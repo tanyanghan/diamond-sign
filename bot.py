@@ -840,6 +840,89 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
     zf.write(fp, rel)
 
 
+# Bedrock per-player restore reads player data from a sidecar embedded in each
+# backup zip (the live LevelDB is locked while the server runs). Dedup state of
+# {player_server_key: sha256} so incrementals only carry players that changed.
+_PLAYER_STATE_PATH = Path(__file__).parent / "bedrock_player_state.json"
+
+
+def _load_player_state() -> dict:
+    try:
+        return json.loads(_PLAYER_STATE_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Failed to read bedrock_player_state.json")
+        return {}
+
+
+def _save_player_state(hashes: dict) -> None:
+    try:
+        _PLAYER_STATE_PATH.write_text(json.dumps(hashes))
+    except Exception:
+        logger.exception("Failed to write bedrock_player_state.json")
+
+
+def _maybe_learn_player(sidecar: dict, log) -> None:
+    """Bind an online player's xuid to their (account-stable) identity uuids
+    when unambiguous: exactly one player online and exactly one player in the
+    (changed) sidecar. The binding is persisted by the backend and reused to
+    resolve the player in any backup. Stable, so learned once per player.
+
+    Lives here (not the backend) because it needs the bot's in-memory online
+    set and the name registry; the backend just persists the result.
+    """
+    online = get_online_players()
+    if len(online) != 1:
+        return
+    server_keys = set(sidecar.get("mappings", {}).values())
+    idents = list(sidecar.get("mappings", {}).keys())
+    if len(server_keys) != 1 or not idents:
+        return
+    name = online[0]
+    names = load_player_names(_NAMES_PATH)
+    xuid = _uuid_by_name(name, names)  # Bedrock registry key is the xuid
+    if not xuid:
+        return
+    if BACKEND.learn_player(name, xuid, idents):
+        log(f"Learned Bedrock player mapping for {name}")
+
+
+def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:
+    """Embed the _players.json sidecar into an open Bedrock backup zip.
+
+    No-op for Java or when there's no snapshot file set. Generates the sidecar
+    from the snapshot db files, hash-dedups against the persisted state (full
+    backup = baseline/everyone + reset state; incremental = changed-only), and
+    never fails the backup — if the amulet libs are missing it just logs and
+    skips, so per-player restore is unavailable for that zip but the backup is
+    otherwise complete.
+    """
+    if CONFIG.edition != EDITION_BEDROCK or not ready:
+        return
+    try:
+        import bedrock_player
+    except Exception as e:
+        log(f"Player sidecar skipped (amulet libs unavailable: {e})")
+        return
+    db_files = [(p, n) for (p, n) in ready
+                if "/db/" in str(p).replace("\\", "/")]
+    if not db_files:
+        return
+    try:
+        sidecar = bedrock_player.build_sidecar_from_files(db_files)
+        prev = {} if full_backup else _load_player_state()
+        filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
+        zf.writestr(bedrock_player.SIDECAR_NAME, json.dumps(filtered))
+        _save_player_state(new_hashes)
+        log(f"Player sidecar: {len(filtered['players'])} player(s) "
+            f"({len(new_hashes)} total)")
+        _maybe_learn_player(filtered, log)
+    except Exception as e:
+        logger.exception("Player sidecar generation failed")
+        log(f"Player sidecar generation failed: {e}")
+
+
 def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     """Run a full server backup.
 
@@ -909,6 +992,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
                     fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
                     _add_world_file_to_zip(zf, fp, rel, ready_map)
+            # Bedrock: embed the full player-data sidecar (baseline).
+            _write_player_sidecar(zf, ready, full_backup=True, log=status)
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
@@ -1037,156 +1122,6 @@ def _read_chain_marker() -> str:
 # Player-data restore helpers (used by /restore_player)
 # ---------------------------------------------------------------------------
 
-# Player-data lives under the active world directory (named by `level-name`
-# in server.properties — read via _get_level_name(), never hardcoded).
-# Minecraft 26.1+ moved player data:
-#   - Old layout (<= 1.21): <world>/playerdata/<uuid>.dat
-#   - New layout (>= 26.1): <world>/players/data/<uuid>.dat
-# We always read live files from whichever directory exists (preferring the
-# new layout) and write restore output to the same one. Backup zips may use
-# either layout depending on when they were created, so the version scanner
-# checks both internal entry paths in each zip.
-# Forward slashes here match the zip layout produced by run_backup /
-# run_incremental_backup.
-
-
-def _live_playerdata_dir() -> Path:
-    """Return the live world's playerdata directory (new layout preferred)."""
-    world = Path(MINECRAFT_DIR) / _get_level_name()
-    new_path = world / "players" / "data"
-    old_path = world / "playerdata"
-    if new_path.is_dir():
-        return new_path
-    if old_path.is_dir():
-        return old_path
-    return new_path  # default to new layout when neither exists yet
-
-
-def _resolve_player(name: str, names: dict) -> tuple | None:
-    """Case-insensitive name lookup. Returns (canonical_name, uuid) or None.
-
-    Minecraft usernames are case-insensitive in practice; player_names.json
-    stores the case the server logged at join time. We accept any case from
-    the admin and surface the stored canonical name.
-    """
-    target = name.lower()
-    for uuid, canonical in names.items():
-        if canonical.lower() == target:
-            return canonical, uuid
-    return None
-
-
-def _scan_player_data_versions(uuid: str) -> list:
-    """Find all available historical copies of a player's .dat file.
-
-    Sources, latest first:
-      1. Live <world>/players/data/<uuid>.dat[_old[.gz]]  (or pre-26.1 path)
-      2. The current chain's full backup (base_full) if it contains the entry
-      3. Every incremental zip in BACKUP_DIR matching the current chain_id
-         that contains the entry
-
-    Backup zips may have been created with either the old (1.21 and earlier)
-    or the new (26.1+) on-disk layout. We probe both possible internal entry
-    paths in each zip and record whichever exists.
-
-    Each returned dict carries enough context for _run_player_restore to read
-    the bytes back later: ("kind", "path", "entry") plus a display label and
-    a sort key.
-    """
-    versions = []
-    level_name = _get_level_name()
-    candidate_entries = (
-        f"{level_name}/players/data/{uuid}.dat",   # new (26.1+)
-        f"{level_name}/playerdata/{uuid}.dat",     # old (<= 1.21)
-    )
-    playerdata_dir = _live_playerdata_dir()
-
-    # 1. Live files (.dat, .dat_old, .dat_old.gz). Each gets its own entry
-    # because the three are independently dated working copies, not snapshots.
-    for suffix, kind, label in (
-        (".dat", "live", "live .dat"),
-        (".dat_old", "live", "live .dat_old"),
-        (".dat_old.gz", "live_gz", "live .dat_old.gz"),
-    ):
-        p = playerdata_dir / f"{uuid}{suffix}"
-        if p.exists():
-            mtime = p.stat().st_mtime
-            versions.append({
-                "timestamp": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                "sort_key": mtime,
-                "source": label,
-                "kind": kind,
-                "path": p,
-                "entry": None,
-            })
-
-    # 1b. Pre-restore safety copies left by previous /restore_player runs.
-    # The timestamp in the filename is the authoritative save time — the
-    # filesystem mtime reflects when the copy was made, not the save itself.
-    if playerdata_dir.exists():
-        for p in playerdata_dir.glob(f"{uuid}.dat.pre-restore-*"):
-            suffix = p.name[len(f"{uuid}.dat.pre-restore-"):]
-            try:
-                ts_dt = datetime.strptime(suffix, "%Y%m%d_%H%M%S")
-            except ValueError:
-                continue
-            sort_key = ts_dt.timestamp()
-            versions.append({
-                "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "sort_key": sort_key,
-                "source": "pre-restore backup",
-                "kind": "live",
-                "path": p,
-                "entry": None,
-            })
-
-    # 2 + 3. All backup zips in BACKUP_DIR — current chain and previous chains.
-    chain_id, base_full, _ = _load_manifest()
-    if BACKUP_DIR.exists():
-        for f in BACKUP_DIR.iterdir():
-            if not f.is_file() or f.suffix != ".zip":
-                continue
-            ts_str = None
-            label = None
-            m_incr = RE_INCR.match(f.name)
-            if m_incr:
-                ts_str = m_incr.group(3)
-                is_current = chain_id and m_incr.group(2) == chain_id
-                label = "incremental backup" if is_current else "incremental backup (old chain)"
-            else:
-                m_full = RE_FULL.match(f.name)
-                if m_full:
-                    ts_str = m_full.group(2)
-                    is_current = chain_id and f.name == base_full
-                    label = "full backup" if is_current else "full backup (old chain)"
-            if ts_str is None:
-                continue
-            try:
-                with zipfile.ZipFile(f, "r") as zf:
-                    names = zf.namelist()
-                found_entry = next(
-                    (e for e in candidate_entries if e in names), None)
-                if found_entry is None:
-                    continue
-            except (zipfile.BadZipFile, OSError):
-                logger.warning("Skipping unreadable backup zip: %s", f.name)
-                continue
-            try:
-                ts_dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
-            except ValueError:
-                continue
-            versions.append({
-                "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "sort_key": ts_dt.timestamp(),
-                "source": label,
-                "kind": "zip",
-                "path": f,
-                "entry": found_entry,
-            })
-
-    versions.sort(key=lambda v: v["sort_key"], reverse=True)
-    return versions
-
 
 def _format_versions_reply(username: str, uuid: str, versions: list,
                            offset: int = 0) -> str:
@@ -1256,100 +1191,6 @@ def _set_pending_player_restore(user_id: int, **fields) -> None:
 def _clear_pending_player_restore(user_id: int) -> None:
     with _pending_player_lock:
         _pending_player_restore.pop(user_id, None)
-
-
-def _read_player_data_bytes(version: dict) -> bytes:
-    """Pull raw .dat bytes from a version entry, transparently gunzipping
-    a .dat_old.gz source. Always returns plain (uncompressed) NBT bytes
-    suitable for writing into <uuid>.dat."""
-    kind = version["kind"]
-    if kind == "zip":
-        with zipfile.ZipFile(version["path"], "r") as zf:
-            return zf.read(version["entry"])
-    if kind == "live_gz":
-        with gzip.open(version["path"], "rb") as f:
-            return f.read()
-    return version["path"].read_bytes()
-
-
-def _run_player_restore(username: str, uuid: str, version: dict,
-                        bot: telebot.TeleBot, chat_id: int) -> None:
-    """Background worker that performs the player .dat restore.
-
-    Holds _backup_lock for the duration to mutex with /backup and the
-    incremental cycle. Saving is always re-enabled in a finally block,
-    even if the file replacement step raises.
-
-    Only reached on editions with CAP_PLAYER_RESTORE (Java); the caller gates.
-    """
-    def status(msg):
-        logger.info("RestorePlayer: %s", msg)
-        try:
-            bot.send_message(chat_id, msg)
-        except Exception:
-            logger.exception("Failed to send status message")
-
-    if not _backup_lock.acquire(blocking=False):
-        bot.send_message(chat_id, "A backup or restore is in progress.")
-        return
-
-    save_started = False
-    try:
-        # Precondition: player must be offline (confirmed by the server, not
-        # the bot's in-memory set, which can drift if log lines were missed).
-        try:
-            if BACKEND.is_player_online(username):
-                status(f"Player {username} is online — log them out first.")
-                return
-            status(f"{username} is offline")
-        except Exception as e:
-            status(f"Online check failed: {e}")
-            return
-
-        # Mirror the backup freeze/flush dance so any outstanding writes finish
-        # before we touch the file.
-        BACKEND.begin_save(status)
-        save_started = True
-
-        wait_for_settle(Path(MINECRAFT_DIR), BACKUP_DIR, log_fn=status,
-                        exclude_names=_BACKUP_EXCLUDE_NAMES)
-
-        # Read source bytes, then atomically replace <uuid>.dat. Keep the
-        # current .dat as <uuid>.dat.pre-restore-<ts> as a safety net so
-        # the admin can manually undo a wrong choice.  The target follows
-        # the live layout (new in 26.1+, falls back to old) regardless of
-        # which layout the source bytes came from.
-        target = _live_playerdata_dir() / f"{uuid}.dat"
-        source_bytes = _read_player_data_bytes(version)
-
-        if target.exists():
-            # Tag the safety copy with the live .dat's mtime (i.e. when the
-            # player data was last saved by the server), not datetime.now().
-            # That way the suffix matches the timestamp the version list
-            # would show for this file, making the filename self-documenting
-            # about the state it captures rather than when the restore ran.
-            ts_label = datetime.fromtimestamp(
-                target.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
-            backup_path = target.with_name(f"{uuid}.dat.pre-restore-{ts_label}")
-            shutil.copy2(target, backup_path)
-            status(f"Saved current .dat as {backup_path.name}")
-
-        tmp = target.with_name(f"{uuid}.dat.tmp")
-        tmp.write_bytes(source_bytes)
-        os.replace(tmp, target)
-        status(f"Restored {username}.dat from {version['source']} "
-               f"({version['timestamp']})")
-
-    except Exception as e:
-        logger.exception("RestorePlayer failed")
-        status(f"Restore failed: {e}")
-    finally:
-        if save_started:
-            try:
-                BACKEND.end_save(status)
-            except Exception:
-                logger.exception("Failed to re-enable auto-save")
-        _backup_lock.release()
 
 
 def run_incremental_backup() -> str | None:
@@ -1444,6 +1285,8 @@ def run_incremental_backup() -> str | None:
                 # incremental's chain membership without external state
                 zf.writestr("_meta.json", json.dumps({
                     "chain_id": chain_id, "base_full": base_full}))
+                # Bedrock: embed the changed-only player-data sidecar.
+                _write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
 
             size_mb = zip_path.stat().st_size / (1024 * 1024)
             logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
@@ -1610,9 +1453,12 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             "Available commands:",
             "/status — show online players",
             "/list — list all known players",
-            "/stats [player] — player statistics",
-            "/playtime — playtime leaderboard",
         ]
+        if CONFIG.edition != EDITION_BEDROCK:  # Bedrock has no per-player stats
+            lines += [
+                "/stats [player] — player statistics",
+                "/playtime — playtime leaderboard",
+            ]
         if BACKEND.supports(EVENT_ACHIEVEMENT):
             lines.append("/achievements [player] — player achievements")
         if BACKEND.supports(EVENT_DEATH):
@@ -1651,6 +1497,10 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_stats(message):
         if not guard(message):
             return
+        if CONFIG.edition == EDITION_BEDROCK:
+            bot.reply_to(message, "Player statistics are not available on Bedrock "
+                                  "(BDS keeps no per-player stats files).")
+            return
         refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
         target = args[1].strip().lower() if len(args) > 1 else None
@@ -1676,6 +1526,10 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_playtime(message):
         if not guard(message):
             return
+        if CONFIG.edition == EDITION_BEDROCK:
+            bot.reply_to(message, "Playtime stats are not available on Bedrock "
+                                  "(BDS keeps no per-player stats files).")
+            return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("Playtime: requested by %s", _tg_user(message))
         all_stats = read_player_stats(_stats_dir(), names)
@@ -1693,6 +1547,15 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("List: requested by %s", _tg_user(message))
+        # Bedrock has no per-player stats files; the known-players source is the
+        # name registry the bot builds from join events.
+        if CONFIG.edition == EDITION_BEDROCK:
+            entries = sorted(set(names.values()))
+            if not entries:
+                bot.reply_to(message, "No players seen yet.")
+                return
+            bot.reply_to(message, "Known players:\n" + "\n".join(entries))
+            return
         if not _stats_dir().exists():
             bot.reply_to(message, "Stats directory not found.")
             return
@@ -2028,7 +1891,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
 
         # Resolve UUID and canonical name
-        resolved = _resolve_player(typed_name, names)
+        resolved = BACKEND.resolve_player(typed_name, names)
         if resolved is None:
             bot.reply_to(message, f"Unknown player: {typed_name}")
             return
@@ -2037,7 +1900,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
 
         # --- Step 1: list ---
         if typed_n is None:
-            versions = _scan_player_data_versions(uuid)
+            versions = BACKEND.list_player_versions(uuid, _load_manifest()[:2])
             if not versions:
                 _clear_pending_player_restore(user_id)
                 bot.reply_to(message, _format_versions_reply(canonical, uuid, versions))
@@ -2088,7 +1951,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 return
             # Re-scan and validate the chosen version still exists. Backup files
             # could in theory have been deleted between selection and confirm.
-            versions = _scan_player_data_versions(uuid)
+            versions = BACKEND.list_player_versions(uuid, _load_manifest()[:2])
             if not (1 <= n <= len(versions)):
                 _clear_pending_player_restore(user_id)
                 bot.reply_to(message,
@@ -2105,7 +1968,25 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             _clear_pending_player_restore(user_id)
 
             def run():
-                _run_player_restore(canonical, uuid, version, bot, message.chat.id)
+                # Hold the backup mutex for the whole restore (mutex with
+                # /backup and the incremental cycle). The backend does the
+                # edition-specific work; we just forward progress to Telegram.
+                if not _backup_lock.acquire(blocking=False):
+                    bot.send_message(message.chat.id,
+                                     "A backup or restore is in progress.")
+                    return
+                chat_id = message.chat.id
+
+                def status_cb(msg):
+                    try:
+                        bot.send_message(chat_id, msg)
+                    except Exception:
+                        logger.exception("Failed to send status message")
+
+                try:
+                    BACKEND.restore_player(canonical, uuid, version, status_cb)
+                finally:
+                    _backup_lock.release()
 
             threading.Thread(target=run, daemon=True).start()
             return

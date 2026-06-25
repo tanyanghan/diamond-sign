@@ -1,0 +1,18 @@
+# Optional dependencies for Bedrock per-player restore (/restore_player).
+# Only needed on a Bedrock host that wants per-player restore; the bot lazily
+# imports them, so it runs fine without them (the feature is just unavailable).
+#
+# amulet-leveldb has NO Linux wheels and its 1.0.6 sdist does not compile with
+# Cython 3.1+. It was published built with Cython 3.0.x, so pin the *build*
+# Cython to 3.0.x. On Debian/Ubuntu, in the bot's virtualenv:
+#
+#   sudo apt install -y build-essential zlib1g-dev
+#   pip install --upgrade pip
+#   printf 'cython>=3.0,<3.1\n' > /tmp/build-constraints.txt
+#   PIP_BUILD_CONSTRAINT=/tmp/build-constraints.txt \
+#       pip install -r requirements-bedrock-restore.txt
+#
+# (macOS/Windows have prebuilt wheels and need no build constraint.)
+
+amulet-leveldb
+amulet-nbt

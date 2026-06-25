@@ -111,3 +111,52 @@ class ServerBackend(ABC):
     # implementation lives in ``bot.py`` because it is tightly coupled to the
     # backup manifest/chain state; Bedrock simply omits the capability. The
     # backend's role there is limited to the save dance and ``is_player_online``.
+
+    # --- server lifecycle (Bedrock per-player restore: stop -> edit -> start) ---
+    # Java doesn't need these (RCON edits live), so they default to NotSupported
+    # and only the Bedrock backend overrides them.
+    def stop_server(self, log_fn=None) -> bool:
+        """Stop the server and return once it has shut down."""
+        raise NotSupported("stop_server")
+
+    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
+        """Wait until the world db is no longer locked by the server."""
+        raise NotSupported("wait_for_db_unlock")
+
+    def relaunch(self, log_fn=None) -> bool:
+        """Relaunch the server and return once it reports ready."""
+        raise NotSupported("relaunch")
+
+    # --- per-player restore (edition-agnostic surface; gated by CAP_PLAYER_RESTORE) ---
+    # The /restore_player handler is a thin 3-step state machine over these; the
+    # edition-specific work (Java: replace one <uuid>.dat live; Bedrock: stop ->
+    # edit the world LevelDB -> relaunch) lives in the subclasses.
+    def resolve_player(self, name: str, names: dict):
+        """Case-insensitive name -> (canonical_name, player_id), or None.
+
+        player_id is the player-names registry key — a UUID on Java, an xuid on
+        Bedrock. Default suits both; subclasses rarely need to override.
+        """
+        target = name.lower()
+        for player_id, canonical in names.items():
+            if canonical.lower() == target:
+                return canonical, player_id
+        return None
+
+    def list_player_versions(self, player_id: str, chain: tuple) -> list:
+        """Restore points for a player, newest first. Each is a dict with at
+        least ``timestamp`` and ``source`` (for display) plus backend-internal
+        keys consumed by ``restore_player``. ``chain`` is ``(chain_id,
+        base_full)`` from the backup manifest."""
+        raise NotSupported("list_player_versions")
+
+    def restore_player(self, username: str, player_id: str, version: dict,
+                       status_cb=None) -> None:
+        """Perform the restore for one ``version`` from ``list_player_versions``.
+        Assumes the caller holds the backup mutex. ``status_cb(msg)`` reports
+        progress (the handler forwards it to Telegram)."""
+        raise NotSupported("restore_player")
+
+    def learn_player(self, name: str, player_id: str, idents: list) -> bool:
+        """Persist a learned identity binding (Bedrock only; no-op elsewhere)."""
+        return False
