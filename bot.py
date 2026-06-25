@@ -18,7 +18,9 @@ from backup_utils import (
     CHAIN_MARKER_NAME, RE_FULL, RE_INCR, build_file_manifest, new_chain_id,
     run_copy_command, wait_for_settle,
 )
-from config import load_config, get_level_name, EDITION_BEDROCK
+from config import (
+    load_config, get_level_name, backup_exclude_names, EDITION_BEDROCK,
+)
 from backends import (
     make_backend, BackendUnavailable, CAP_PLAYER_RESTORE,
     EVENT_DEATH, EVENT_ACHIEVEMENT,
@@ -42,6 +44,13 @@ INCREMENTAL_INTERVAL_MINUTES = CONFIG.incremental_interval_minutes
 
 # Server backend (Java RCON / Bedrock mux). Constructed in main().
 BACKEND = None
+
+# Files excluded from backups and the change manifest in addition to the chain
+# marker: bot infrastructure that lives in the server directory but isn't server
+# data. On Bedrock this is the captured-stdout console.log the bot tails, which
+# tee appends to constantly (it would otherwise appear changed in every
+# incremental). Matched by basename anywhere in the tree.
+_BACKUP_EXCLUDE_NAMES = frozenset(backup_exclude_names())
 
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
@@ -861,7 +870,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
         if ready is None:
             # Java: the server may still be flushing to disk after save-all,
             # so wait for the filesystem to settle before zipping.
-            wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status)
+            wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status,
+                            exclude_names=_BACKUP_EXCLUDE_NAMES)
         else:
             ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
                          for p, n in ready}
@@ -877,8 +887,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
                 except ValueError:
                     pass
                 for fn in filenames:
-                    # Chain marker is backup metadata, not server data
-                    if fn == CHAIN_MARKER_NAME:
+                    # Chain marker and bot infrastructure are not server data
+                    if fn == CHAIN_MARKER_NAME or fn in _BACKUP_EXCLUDE_NAMES:
                         continue
                     fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
@@ -900,7 +910,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     # while it's offline.
     try:
         chain_id = new_chain_id(BACKUP_DIR)
-        fresh_files = build_file_manifest(Path(MINECRAFT_DIR), BACKUP_DIR)
+        fresh_files = build_file_manifest(Path(MINECRAFT_DIR), BACKUP_DIR,
+                                          _BACKUP_EXCLUDE_NAMES)
         _save_manifest(fresh_files, chain_id=chain_id, base_full=final_path.name)
         _write_chain_marker(chain_id)
         logger.info("Backup: new chain %s established (base: %s)",
@@ -1277,7 +1288,8 @@ def _run_player_restore(username: str, uuid: str, version: dict,
         BACKEND.begin_save(status)
         save_started = True
 
-        wait_for_settle(Path(MINECRAFT_DIR), BACKUP_DIR, log_fn=status)
+        wait_for_settle(Path(MINECRAFT_DIR), BACKUP_DIR, log_fn=status,
+                        exclude_names=_BACKUP_EXCLUDE_NAMES)
 
         # Read source bytes, then atomically replace <uuid>.dat. Keep the
         # current .dat as <uuid>.dat.pre-restore-<ts> as a safety net so
@@ -1350,7 +1362,7 @@ def run_incremental_backup() -> str | None:
             return None
 
         # First pass: quick scan to see if anything changed at all
-        new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
+        new_manifest = build_file_manifest(mc_dir, BACKUP_DIR, _BACKUP_EXCLUDE_NAMES)
 
         changed, deleted = _diff_manifest(old_files, new_manifest)
         if not changed and not deleted:
@@ -1378,11 +1390,12 @@ def run_incremental_backup() -> str | None:
             if ready is None:
                 # Java: the server may still be flushing after the save, so wait
                 # for the filesystem to settle before diffing.
-                new_manifest = wait_for_settle(mc_dir, BACKUP_DIR, log_fn=inc_log)
+                new_manifest = wait_for_settle(mc_dir, BACKUP_DIR, log_fn=inc_log,
+                                               exclude_names=_BACKUP_EXCLUDE_NAMES)
                 ready_map = None
             else:
                 # Bedrock: snapshot lengths are authoritative; no settle needed.
-                new_manifest = build_file_manifest(mc_dir, BACKUP_DIR)
+                new_manifest = build_file_manifest(mc_dir, BACKUP_DIR, _BACKUP_EXCLUDE_NAMES)
                 ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
                              for p, n in ready}
             changed, deleted = _diff_manifest(old_files, new_manifest)

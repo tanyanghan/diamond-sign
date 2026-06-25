@@ -65,6 +65,7 @@ from backup_utils import (
     CHAIN_MARKER_NAME, META_FILES, RE_FULL, RE_INCR,
     build_file_manifest, new_chain_id, run_copy_command,
 )
+from config import backup_exclude_names
 
 # Load .env for defaults (BACKUP_DIR, MINECRAFT_DIR)
 load_dotenv(Path(__file__).parent / ".env")
@@ -598,7 +599,8 @@ def restore(chains: list, chain_idx: int, point_idx: int,
 
             manifest_path = Path(__file__).parent / "backup_manifest.json"
             print("Rebuilding backup manifest...")
-            files = build_file_manifest(target_dir, backup_dir)
+            files = build_file_manifest(target_dir, backup_dir,
+                                        backup_exclude_names())
             with open(manifest_path, "w") as f:
                 json.dump({"chain_id": chain_id, "base_full": full_zip.name,
                             "files": files}, f)

@@ -101,7 +101,8 @@ def new_chain_id(backup_dir: Path) -> str:
     return chain_id
 
 
-def build_file_manifest(root_dir: Path, backup_dir: Path | None = None) -> dict:
+def build_file_manifest(root_dir: Path, backup_dir: Path | None = None,
+                        exclude_names: set | None = None) -> dict:
     """Walk root_dir and return {relative_path: mtime} dict.
 
     This is the core of the incremental backup change-detection system.
@@ -110,9 +111,14 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None) -> dict:
 
     Skips:
     - CHAIN_MARKER_NAME: backup metadata, not server data
+    - Any basename in exclude_names: bot infrastructure that lives in the
+      server directory but isn't server data (e.g. the Bedrock console.log
+      the bot tails). Must match the set excluded from the backup zips, or
+      excluded files would show up as perpetually changed/deleted.
     - Anything under backup_dir: if the backup output directory happens to
       be inside the server directory, we don't want to back up backups
     """
+    skip = {CHAIN_MARKER_NAME} | (exclude_names or set())
     backup_dir_resolved = backup_dir.resolve() if backup_dir else None
     files = {}
     for dirpath, _dirnames, filenames in os.walk(root_dir):
@@ -125,7 +131,7 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None) -> dict:
             except ValueError:
                 pass
         for fn in filenames:
-            if fn == CHAIN_MARKER_NAME:
+            if fn in skip:
                 continue
             fp = dp / fn
             try:
@@ -139,7 +145,7 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None) -> dict:
 
 def wait_for_settle(root_dir: Path, backup_dir: Path | None = None,
                     settle_seconds: int = 5, max_attempts: int = 12,
-                    log_fn=None) -> dict:
+                    log_fn=None, exclude_names: set | None = None) -> dict:
     """Wait until no files in root_dir change for settle_seconds, then return
     the final manifest.
 
@@ -163,10 +169,10 @@ def wait_for_settle(root_dir: Path, backup_dir: Path | None = None,
         if log_fn:
             log_fn(msg)
 
-    manifest = build_file_manifest(root_dir, backup_dir)
+    manifest = build_file_manifest(root_dir, backup_dir, exclude_names)
     for attempt in range(max_attempts):
         time.sleep(settle_seconds)
-        check = build_file_manifest(root_dir, backup_dir)
+        check = build_file_manifest(root_dir, backup_dir, exclude_names)
         if check == manifest:
             log(f"Filesystem settled after {settle_seconds * (attempt + 1)} s")
             return manifest

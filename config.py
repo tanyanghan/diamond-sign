@@ -143,3 +143,19 @@ def get_level_name(minecraft_dir: Path) -> str:
     key isn't set.
     """
     return read_server_properties(minecraft_dir).get("level-name", "world")
+
+
+def backup_exclude_names() -> set:
+    """Basenames to exclude from backups (and the change manifest) in addition
+    to the chain marker, derived from the current environment.
+
+    This is bot infrastructure that lives in the server directory but isn't
+    server data — the Bedrock ``console.log`` the bot tails. Shared by ``bot.py``
+    and ``restore.py`` so both keep the backup zips and the manifest in sync.
+    Assumes ``.env`` is already loaded.
+    """
+    console_log_env = os.environ.get("CONSOLE_LOG", "").strip()
+    if console_log_env:
+        return {Path(console_log_env).name}
+    edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
+    return {"console.log"} if edition == EDITION_BEDROCK else set()
