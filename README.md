@@ -13,7 +13,9 @@ Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITI
 | `bot.py` | Main bot — log watcher, Telegram handlers, stats, orchestration |
 | `config.py` | Central config (`ServerConfig`) and world-layout helpers |
 | `backends/` | Edition backends: `base` (interface), `java` (RCON), `bedrock` (tmux/screen), `mux` (multiplexer detection) |
+| `bedrock_player.py` | Bedrock world-LevelDB access + backup sidecar for per-player restore |
 | `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
+| `requirements-bedrock-restore.txt` | Optional deps for Bedrock per-player restore (amulet-leveldb/amulet-nbt) |
 | `restore.py` | Interactive CLI tool for restoring from backup chains |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for required environment variables |
@@ -130,9 +132,27 @@ If BDS runs in the window named `bedrock` of session `1`, set `MUX_SESSION=1:bed
 
 **Backups.** Instead of Java's `save-off` / `save-all` / `save-on`, the bot uses `save hold` → poll `save query` → `save resume`. `save query` reports each file with the exact number of bytes that belong to the snapshot, and the bot copies each file truncated to that length (BDS keeps appending past the snapshot point). Full and incremental backups and the [restore tool](#restoring-from-backups) work the same as Java otherwise.
 
-**Feature limitations (current).** BDS does not emit death or achievement events, and player data lives in the world LevelDB rather than per-player `.dat` files. So on Bedrock:
-- Join/leave notifications, full + incremental backups, and whole-world restore work.
-- `/deaths`, `/death_summary`, `/achievements`, the `/scan_*` commands, and `/restore_player` reply that they are not available on this edition.
+**Feature limitations (current).** BDS does not emit death or achievement events. So on Bedrock:
+- Join/leave notifications, full + incremental backups, whole-world restore, and per-player restore (see below) work.
+- `/deaths`, `/death_summary`, `/achievements`, and the `/scan_*` commands reply that they are not available on this edition.
+
+### Bedrock per-player restore
+
+`/restore_player` works on Bedrock too, but the mechanics differ from Java because all players live in one world **LevelDB** that BDS keeps locked while running. It needs two extra dependencies and runs a stop→edit→restart cycle.
+
+**Install the LevelDB libraries** (one-time, in the bot's virtualenv). amulet-leveldb has no Linux wheels and its sdist needs Cython 3.0.x:
+```bash
+sudo apt install -y build-essential zlib1g-dev
+pip install --upgrade pip
+printf 'cython>=3.0,<3.1\n' > /tmp/build-constraints.txt
+PIP_BUILD_CONSTRAINT=/tmp/build-constraints.txt pip install -r requirements-bedrock-restore.txt
+```
+The bot lazily imports them — without them, backups and notifications still work; only per-player restore is unavailable.
+
+**How it works.** Each backup embeds a small `_players.json` sidecar (each player's data + their account-stable identity), so a restore reads one zip with no chain reconstruction. To restore, the bot **stops the server** (the only way to write the locked db), overwrites that one player's data, and **relaunches** it via `MUX_START_CMD` — so the server is briefly offline. A pre-restore copy of the player's current data is written to `BACKUP_DIR` as an undo. If the relaunch fails, the bot prints the exact manual start command.
+
+- **`MUX_START_CMD`** — the command to relaunch BDS in the mux window. Defaults to `cd <MINECRAFT_DIR> && ./bedrock_server 2>&1 | tee -a console.log`; override only for non-standard launches.
+- **Name → player mapping.** A player's xuid (from the join log) and their LevelDB identity aren't linked anywhere queryable, so the bot **learns** the binding the first time that player is solo-online during a backup (stored in `bedrock_players.json`). Until a player has been learned, `/restore_player <name>` finds no versions for them — just have them play once.
 
 ## Backups
 
@@ -242,7 +262,7 @@ python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
 
 ### Restoring a single player's data
 
-> **Java servers only.** Bedrock stores player data inside the world LevelDB rather than per-player `.dat` files, so `/restore_player` is not available there and replies that it is unsupported.
+> This section describes the **Java** flow (replace one `<uuid>.dat` live). Bedrock supports `/restore_player` too, but via a stop→edit→restart of the world LevelDB — see [Bedrock per-player restore](#bedrock-per-player-restore).
 
 The admin can roll back one player's `<uuid>.dat` without restoring the whole world via the `/restore_player` Telegram command. The command runs in three enforced steps so a single mistyped message can never trigger a destructive restore:
 
@@ -274,7 +294,7 @@ The player must be offline before the restore proceeds; the command refuses with
 | `/backup` | *(Admin)* Trigger a server backup now |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore a single player's `.dat` file from any backup or live working copy |
 
-On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/achievements`, `/scan_deaths`, `/scan_achievements`) and `/restore_player` are unavailable and reply that they are not supported on this edition.
+On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/achievements`, `/scan_deaths`, `/scan_achievements`) are unavailable and reply that they are not supported on this edition. `/restore_player` works via a different mechanism — see [Bedrock per-player restore](#bedrock-per-player-restore).
 
 ## Runtime state
 
@@ -285,6 +305,8 @@ The bot writes the following at runtime (all excluded from git):
 - `player_achievements.json` — player achievements with timestamps, keyed by UUID
 - `player_deaths.json` — player death history with timestamps, keyed by UUID
 - `backup_manifest.json` — incremental backup state: chain ID, base full backup, and file modification timestamps
+- `bedrock_player_state.json` — *(Bedrock)* per-player data hashes, so incremental sidecars only carry players that changed
+- `bedrock_players.json` — *(Bedrock)* learned xuid → LevelDB-identity bindings for per-player restore
 - `<MINECRAFT_DIR>/.mcnotifier_chain` — chain validity marker written in the server directory
 - `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file is created each time the bot starts
 

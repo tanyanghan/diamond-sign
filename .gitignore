@@ -17,6 +17,8 @@ player_names.json
 player_achievements.json
 player_deaths.json
 backup_manifest.json
+bedrock_player_state.json
+bedrock_players.json
 logs/
 
 # IDE
