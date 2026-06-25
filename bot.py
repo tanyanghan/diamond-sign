@@ -840,6 +840,63 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
     zf.write(fp, rel)
 
 
+# Bedrock per-player restore reads player data from a sidecar embedded in each
+# backup zip (the live LevelDB is locked while the server runs). Dedup state of
+# {player_server_key: sha256} so incrementals only carry players that changed.
+_PLAYER_STATE_PATH = Path(__file__).parent / "bedrock_player_state.json"
+
+
+def _load_player_state() -> dict:
+    try:
+        return json.loads(_PLAYER_STATE_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Failed to read bedrock_player_state.json")
+        return {}
+
+
+def _save_player_state(hashes: dict) -> None:
+    try:
+        _PLAYER_STATE_PATH.write_text(json.dumps(hashes))
+    except Exception:
+        logger.exception("Failed to write bedrock_player_state.json")
+
+
+def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:
+    """Embed the _players.json sidecar into an open Bedrock backup zip.
+
+    No-op for Java or when there's no snapshot file set. Generates the sidecar
+    from the snapshot db files, hash-dedups against the persisted state (full
+    backup = baseline/everyone + reset state; incremental = changed-only), and
+    never fails the backup — if the amulet libs are missing it just logs and
+    skips, so per-player restore is unavailable for that zip but the backup is
+    otherwise complete.
+    """
+    if CONFIG.edition != EDITION_BEDROCK or not ready:
+        return
+    try:
+        import bedrock_player
+    except Exception as e:
+        log(f"Player sidecar skipped (amulet libs unavailable: {e})")
+        return
+    db_files = [(p, n) for (p, n) in ready
+                if "/db/" in str(p).replace("\\", "/")]
+    if not db_files:
+        return
+    try:
+        sidecar = bedrock_player.build_sidecar_from_files(db_files)
+        prev = {} if full_backup else _load_player_state()
+        filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
+        zf.writestr(bedrock_player.SIDECAR_NAME, json.dumps(filtered))
+        _save_player_state(new_hashes)
+        log(f"Player sidecar: {len(filtered['players'])} player(s) "
+            f"({len(new_hashes)} total)")
+    except Exception as e:
+        logger.exception("Player sidecar generation failed")
+        log(f"Player sidecar generation failed: {e}")
+
+
 def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
     """Run a full server backup.
 
@@ -909,6 +966,8 @@ def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
                     fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
                     _add_world_file_to_zip(zf, fp, rel, ready_map)
+            # Bedrock: embed the full player-data sidecar (baseline).
+            _write_player_sidecar(zf, ready, full_backup=True, log=status)
         size_mb = final_path.stat().st_size / (1024 * 1024)
         status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
     finally:
@@ -1444,6 +1503,8 @@ def run_incremental_backup() -> str | None:
                 # incremental's chain membership without external state
                 zf.writestr("_meta.json", json.dumps({
                     "chain_id": chain_id, "base_full": base_full}))
+                # Bedrock: embed the changed-only player-data sidecar.
+                _write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
 
             size_mb = zip_path.stat().st_size / (1024 * 1024)
             logger.info("Incremental backup saved: %s (%.1f MB, %d files)",

@@ -62,7 +62,7 @@ CHAIN_MARKER_NAME = ".mcnotifier_chain"
 #                     backup it builds upon.
 #   _deletions.json:  ["path/to/deleted/file", ...] — files that were deleted
 #                     since the previous backup in the chain.
-META_FILES = {"_deletions.json", "_meta.json"}
+META_FILES = {"_deletions.json", "_meta.json", "_players.json"}
 
 # Regex for full backup filenames: servername_YYYYMMDD_HHMMSS.zip
 # Captures: (1) server name, (2) timestamp

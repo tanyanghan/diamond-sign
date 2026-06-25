@@ -16,6 +16,8 @@ wheels; only the functions that touch the db require them.
 
 import hashlib
 import json
+import shutil
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -137,6 +139,45 @@ def build_player_sidecar(db) -> dict:
                     for k, v in players.items()},
         "mappings": read_identity_map(db),
     }
+
+
+def build_sidecar_from_files(db_files) -> dict:
+    """Build the sidecar from a save-query file set.
+
+    ``db_files`` is an iterable of ``(abs_path, max_bytes)`` for the world db
+    files (the live db is locked, so we copy each truncated to its snapshot
+    length into a temp dir — a consistent, openable db — then read it).
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="mcn_sidecar_"))
+    try:
+        for path, max_bytes in db_files:
+            with open(path, "rb") as src:
+                (tmp / Path(path).name).write_bytes(src.read(max_bytes))
+        db = open_db(tmp)
+        try:
+            return build_player_sidecar(db)
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def filter_sidecar_changed(sidecar: dict, prev_hashes: dict) -> tuple:
+    """Return ``(filtered_sidecar, new_hashes)``.
+
+    ``filtered_sidecar`` keeps only players whose value hash differs from
+    ``prev_hashes`` (pass ``{}`` to keep everyone, e.g. for a full backup), plus
+    the mapping entries pointing at the kept players. ``new_hashes`` is the
+    complete current ``{server_key: sha256}`` for the caller to persist as the
+    new dedup state.
+    """
+    players = sidecar.get("players", {})
+    mappings = sidecar.get("mappings", {})
+    new_hashes = {k: e["sha256"] for k, e in players.items()}
+    changed = {k: e for k, e in players.items()
+               if prev_hashes.get(k) != e["sha256"]}
+    filt_maps = {ident: sk for ident, sk in mappings.items() if sk in changed}
+    return {"players": changed, "mappings": filt_maps}, new_hashes
 
 
 def read_sidecar(zip_path) -> dict:
