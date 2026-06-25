@@ -111,3 +111,18 @@ class ServerBackend(ABC):
     # implementation lives in ``bot.py`` because it is tightly coupled to the
     # backup manifest/chain state; Bedrock simply omits the capability. The
     # backend's role there is limited to the save dance and ``is_player_online``.
+
+    # --- server lifecycle (Bedrock per-player restore: stop -> edit -> start) ---
+    # Java doesn't need these (RCON edits live), so they default to NotSupported
+    # and only the Bedrock backend overrides them.
+    def stop_server(self, log_fn=None) -> bool:
+        """Stop the server and return once it has shut down."""
+        raise NotSupported("stop_server")
+
+    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
+        """Wait until the world db is no longer locked by the server."""
+        raise NotSupported("wait_for_db_unlock")
+
+    def relaunch(self, log_fn=None) -> bool:
+        """Relaunch the server and return once it reports ready."""
+        raise NotSupported("relaunch")

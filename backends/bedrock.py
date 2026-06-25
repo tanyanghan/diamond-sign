@@ -22,6 +22,7 @@ import time
 
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE,
+    CAP_PLAYER_RESTORE,
 )
 from .mux import detect
 
@@ -41,7 +42,7 @@ def _strip_prefix(line: str) -> str:
 
 
 class BedrockBackend(ServerBackend):
-    CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE}
+    CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, CAP_PLAYER_RESTORE}
 
     def __init__(self, config):
         super().__init__(config)
@@ -149,6 +150,48 @@ class BedrockBackend(ServerBackend):
             log("Save resumed")
         else:
             log("Warning: 'save resume' not confirmed after retries")
+
+    # --- server lifecycle (per-player restore: stop -> edit db -> relaunch) ---
+    def stop_server(self, log_fn=None) -> bool:
+        """Request a stop and confirm BDS acknowledged it. Actual shutdown (lock
+        release) is confirmed separately by wait_for_db_unlock()."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+        ok = self._send_confirmed("stop", "Server stop requested", retries=3, log=log)
+        log("Stop requested" if ok else "Warning: 'stop' not confirmed")
+        return ok
+
+    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
+        """Poll until the world db LevelDB lock is released (server fully down)."""
+        import bedrock_player
+        db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not bedrock_player.is_db_locked(db_path):
+                return True
+            time.sleep(1)
+        return False
+
+    def relaunch(self, log_fn=None) -> bool:
+        """Send MUX_START_CMD to the mux window and wait for 'Server started'."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+        cmd = self.config.mux_start_cmd
+        if not cmd:
+            log("No MUX_START_CMD configured; cannot relaunch the server")
+            return False
+        for attempt in range(1, 4):
+            waiter = self._watcher.expect_line("Server started")
+            self.send_command(cmd)
+            if waiter.wait(timeout=120):
+                log("Server relaunched")
+                return True
+            self._watcher.cancel(waiter)
+            if attempt < 3:
+                log(f"Relaunch not confirmed (attempt {attempt}/3), retrying")
+        return False
 
     # --- server-side queries ---
     def query_online_players(self) -> list[str]:

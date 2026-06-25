@@ -37,11 +37,35 @@ def _leveldb():
     return leveldb
 
 
-def open_db(db_path, writable: bool = False):
-    """Open a Bedrock world LevelDB. Raises if another process holds the lock
-    (i.e. the server is still running) when writable."""
+def world_db_path(minecraft_dir) -> Path:
+    """The Bedrock world LevelDB directory: ``<dir>/worlds/<level-name>/db``."""
+    from config import get_level_name
+    return Path(minecraft_dir) / "worlds" / get_level_name(minecraft_dir) / "db"
+
+
+def is_db_locked(db_path) -> bool:
+    """True if the world db is locked (server running) or absent. An open
+    succeeds only when the lock is free; we close immediately. Guard on the
+    CURRENT file first — a valid LevelDB always has one, and it stops
+    amulet-leveldb from creating an empty db at a missing/wrong path."""
+    if not (Path(db_path) / "CURRENT").exists():
+        return True
+    try:
+        db = open_db(db_path)
+        db.close()
+        return False
+    except Exception:
+        return True
+
+
+def open_db(db_path, create: bool = False):
+    """Open a Bedrock world LevelDB (always read-write — amulet-leveldb has no
+    read-only mode, so it acquires the LOCK and raises if another process, i.e.
+    the running server, holds it). ``create`` only controls create-if-missing;
+    callers operate on backups/copies or the stopped live db, so it stays False.
+    """
     leveldb = _leveldb()
-    return leveldb.LevelDB(str(db_path), bool(writable))
+    return leveldb.LevelDB(str(db_path), bool(create))
 
 
 def value_hash(value: bytes) -> str:
@@ -99,8 +123,8 @@ def lookup_server_key(db, identity_uuid: str) -> str | None:
 
 
 def write_player_value(db_path, key: str, value: bytes) -> None:
-    """Overwrite one player's value in a writable (server-stopped) db."""
-    db = open_db(db_path, writable=True)
+    """Overwrite one player's value in the (server-stopped) live db."""
+    db = open_db(db_path)
     try:
         db.put(key.encode("latin1"), value)
     finally:
@@ -109,8 +133,8 @@ def write_player_value(db_path, key: str, value: bytes) -> None:
 
 def backup_player_value(db_path, key: str, dest: Path) -> bytes | None:
     """Save the current value of ``key`` to ``dest`` (undo blob). Returns the
-    bytes, or None if the key is absent. Opens read-only."""
-    db = open_db(db_path, writable=False)
+    bytes, or None if the key is absent."""
+    db = open_db(db_path)
     try:
         cur = db.get(key.encode("latin1"))
     finally:

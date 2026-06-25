@@ -11,6 +11,7 @@ here avoids a circular import between ``bot.py`` and ``backends``.
 """
 
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +45,9 @@ class ServerConfig:
     # Bedrock (terminal multiplexer) transport
     console_log: Path | None = None
     mux_session: str = ""
+    # Command sent to the mux window to relaunch BDS after a player restore's
+    # stop->edit->restart. Derived from minecraft_dir if not set explicitly.
+    mux_start_cmd: str = ""
 
     # Backup behaviour (edition-agnostic)
     incremental_enabled: bool = False
@@ -87,6 +91,15 @@ def load_config() -> ServerConfig:
     console_log = Path(os.path.expanduser(console_log_env)) if console_log_env \
         else (mc_dir / "console.log" if edition == EDITION_BEDROCK else None)
 
+    # Relaunch command for the mux window. Default mirrors the documented launch
+    # (`./bedrock_server 2>&1 | tee -a console.log` from the server dir); override
+    # with MUX_START_CMD for non-standard setups.
+    mux_start_cmd = os.environ.get("MUX_START_CMD", "").strip()
+    if not mux_start_cmd and edition == EDITION_BEDROCK:
+        log_target = console_log if console_log else (mc_dir / "console.log")
+        mux_start_cmd = (f"cd {shlex.quote(mc_dir.as_posix())} && "
+                         f"./bedrock_server 2>&1 | tee -a {shlex.quote(log_target.as_posix())}")
+
     return ServerConfig(
         bot_token=bot_token,
         edition=edition,
@@ -97,6 +110,7 @@ def load_config() -> ServerConfig:
         rcon_password=os.environ.get("RCON_PASSWORD", ""),
         console_log=console_log,
         mux_session=os.environ.get("MUX_SESSION", "").strip(),
+        mux_start_cmd=mux_start_cmd,
         incremental_enabled=_env_bool("INCREMENTAL_BACKUP_ENABLED"),
         incremental_interval_minutes=int(
             os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15")),
