@@ -3,3 +3,7 @@ python-dotenv
 pyTelegramBotAPI
 mcrcon
 windows-curses; sys_platform == "win32"
+# Bedrock per-player restore only: world LevelDB access + little-endian NBT.
+# Lazily imported, so the bot runs without them (the feature is just unavailable).
+amulet-leveldb
+amulet-nbt
