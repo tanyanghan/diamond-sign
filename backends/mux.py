@@ -13,8 +13,17 @@ server's stdout, which the caller tails from console.log.
 import logging
 import re
 import subprocess
+import threading
+import time
 
 logger = logging.getLogger("mcnotifier")
+
+# Serialise all injections process-wide: two senders interleaving keystrokes into
+# the same pane is what corrupted "save hold" into "ave" in the wild. A short
+# settle after each line keeps the server's stdin reader from coalescing rapid
+# back-to-back commands.
+_send_lock = threading.Lock()
+_SETTLE_SECONDS = 0.3
 
 
 class ConsoleMultiplexer:
@@ -67,9 +76,14 @@ class TmuxMux(ConsoleMultiplexer):
         return cls(sessions[0])
 
     def send(self, cmd: str) -> None:
-        # `--` stops option parsing so a command starting with '-' is safe.
-        # cmd and "Enter" are separate args so the line is submitted.
-        _run(["tmux", "send-keys", "-t", self.target, "--", cmd, "Enter"])
+        # `-l` sends the command as a LITERAL string so tmux never interprets a
+        # word as a key name (and never coalesces/escapes characters). Enter is
+        # sent as a separate keystroke. Both are serialised + settled so two
+        # commands can't interleave in the pane.
+        with _send_lock:
+            _run(["tmux", "send-keys", "-t", self.target, "-l", "--", cmd])
+            _run(["tmux", "send-keys", "-t", self.target, "Enter"])
+            time.sleep(_SETTLE_SECONDS)
 
 
 # screen -ls lines look like: "\t12345.mc\t(Detached)"
@@ -106,8 +120,11 @@ class ScreenMux(ConsoleMultiplexer):
     def send(self, cmd: str) -> None:
         # `stuff` injects literal text; the trailing newline submits the line.
         # `-p <window>` selects which window of the session receives it.
-        _run(["screen", "-S", self.target, "-p", self.window,
-              "-X", "stuff", cmd + "\n"])
+        # Serialised + settled so commands can't interleave in the window.
+        with _send_lock:
+            _run(["screen", "-S", self.target, "-p", self.window,
+                  "-X", "stuff", cmd + "\n"])
+            time.sleep(_SETTLE_SECONDS)
 
 
 def detect(session: str = "") -> ConsoleMultiplexer | None:

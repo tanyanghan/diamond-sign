@@ -454,6 +454,10 @@ class LogLineWaiter:
         """Block until the phrase is seen or timeout. Returns True if found."""
         return self._event.wait(timeout)
 
+    def triggered(self) -> bool:
+        """Whether the phrase has been seen (non-blocking)."""
+        return self._event.is_set()
+
 
 class LogWatcher(FileSystemEventHandler):
     """Watches the Minecraft server's latest.log for player events and
@@ -515,6 +519,13 @@ class LogWatcher(FileSystemEventHandler):
         with self._waiters_lock:
             self._waiters.append(waiter)
         return waiter
+
+    def cancel(self, waiter: LogLineWaiter) -> None:
+        """Deregister a waiter that never fired (e.g. an error-line watcher that
+        wasn't triggered), so it doesn't linger in the waiters list."""
+        with self._waiters_lock:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
 
     def _check_waiters(self, line: str) -> None:
         """Check a log line against all registered waiters."""
