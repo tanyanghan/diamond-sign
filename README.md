@@ -57,7 +57,9 @@ The bot will now send join/leave notifications to all authorised chats and respo
 
 ## RCON setup
 
-The backup feature and any future server commands require RCON to be enabled on the Minecraft server.
+> **Java servers only.** Bedrock has no RCON — it uses tmux/screen command injection instead (see [Bedrock servers](#bedrock-servers)). Skip this section for Bedrock.
+
+On Java, the backup feature and `/list` require RCON to be enabled on the Minecraft server.
 
 1. Edit `server.properties` and set:
    ```
@@ -136,7 +138,7 @@ If BDS runs in the window named `bedrock` of session `1`, set `MUX_SESSION=1:bed
 
 The bot performs automated full backups of the entire Minecraft server directory on a configurable schedule (daily, weekly, or monthly).
 
-**How it works:**
+**How it works (Java):**
 
 1. Sends `save-off` via RCON to disable auto-save.
 2. Sends `save-all` to flush world data from memory to disk.
@@ -148,11 +150,13 @@ The bot performs automated full backups of the entire Minecraft server directory
 
 Players do not need to be kicked — the save-off/save-all/save-on sequence ensures a consistent snapshot while the server stays online.
 
+On **Bedrock** the freeze sequence is `save hold` → `save query` → `save resume` with snapshot-truncated copies (see [Bedrock servers](#bedrock-servers)); everything else (scheduling, chains, off-server copy, restore) is identical. Bot infrastructure that lives in the server directory is excluded from every zip: the `.mcnotifier_chain` marker (both editions) and the Bedrock `console.log` the bot tails. Unix file permissions (e.g. the executable bit on the Bedrock server binary) are preserved through backup and restore.
+
 **Configuration:**
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RCON_PASSWORD` | Must match `server.properties` `rcon.password` | *(required for backup)* |
+| `RCON_PASSWORD` | **Java only.** Must match `server.properties` `rcon.password` | *(required for Java backup)* |
 | `BACKUP_SCHEDULE` | How often to run full backups: `daily`, `weekly` (Monday), or `monthly` (1st) | `daily` |
 | `BACKUP_HOUR` | Hour of day (0–23) for the scheduled backup | `4` |
 | `BACKUP_DIR` | Directory where backup zips are saved | `~/minecraft_backup` |
@@ -184,9 +188,9 @@ When enabled, the bot performs incremental backups while players are active. Onl
 1. When the first player joins, the incremental backup cycle starts.
 2. Every `INCREMENTAL_INTERVAL_MINUTES` minutes, the bot:
    - Compares file modification timestamps against a stored manifest.
-   - If changes are detected, runs save-off / save-all via RCON, then waits for the filesystem to settle (no file changes for 5 seconds).
+   - If changes are detected, freezes the world (Java: save-off / save-all; Bedrock: save hold / query), then waits for the filesystem to settle (no file changes for 5 seconds).
    - Creates a zip containing only changed/added files, plus `_deletions.json` for removed files.
-   - Runs save-on to re-enable auto-save.
+   - Resumes saving (Java: save-on; Bedrock: save resume).
 3. When the last player leaves, one final incremental backup runs and the cycle stops.
 4. After a full backup, the manifest resets so the next incremental only captures changes since the full backup.
 
@@ -238,6 +242,8 @@ python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
 
 ### Restoring a single player's data
 
+> **Java servers only.** Bedrock stores player data inside the world LevelDB rather than per-player `.dat` files, so `/restore_player` is not available there and replies that it is unsupported.
+
 The admin can roll back one player's `<uuid>.dat` without restoring the whole world via the `/restore_player` Telegram command. The command runs in three enforced steps so a single mistyped message can never trigger a destructive restore:
 
 1. `/restore_player <username>` — bot replies with a numbered, latest-first list of every available `.dat` version it can find for that player. Sources include the live player-data folder (`<uuid>.dat`, `<uuid>.dat_old`, `<uuid>.dat_old.gz`, plus any prior `pre-restore` safety copies) and every backup zip in the active chain that contains the player's `.dat`. Both the pre-26.1 layout (`<world>/playerdata/`) and the 26.1+ layout (`<world>/players/data/`) are supported, so old backups created before the upgrade are still usable.
@@ -267,6 +273,8 @@ The player must be offline before the restore proceeds; the command refuses with
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
 | `/backup` | *(Admin)* Trigger a server backup now |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore a single player's `.dat` file from any backup or live working copy |
+
+On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/achievements`, `/scan_deaths`, `/scan_achievements`) and `/restore_player` are unavailable and reply that they are not supported on this edition.
 
 ## Runtime state
 
