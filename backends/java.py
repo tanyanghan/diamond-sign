@@ -7,12 +7,19 @@ code path (``rcon_command``, the save-off/save-all/save-on dance,
 relocated unchanged.
 """
 
+import gzip
 import logging
+import os
 import re
+import shutil
+import zipfile
+from datetime import datetime
+from pathlib import Path
 
 from mcrcon import MCRcon
 
-from config import read_server_properties
+from backup_utils import RE_FULL, RE_INCR, wait_for_settle
+from config import read_server_properties, get_level_name, backup_exclude_names
 from .base import (
     ServerBackend, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
     CAP_PLAYER_RESTORE,
@@ -139,3 +146,167 @@ class JavaBackend(ServerBackend):
     def is_player_online(self, username: str) -> bool:
         target = username.lower()
         return any(n.lower() == target for n in self.query_online_players())
+
+    # --- per-player restore (replace one <uuid>.dat, live, player offline) ---
+    # Player-data lives under the active world (named by `level-name`):
+    #   - Old layout (<= 1.21): <world>/playerdata/<uuid>.dat
+    #   - New layout (>= 26.1): <world>/players/data/<uuid>.dat
+    def _live_playerdata_dir(self) -> Path:
+        world = self.config.minecraft_dir / get_level_name(self.config.minecraft_dir)
+        new_path = world / "players" / "data"
+        old_path = world / "playerdata"
+        if new_path.is_dir():
+            return new_path
+        if old_path.is_dir():
+            return old_path
+        return new_path  # default to new layout when neither exists yet
+
+    def list_player_versions(self, player_id: str, chain: tuple) -> list:
+        """Historical copies of a player's .dat, newest first: live working
+        files, pre-restore safety copies, and every backup zip that contains
+        the entry. ``chain`` is ``(chain_id, base_full)``."""
+        uuid = player_id
+        chain_id, base_full = chain
+        versions = []
+        level_name = get_level_name(self.config.minecraft_dir)
+        candidate_entries = (
+            f"{level_name}/players/data/{uuid}.dat",   # new (26.1+)
+            f"{level_name}/playerdata/{uuid}.dat",     # old (<= 1.21)
+        )
+        playerdata_dir = self._live_playerdata_dir()
+
+        # 1. Live files (.dat, .dat_old, .dat_old.gz) — independently dated.
+        for suffix, kind, label in (
+            (".dat", "live", "live .dat"),
+            (".dat_old", "live", "live .dat_old"),
+            (".dat_old.gz", "live_gz", "live .dat_old.gz"),
+        ):
+            p = playerdata_dir / f"{uuid}{suffix}"
+            if p.exists():
+                mtime = p.stat().st_mtime
+                versions.append({
+                    "timestamp": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "sort_key": mtime, "source": label,
+                    "kind": kind, "path": p, "entry": None,
+                })
+
+        # 1b. Pre-restore safety copies left by previous restores. The timestamp
+        # in the filename is the authoritative save time.
+        if playerdata_dir.exists():
+            for p in playerdata_dir.glob(f"{uuid}.dat.pre-restore-*"):
+                suffix = p.name[len(f"{uuid}.dat.pre-restore-"):]
+                try:
+                    ts_dt = datetime.strptime(suffix, "%Y%m%d_%H%M%S")
+                except ValueError:
+                    continue
+                versions.append({
+                    "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "sort_key": ts_dt.timestamp(), "source": "pre-restore backup",
+                    "kind": "live", "path": p, "entry": None,
+                })
+
+        # 2 + 3. All backup zips — current and previous chains.
+        if self.config.backup_dir.exists():
+            for f in self.config.backup_dir.iterdir():
+                if not f.is_file() or f.suffix != ".zip":
+                    continue
+                ts_str = label = None
+                m_incr = RE_INCR.match(f.name)
+                if m_incr:
+                    ts_str = m_incr.group(3)
+                    cur = chain_id and m_incr.group(2) == chain_id
+                    label = "incremental backup" if cur else "incremental backup (old chain)"
+                else:
+                    m_full = RE_FULL.match(f.name)
+                    if m_full:
+                        ts_str = m_full.group(2)
+                        cur = chain_id and f.name == base_full
+                        label = "full backup" if cur else "full backup (old chain)"
+                if ts_str is None:
+                    continue
+                try:
+                    with zipfile.ZipFile(f, "r") as zf:
+                        names = zf.namelist()
+                    found_entry = next(
+                        (e for e in candidate_entries if e in names), None)
+                    if found_entry is None:
+                        continue
+                except (zipfile.BadZipFile, OSError):
+                    logger.warning("Skipping unreadable backup zip: %s", f.name)
+                    continue
+                try:
+                    ts_dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                except ValueError:
+                    continue
+                versions.append({
+                    "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "sort_key": ts_dt.timestamp(), "source": label,
+                    "kind": "zip", "path": f, "entry": found_entry,
+                })
+
+        versions.sort(key=lambda v: v["sort_key"], reverse=True)
+        return versions
+
+    def restore_player(self, username: str, player_id: str, version: dict,
+                       status_cb=None) -> None:
+        """Atomically replace <uuid>.dat with the chosen version, keeping the
+        current file as a pre-restore safety copy. Assumes the backup mutex is
+        held by the caller; the save-off/save-all/save-on dance freezes writes."""
+        uuid = player_id
+
+        def status(msg):
+            logger.info("RestorePlayer: %s", msg)
+            if status_cb:
+                status_cb(msg)
+
+        save_started = False
+        try:
+            try:
+                if self.is_player_online(username):
+                    status(f"Player {username} is online — log them out first.")
+                    return
+                status(f"{username} is offline")
+            except Exception as e:
+                status(f"Online check failed: {e}")
+                return
+
+            self.begin_save(status)
+            save_started = True
+            wait_for_settle(self.config.minecraft_dir, self.config.backup_dir,
+                            log_fn=status, exclude_names=backup_exclude_names())
+
+            target = self._live_playerdata_dir() / f"{uuid}.dat"
+            source_bytes = _read_player_data_bytes(version)
+            if target.exists():
+                ts_label = datetime.fromtimestamp(
+                    target.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+                backup_path = target.with_name(f"{uuid}.dat.pre-restore-{ts_label}")
+                shutil.copy2(target, backup_path)
+                status(f"Saved current .dat as {backup_path.name}")
+
+            tmp = target.with_name(f"{uuid}.dat.tmp")
+            tmp.write_bytes(source_bytes)
+            os.replace(tmp, target)
+            status(f"Restored {username}.dat from {version['source']} "
+                   f"({version['timestamp']})")
+        except Exception as e:
+            logger.exception("RestorePlayer failed")
+            status(f"Restore failed: {e}")
+        finally:
+            if save_started:
+                try:
+                    self.end_save(status)
+                except Exception:
+                    logger.exception("Failed to re-enable auto-save")
+
+
+def _read_player_data_bytes(version: dict) -> bytes:
+    """Raw .dat bytes from a version entry, gunzipping a .dat_old.gz source."""
+    kind = version["kind"]
+    if kind == "zip":
+        with zipfile.ZipFile(version["path"], "r") as zf:
+            return zf.read(version["entry"])
+    if kind == "live_gz":
+        with gzip.open(version["path"], "rb") as f:
+            return f.read()
+    return version["path"].read_bytes()

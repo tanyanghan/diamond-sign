@@ -16,15 +16,41 @@ versions. The parsing here is best-effort and tolerant; verify against the
 target server's actual output (see the design doc's open questions).
 """
 
+import json
 import logging
 import re
 import time
+from datetime import datetime
+from pathlib import Path
 
+from backup_utils import RE_FULL, RE_INCR
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE,
     CAP_PLAYER_RESTORE,
 )
 from .mux import detect
+
+# Learned, account-stable xuid -> {name, identities:[MsaId, SelfSignedId]}.
+# The data key is per-server random, but identities are stable, so we resolve a
+# player by trying their identities against each backup's sidecar mappings.
+_PLAYERS_PATH = Path(__file__).resolve().parent.parent / "bedrock_players.json"
+
+
+def _load_players() -> dict:
+    try:
+        return json.loads(_PLAYERS_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logging.getLogger("mcnotifier").exception("Failed to read bedrock_players.json")
+        return {}
+
+
+def _save_players(data: dict) -> None:
+    try:
+        _PLAYERS_PATH.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logging.getLogger("mcnotifier").exception("Failed to write bedrock_players.json")
 
 logger = logging.getLogger("mcnotifier")
 
@@ -202,6 +228,148 @@ class BedrockBackend(ServerBackend):
     def is_player_online(self, username: str) -> bool:
         target = username.lower()
         return any(n.lower() == target for n in self.query_online_players())
+
+    # --- per-player restore (stop -> edit world LevelDB -> relaunch) ---
+    def learn_player(self, name: str, xuid: str, idents: list) -> bool:
+        """Persist a learned xuid -> identities binding (account-stable). Returns
+        True if newly learned/changed."""
+        players = _load_players()
+        if players.get(xuid, {}).get("identities") == idents:
+            return False
+        players[xuid] = {"name": name, "identities": idents}
+        _save_players(players)
+        return True
+
+    def player_identities(self, xuid: str) -> list:
+        return _load_players().get(xuid, {}).get("identities", [])
+
+    def list_player_versions(self, player_id: str, chain: tuple) -> list:
+        """Restore points for a player from each backup zip's sidecar (deduped
+        by construction — a player only appears in zips where they changed)."""
+        idents = self.player_identities(player_id)
+        if not idents:
+            return []
+        try:
+            import bedrock_player
+        except Exception:
+            return []
+        chain_id, base_full = chain
+        versions = []
+        if not self.config.backup_dir.exists():
+            return []
+        for f in self.config.backup_dir.iterdir():
+            if not f.is_file() or f.suffix != ".zip":
+                continue
+            ts_str = label = None
+            m_incr = RE_INCR.match(f.name)
+            if m_incr:
+                ts_str = m_incr.group(3)
+                cur = chain_id and m_incr.group(2) == chain_id
+                label = "incremental backup" if cur else "incremental backup (old chain)"
+            else:
+                m_full = RE_FULL.match(f.name)
+                if m_full:
+                    ts_str = m_full.group(2)
+                    cur = chain_id and f.name == base_full
+                    label = "full backup" if cur else "full backup (old chain)"
+            if ts_str is None:
+                continue
+            sidecar = bedrock_player.read_sidecar(f)
+            if not any(bedrock_player.resolve_from_sidecar(sidecar, i) for i in idents):
+                continue
+            try:
+                ts_dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            versions.append({
+                "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "sort_key": ts_dt.timestamp(), "source": label,
+                "path": f, "idents": idents,
+            })
+        versions.sort(key=lambda v: v["sort_key"], reverse=True)
+        return versions
+
+    def restore_player(self, username: str, player_id: str, version: dict,
+                       status_cb=None) -> None:
+        """Stop the server, overwrite the player's value in the world LevelDB
+        from the chosen backup, relaunch. Fail-safe: everything that can fail is
+        done before the stop, and a relaunch failure alerts loudly."""
+        import bedrock_player
+
+        def status(msg):
+            logger.info("RestorePlayer(BR): %s", msg)
+            if status_cb:
+                status_cb(msg)
+
+        idents = version["idents"]
+        stopped = db_unlocked = False
+        try:
+            # 1. Read the historical value (server untouched if this fails).
+            sidecar = bedrock_player.read_sidecar(version["path"])
+            resolved = None
+            for ident in idents:
+                resolved = bedrock_player.resolve_from_sidecar(sidecar, ident)
+                if resolved:
+                    break
+            if not resolved:
+                status("Could not read player data from the selected backup.")
+                return
+            backup_key, value = resolved
+
+            # 2. Player must be offline (server still up).
+            try:
+                if self.is_player_online(username):
+                    status(f"{username} is online — log them out first.")
+                    return
+                status(f"{username} is offline")
+            except Exception as e:
+                status(f"Online check failed: {e}")
+                return
+
+            # 3. Stop the server and wait for the db lock to release.
+            status("Stopping server...")
+            self.stop_server(status)
+            stopped = True
+            if not self.wait_for_db_unlock(timeout=120):
+                status("⚠️ Server did not release the world db in time. "
+                       "Aborting; check the server manually.")
+                return
+            db_unlocked = True
+            status("Server stopped; world db unlocked")
+
+            # 4. Resolve the live data key (per-server), back it up, overwrite.
+            db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
+            live_key = None
+            db = bedrock_player.open_db(db_path)
+            try:
+                for ident in idents:
+                    live_key = bedrock_player.lookup_server_key(db, ident)
+                    if live_key:
+                        break
+            finally:
+                db.close()
+            live_key = live_key or backup_key
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            undo = self.config.backup_dir / f"{live_key}.pre-restore-{ts}.nbt"
+            bedrock_player.backup_player_value(db_path, live_key, undo)
+            status(f"Saved current data as {undo.name}")
+            bedrock_player.write_player_value(db_path, live_key, value)
+            status(f"Restored {username} to {version['timestamp']} "
+                   f"({len(value)} bytes)")
+        except Exception as e:
+            logger.exception("Bedrock player restore failed")
+            status(f"Restore failed: {e}")
+        finally:
+            if db_unlocked:
+                status("Relaunching server...")
+                if self.relaunch(status):
+                    status("✅ Server is back up.")
+                else:
+                    status("⚠️ Server FAILED to relaunch — start it "
+                           f"manually:\n  {self.config.mux_start_cmd}")
+            elif stopped:
+                status("⚠️ Sent stop but couldn't confirm shutdown — NOT "
+                       "relaunching (avoids a double start). Check the server.")
 
     # --- console.log parsing helpers ---
     def _tail(self, max_bytes: int = 65536) -> list[str]:
