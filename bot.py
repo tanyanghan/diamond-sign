@@ -816,8 +816,13 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
     """
     if ready_map is not None:
         if rel in ready_map:
+            # Truncate to the snapshot length. Build the entry from the file so
+            # its mode/mtime are preserved (writestr with a bare name drops the
+            # Unix mode, which restore needs e.g. for executables).
+            zi = zipfile.ZipInfo.from_file(fp, rel)
+            zi.compress_type = zipfile.ZIP_DEFLATED
             with open(fp, "rb") as src:
-                zf.writestr(rel, src.read(ready_map[rel]))
+                zf.writestr(zi, src.read(ready_map[rel]))
             return
         if "/db/" in rel:
             return

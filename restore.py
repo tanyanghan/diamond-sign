@@ -54,6 +54,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import zipfile
@@ -74,6 +75,21 @@ load_dotenv(Path(__file__).parent / ".env")
 def parse_timestamp(ts: str) -> str:
     """Format '20260401_040000' as '2026-04-01 04:00:00'."""
     return f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+
+
+def _apply_zip_mode(info: zipfile.ZipInfo, path: Path) -> None:
+    """Reapply the Unix mode stored in a zip entry to the extracted file.
+
+    Python's zipfile records the source file's mode in external_attr on write
+    but does NOT restore it on extract, so executables (e.g. the Bedrock
+    ``bedrock_server`` binary) come out non-executable. Reapply it here.
+    """
+    mode = info.external_attr >> 16
+    if mode:
+        try:
+            os.chmod(path, stat.S_IMODE(mode))
+        except OSError:
+            pass
 
 
 def scan_backups(backup_dir: Path) -> tuple:
@@ -492,10 +508,14 @@ def restore(chains: list, chain_idx: int, point_idx: int,
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Extract the full backup as the base state
+    # Step 1: Extract the full backup as the base state. Extract per-member so
+    # the stored Unix mode can be reapplied (extractall drops it, which would
+    # leave the Bedrock server binary non-executable).
     print(f"Extracting full backup: {full_zip.name} ...")
     with zipfile.ZipFile(full_zip, "r") as zf:
-        zf.extractall(target_dir)
+        for info in zf.infolist():
+            extracted = zf.extract(info, target_dir)
+            _apply_zip_mode(info, Path(extracted))
     print(f"  Full backup extracted.")
 
     # Determine whether this is an in-place restore (overwriting the live
@@ -533,11 +553,13 @@ def restore(chains: list, chain_idx: int, point_idx: int,
                 for name in zf.namelist():
                     if name in META_FILES:
                         continue
+                    info = zf.getinfo(name)
                     for dest_root in dest_roots:
                         dest = dest_root / name
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         with zf.open(name) as src, open(dest, "wb") as dst:
                             shutil.copyfileobj(src, dst)
+                        _apply_zip_mode(info, dest)
                     if tmp is not None:
                         re_added.add(name)
                     file_count += 1
