@@ -56,7 +56,14 @@ class TmuxMux(ConsoleMultiplexer):
         if not sessions:
             return None
         if session:
-            return cls(session) if session in sessions else None
+            # ``session`` may be a full send-keys target: "name",
+            # "name:window", or "name:window.pane". Only the part before the
+            # first ':' is the session name to verify; the whole string is kept
+            # as the target so a specific window/pane can be pinned. Pinning the
+            # window matters with byobu grouped sessions, where the active-window
+            # pointer is shared and unreliable.
+            name = session.split(":", 1)[0]
+            return cls(session) if name in sessions else None
         return cls(sessions[0])
 
     def send(self, cmd: str) -> None:
@@ -72,6 +79,10 @@ _RE_SCREEN = re.compile(r'^\s*(\d+\.\S+)', re.MULTILINE)
 class ScreenMux(ConsoleMultiplexer):
     name = "screen"
 
+    def __init__(self, target: str, window: str = "0"):
+        super().__init__(target)
+        self.window = window
+
     @classmethod
     def detect(cls, session: str = "") -> "ScreenMux | None":
         # `screen -ls` exits non-zero even when sessions exist, so parse stdout.
@@ -82,16 +93,21 @@ class ScreenMux(ConsoleMultiplexer):
         if not entries:
             return None
         if session:
-            # Accept either the bare session name or the full "pid.name" form.
+            # ``session`` may be "name" or "name:window"; the window (a screen
+            # window number) pins which window receives commands.
+            name, _, window = session.partition(":")
+            window = window or "0"
             for e in entries:
-                if e == session or e.split(".", 1)[-1] == session:
-                    return cls(e)
+                if e == name or e.split(".", 1)[-1] == name:
+                    return cls(e, window)
             return None
         return cls(entries[0])
 
     def send(self, cmd: str) -> None:
         # `stuff` injects literal text; the trailing newline submits the line.
-        _run(["screen", "-S", self.target, "-p", "0", "-X", "stuff", cmd + "\n"])
+        # `-p <window>` selects which window of the session receives it.
+        _run(["screen", "-S", self.target, "-p", self.window,
+              "-X", "stuff", cmd + "\n"])
 
 
 def detect(session: str = "") -> ConsoleMultiplexer | None:
