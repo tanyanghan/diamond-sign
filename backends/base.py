@@ -25,6 +25,7 @@ EVENT_ACHIEVEMENT = "achievement"
 
 # Non-event capabilities.
 CAP_PLAYER_RESTORE = "player_restore"
+CAP_STATS = "stats"  # backend can answer /stats and /playtime
 
 
 class BackendUnavailable(Exception):
@@ -160,3 +161,37 @@ class ServerBackend(ABC):
     def learn_player(self, name: str, player_id: str, idents: list) -> bool:
         """Persist a learned identity binding (Bedrock only; no-op elsewhere)."""
         return False
+
+    # --- player-name registry (the bot's `names` dict is sourced from here) ---
+    # Java keeps player_names.json keyed by UUID; Bedrock projects names from its
+    # richer bedrock_players.json keyed by xuid. Either way bot.py just sees a
+    # {player_id: name} dict.
+    @abstractmethod
+    def load_names(self) -> dict:
+        """Return the {player_id: name} registry from disk."""
+
+    @abstractmethod
+    def register_name(self, player_id: str, name: str) -> bool:
+        """Persist player_id -> name. Returns True if it created/changed an entry
+        (used only for logging — Bedrock may still touch last_seen and return
+        False)."""
+
+    # --- stats (gated by CAP_STATS) ---
+    def list_known_players(self, names: dict) -> list:
+        """Player names for /list. Default: the registry's names."""
+        return sorted(set(names.values()))
+
+    def player_stats(self, names: dict) -> list:
+        """Per-player stat dicts for /stats and /playtime. Each has at least
+        ``name`` and ``time_played_hours``; richer editions add more fields."""
+        raise NotSupported("player_stats")
+
+    # --- online-time tracking (Bedrock only; no-op default) ---
+    def record_player_session(self, event_type: str, player_id: str) -> None:
+        """Accumulate connected time from a join/leave event."""
+
+    def reset_open_sessions(self) -> None:
+        """Clear sessions left open by a crash (called at startup)."""
+
+    def close_open_sessions(self) -> None:
+        """Flush any open sessions (called on graceful shutdown)."""

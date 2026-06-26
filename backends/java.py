@@ -8,10 +8,12 @@ relocated unchanged.
 """
 
 import gzip
+import json
 import logging
 import os
 import re
 import shutil
+import threading
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +24,7 @@ from backup_utils import RE_FULL, RE_INCR, wait_for_settle
 from config import read_server_properties, get_level_name, backup_exclude_names
 from .base import (
     ServerBackend, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
-    CAP_PLAYER_RESTORE,
+    CAP_PLAYER_RESTORE, CAP_STATS,
 )
 
 logger = logging.getLogger("mcnotifier")
@@ -30,10 +32,22 @@ logger = logging.getLogger("mcnotifier")
 # Response to the `list` command: "There are X of a max of Y players online: a, b"
 _RE_LIST = re.compile(r'There are \d+ of a max of \d+ players online:(.*)')
 
+# Java name registry: UUID -> name, learned from server logs.
+_NAMES_PATH = Path(__file__).resolve().parent.parent / "player_names.json"
+_names_lock = threading.Lock()
+
+
+def _ticks_to_hours(ticks: int) -> float:
+    return round(ticks / 20 / 3600, 2)
+
+
+def _cm_to_km(cm: int) -> float:
+    return round(cm / 100000, 2)
+
 
 class JavaBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
-                    CAP_PLAYER_RESTORE}
+                    CAP_PLAYER_RESTORE, CAP_STATS}
 
     # --- availability / readiness ---
     def is_available(self, log_warnings: bool = False) -> bool:
@@ -146,6 +160,88 @@ class JavaBackend(ServerBackend):
     def is_player_online(self, username: str) -> bool:
         target = username.lower()
         return any(n.lower() == target for n in self.query_online_players())
+
+    # --- name registry (player_names.json, keyed by UUID) ---
+    def load_names(self) -> dict:
+        if _NAMES_PATH.exists():
+            try:
+                with open(_NAMES_PATH) as f:
+                    return json.load(f)
+            except Exception:
+                logger.exception("Failed to load player_names.json")
+        return {}
+
+    def register_name(self, player_id: str, name: str) -> bool:
+        with _names_lock:
+            data = self.load_names()
+            if data.get(player_id) == name:
+                return False
+            data[player_id] = name
+            try:
+                with open(_NAMES_PATH, "w") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                logger.exception("Failed to write player_names.json")
+            return True
+
+    # --- stats (read the world's per-player stat files) ---
+    def _stats_dir(self) -> Path:
+        """Per-player stats dir. 26.1+ moved <world>/stats to
+        <world>/players/stats; prefer the new layout, fall back to old."""
+        world = self.config.minecraft_dir / get_level_name(self.config.minecraft_dir)
+        new_path = world / "players" / "stats"
+        old_path = world / "stats"
+        if new_path.is_dir():
+            return new_path
+        if old_path.is_dir():
+            return old_path
+        return new_path
+
+    def list_known_players(self, names: dict) -> list:
+        stats_dir = self._stats_dir()
+        if not stats_dir.exists():
+            return []
+        return sorted(names.get(f.stem, f.stem) for f in stats_dir.glob("*.json"))
+
+    def player_stats(self, names: dict) -> list:
+        stats_dir = self._stats_dir()
+        if not stats_dir.exists():
+            return []
+        result = []
+        for stat_file in stats_dir.glob("*.json"):
+            try:
+                with open(stat_file) as f:
+                    data = json.load(f)
+            except Exception:
+                logger.exception("Failed to read stats file %s", stat_file)
+                continue
+            uuid = stat_file.stem
+            name = names.get(uuid, uuid)
+            stats = data.get("stats", {})
+            custom = stats.get("minecraft:custom", {})
+            mined = stats.get("minecraft:mined", {})
+            killed = stats.get("minecraft:killed", {})
+            distance_cm = (
+                custom.get("minecraft:walk_one_cm", 0)
+                + custom.get("minecraft:sprint_one_cm", 0)
+                + custom.get("minecraft:swim_one_cm", 0)
+                + custom.get("minecraft:fly_one_cm", 0)
+            )
+            diamonds = (
+                mined.get("minecraft:diamond_ore", 0)
+                + mined.get("minecraft:deepslate_diamond_ore", 0)
+            )
+            result.append({
+                "name": name,
+                "time_played_hours": _ticks_to_hours(custom.get("minecraft:play_time", 0)),
+                "deaths": custom.get("minecraft:deaths", 0),
+                "diamonds_mined": diamonds,
+                "ancient_debris_mined": mined.get("minecraft:ancient_debris", 0),
+                "distance_travelled_km": _cm_to_km(distance_cm),
+                "villager_trades": custom.get("minecraft:traded_with_villager", 0),
+                "total_mobs_killed": sum(killed.values()) if killed else 0,
+            })
+        return result
 
     # --- per-player restore (replace one <uuid>.dat, live, player offline) ---
     # Player-data lives under the active world (named by `level-name`):
