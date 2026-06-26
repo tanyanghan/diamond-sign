@@ -162,6 +162,10 @@ class ServerBackend(ABC):
         """Persist a learned identity binding (Bedrock only; no-op elsewhere)."""
         return False
 
+    def known_identities(self) -> set:
+        """All identity uuids already bound to some player (Bedrock only)."""
+        return set()
+
     # --- player-name registry (the bot's `names` dict is sourced from here) ---
     # Java keeps player_names.json keyed by UUID; Bedrock projects names from its
     # richer bedrock_players.json keyed by xuid. Either way bot.py just sees a

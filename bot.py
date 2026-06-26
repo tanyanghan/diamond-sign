@@ -227,6 +227,13 @@ def record_death(uuid: str, message: str, timestamp: str,
 _online_players: set = set()
 _online_lock = threading.Lock()
 
+# Bedrock identity learning: xuids seen online since the last backup (kept even
+# after a player leaves, so a short session that only triggers a post-leave
+# backup is still attributable). Pruned to the still-online set after each
+# learn attempt. See _maybe_learn_player.
+_session_xuids: set = set()
+_session_lock = threading.Lock()
+
 
 def player_join(name: str) -> None:
     with _online_lock:
@@ -241,6 +248,12 @@ def player_leave(name: str) -> None:
 def get_online_players() -> list:
     with _online_lock:
         return sorted(_online_players)
+
+
+def _note_active_xuid(xuid: str) -> None:
+    if xuid:
+        with _session_lock:
+            _session_xuids.add(xuid)
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +622,7 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
         pid = _uuid_by_name(name, names)
         if pid:
             BACKEND.record_player_session(event_type, pid)
+            _note_active_xuid(pid)  # candidate for identity learning
 
         key = f"{name}-{event_type}"
         now = time.time()
@@ -790,28 +804,48 @@ def _save_player_state(hashes: dict) -> None:
 
 
 def _maybe_learn_player(sidecar: dict, log) -> None:
-    """Bind an online player's xuid to their (account-stable) identity uuids
-    when unambiguous: exactly one player online and exactly one player in the
-    (changed) sidecar. The binding is persisted by the backend and reused to
-    resolve the player in any backup. Stable, so learned once per player.
+    """Bind a player's xuid to their (account-stable) identity uuids by process
+    of elimination from a backup's changed-player sidecar.
 
-    Lives here (not the backend) because it needs the bot's in-memory online
-    set and the name registry; the backend just persists the result.
+    The xuid->identity link isn't in the world db, so it's inferred: the changed
+    sidecar lists exactly the players whose data changed since the last backup,
+    grouped into server keys (each with its MsaId+SelfSignedId). If exactly one
+    of those keys is still unattributed AND exactly one xuid that was online
+    since the last backup still has no identities, they must be the same player —
+    bind them. Handles a lone player (even one who already left) and "N online,
+    N-1 already known". Ambiguous cases are skipped and retried next backup.
+
+    Lives here (not the backend) because it needs the bot's session/online state
+    and the name registry; the backend supplies the known-identity facts.
     """
-    online = get_online_players()
-    if len(online) != 1:
+    # Changed server keys -> their identity uuids.
+    by_key: dict = {}
+    for ident, key in sidecar.get("mappings", {}).items():
+        by_key.setdefault(key, []).append(ident)
+    if not by_key:
         return
-    server_keys = set(sidecar.get("mappings", {}).values())
-    idents = list(sidecar.get("mappings", {}).keys())
-    if len(server_keys) != 1 or not idents:
-        return
-    name = online[0]
-    names = load_player_names(_NAMES_PATH)
-    xuid = _uuid_by_name(name, names)  # Bedrock registry key is the xuid
-    if not xuid:
-        return
-    if BACKEND.learn_player(name, xuid, idents):
-        log(f"Learned Bedrock player mapping for {name}")
+
+    known = BACKEND.known_identities()
+    unattributed = [k for k, idents in by_key.items()
+                    if not any(i in known for i in idents)]
+
+    names = load_player_names()
+    with _session_lock:
+        session = list(_session_xuids)
+    unknown_active = [x for x in session if not BACKEND.player_identities(x)]
+
+    if len(unattributed) == 1 and len(unknown_active) == 1:
+        key = unattributed[0]
+        xuid = unknown_active[0]
+        name = names.get(xuid, xuid)
+        if BACKEND.learn_player(name, xuid, by_key[key]):
+            log(f"Learned Bedrock identity for {name}")
+
+    # Drop players who have left; keep still-online ones for the next backup.
+    online_xuids = {_uuid_by_name(n, names) for n in get_online_players()}
+    online_xuids.discard(None)
+    with _session_lock:
+        _session_xuids.intersection_update(online_xuids)
 
 
 def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:

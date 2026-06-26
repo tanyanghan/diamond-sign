@@ -291,6 +291,12 @@ class BedrockBackend(ServerBackend):
     def player_identities(self, xuid: str) -> list:
         return _load_players().get(xuid, {}).get("identities", [])
 
+    def known_identities(self) -> set:
+        out = set()
+        for e in _load_players().values():
+            out.update(e.get("identities", []))
+        return out
+
     def list_known_players(self, names: dict) -> list:
         return sorted(e["name"] for e in _load_players().values() if e.get("name"))
 
