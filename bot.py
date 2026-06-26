@@ -623,6 +623,10 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
         if pid:
             BACKEND.record_player_session(event_type, pid)
             _note_active_xuid(pid)  # candidate for identity learning
+            if event_type == "leave":
+                # Refresh last_seen to the disconnect time (connect already set
+                # it on join). No-op on Java for an unchanged name.
+                BACKEND.register_name(pid, name)
 
         key = f"{name}-{event_type}"
         now = time.time()
