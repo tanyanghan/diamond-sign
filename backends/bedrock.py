@@ -353,7 +353,27 @@ class BedrockBackend(ServerBackend):
             if touched:
                 _save_stats(data)
 
+    def checkpoint_open_sessions(self, now: float | None = None) -> None:
+        """Bank elapsed time for open sessions but keep them open (open_since
+        advances to now). Unlike close_open_sessions this does NOT count a
+        session — it's a durability checkpoint, not a sign-off. Idempotent."""
+        now = time.time() if now is None else now
+        with _stats_lock:
+            data = _load_stats()
+            touched = False
+            for entry in data.values():
+                start = entry.get("open_since")
+                if start:
+                    entry["total_seconds"] = entry.get("total_seconds", 0) + max(0, now - start)
+                    entry["open_since"] = now
+                    touched = True
+            if touched:
+                _save_stats(data)
+
     def player_stats(self, names: dict) -> list:
+        # Persist running time so the displayed value survives a later crash
+        # and /stats can't show a number that isn't on disk.
+        self.checkpoint_open_sessions()
         players = _load_players()
         result = []
         for xuid, e in _load_stats().items():

@@ -197,5 +197,9 @@ class ServerBackend(ABC):
     def reset_open_sessions(self) -> None:
         """Clear sessions left open by a crash (called at startup)."""
 
+    def checkpoint_open_sessions(self) -> None:
+        """Bank elapsed time for open sessions without ending them, so a later
+        crash loses at most the time since this checkpoint."""
+
     def close_open_sessions(self) -> None:
         """Flush any open sessions (called on graceful shutdown)."""

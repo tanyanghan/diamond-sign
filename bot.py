@@ -1263,6 +1263,10 @@ def run_incremental_backup() -> str | None:
             # Always resume normal saving
             BACKEND.end_save(inc_log)
 
+        # Checkpoint online-time stats so a crash loses at most one interval of
+        # in-progress playtime (no-op on Java).
+        BACKEND.checkpoint_open_sessions()
+
         # Copy off-server if configured
         run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
 
