@@ -37,6 +37,11 @@ class ServerConfig:
     minecraft_dir: Path
     backup_dir: Path
 
+    # Chat platforms served simultaneously (e.g. ["telegram", "slack"]).
+    chat_platforms: tuple = ("telegram",)
+    slack_bot_token: str = ""   # xoxb-… (Slack Web API)
+    slack_app_token: str = ""   # xapp-… (Slack Socket Mode)
+
     # Java (RCON) transport
     rcon_host: str = "localhost"
     rcon_port: int = 25575
@@ -70,13 +75,30 @@ def load_config() -> ServerConfig:
     """Load and validate configuration from ``.env`` / the environment."""
     load_dotenv(Path(__file__).parent / ".env")
 
-    bot_token = os.environ.get("BOT_TOKEN")
     minecraft_dir = os.environ.get("MINECRAFT_DIR")
-    missing = [k for k, v in {"BOT_TOKEN": bot_token,
-                              "MINECRAFT_DIR": minecraft_dir}.items() if not v]
-    if missing:
+    if not minecraft_dir:
+        raise EnvironmentError("Missing required environment variable: MINECRAFT_DIR")
+
+    # Chat platforms (csv). Each enabled platform requires its own token(s).
+    platforms = tuple(p.strip().lower() for p in
+                      os.environ.get("CHAT_PLATFORMS", "telegram").split(",")
+                      if p.strip())
+    if not platforms:
+        platforms = ("telegram",)
+    _KNOWN = ("telegram", "slack")
+    bad = [p for p in platforms if p not in _KNOWN]
+    if bad:
         raise EnvironmentError(
-            f"Missing required environment variables: {', '.join(missing)}")
+            f"CHAT_PLATFORMS must be from {_KNOWN}, got {bad}")
+
+    bot_token = os.environ.get("BOT_TOKEN", "")
+    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    slack_app_token = os.environ.get("SLACK_APP_TOKEN", "")
+    if "telegram" in platforms and not bot_token:
+        raise EnvironmentError("CHAT_PLATFORMS includes telegram but BOT_TOKEN is not set")
+    if "slack" in platforms and not (slack_bot_token and slack_app_token):
+        raise EnvironmentError("CHAT_PLATFORMS includes slack but SLACK_BOT_TOKEN / "
+                               "SLACK_APP_TOKEN are not set")
 
     edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
     if edition not in _EDITIONS:
@@ -105,6 +127,9 @@ def load_config() -> ServerConfig:
         edition=edition,
         minecraft_dir=mc_dir,
         backup_dir=backup_dir,
+        chat_platforms=platforms,
+        slack_bot_token=slack_bot_token,
+        slack_app_token=slack_app_token,
         rcon_host=os.environ.get("RCON_HOST", "localhost"),
         rcon_port=int(os.environ.get("RCON_PORT", "25575")),
         rcon_password=os.environ.get("RCON_PASSWORD", ""),
