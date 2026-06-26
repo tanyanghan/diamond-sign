@@ -1,6 +1,8 @@
 # mcnotifier
 
-A Telegram bot that monitors a Minecraft server and sends notifications when players join or leave. Tracks achievements, deaths, player stats, and performs automated backups. Full backups run on a configurable daily, weekly, or monthly schedule, while incremental backups capture changes every few minutes (configurable) as players explore the world. Restoration to any backup point is done through an interactive CLI tool and requires the server to be offline.
+A chat bot that monitors a Minecraft server and sends notifications when players join or leave. Tracks achievements, deaths, player stats, and performs automated backups. Full backups run on a configurable daily, weekly, or monthly schedule, while incremental backups capture changes every few minutes (configurable) as players explore the world. Restoration to any backup point is done through an interactive CLI tool and requires the server to be offline.
+
+Works with **Telegram** and **Slack** — one or both at once (set `CHAT_PLATFORMS`). Commands are answered on the platform they arrive on; announcements broadcast to every platform's authorized chats. See [Chat platforms](#chat-platforms).
 
 Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITION`). Java uses RCON; Bedrock — which has no RCON — injects commands through the tmux/screen session hosting the server. See [Bedrock servers](#bedrock-servers) for the differences and feature limitations.
 
@@ -10,8 +12,9 @@ Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITI
 
 | File | Description |
 |------|-------------|
-| `bot.py` | Main bot — log watcher, Telegram handlers, stats, orchestration |
+| `bot.py` | Main bot — log watcher, command handlers, stats, orchestration |
 | `config.py` | Central config (`ServerConfig`) and world-layout helpers |
+| `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base` (interface), `java` (RCON), `bedrock` (tmux/screen), `mux` (multiplexer detection) |
 | `bedrock_player.py` | Bedrock world-LevelDB access + backup sidecar for per-player restore |
 | `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
@@ -35,8 +38,10 @@ Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITI
    cp .env.example .env
    ```
    Edit `.env` and fill in:
-   - `BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
    - `MINECRAFT_DIR` — absolute path to the Minecraft server directory (e.g. `/home/user/Minecraft`)
+   - `CHAT_PLATFORMS` — `telegram` (default), `slack`, or `telegram,slack`. See [Chat platforms](#chat-platforms)
+   - `BOT_TOKEN` — Telegram bot token from [@BotFather](https://t.me/BotFather) (needed if Telegram is enabled)
+   - `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` — Slack tokens (needed if Slack is enabled; see [Chat platforms](#chat-platforms))
    - `SERVER_EDITION` — `java` (default) or `bedrock`
    - `RCON_PASSWORD` — **Java only:** RCON password (must match `server.properties` `rcon.password`)
    - `MUX_SESSION` / `CONSOLE_LOG` — **Bedrock only:** see [Bedrock servers](#bedrock-servers)
@@ -51,11 +56,64 @@ Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITI
 
 ## First-time authorisation
 
-1. Send any private message to the bot — the first sender becomes the **admin**.
-2. Add the bot to your group chat, then send `/chat_id` in the group to get its ID.
-3. In a private message to the bot, send `/authorize <chat_id>` to whitelist the group.
+Authorization is **per platform** (each has its own admin and whitelist, stored namespaced in `auth.json`). On each platform you use:
 
-The bot will now send join/leave notifications to all authorised chats and respond to commands there.
+1. Send the bot a private message / DM — the first sender becomes that platform's **admin** (on Telegram, any message; on Slack, any slash command such as `/status`).
+2. In the group/channel you want notifications in, send `/chat_id` to get its ID (works even before the chat is authorized; on Slack, invite the bot to the channel first).
+3. In a private message/DM to the bot, send `/authorize <chat_id>` to whitelist it.
+
+The bot then sends join/leave (and death/achievement) announcements to every authorized chat on every platform, and answers commands in whichever chat they're sent.
+
+## Chat platforms
+
+`CHAT_PLATFORMS` (comma-separated) selects which platforms run; the bot serves them **all at once** from one process. Commands are answered on the platform they arrive on; only announcements broadcast to every platform. A `/backup` (or `/restore_player`) started on one platform while one is already running anywhere replies "already in progress" — backups are globally serialized.
+
+### Telegram
+
+Long-polling — no public URL needed. Create a bot with [@BotFather](https://t.me/BotFather), set `BOT_TOKEN`, and include `telegram` in `CHAT_PLATFORMS`.
+
+### Slack
+
+Uses **Socket Mode** (an outbound websocket), so no public URL or webhook is needed — it works behind NAT like Telegram. Set `CHAT_PLATFORMS=...,slack` and both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
+
+1. Create an app at <https://api.slack.com/apps> → **From an app manifest**, and paste the manifest below (it declares every slash command and the needed scopes).
+2. **Basic Information → App-Level Tokens →** generate a token with the `connections:write` scope → that's `SLACK_APP_TOKEN` (`xapp-…`).
+3. **Install App** to your workspace → **Bot User OAuth Token** is `SLACK_BOT_TOKEN` (`xoxb-…`).
+4. Invite the bot to each channel you want notifications in (`/invite @yourbot`). `chat:write.public` lets it also post to public channels it hasn't joined.
+
+```yaml
+display_information:
+  name: mcnotifier
+features:
+  bot_user:
+    display_name: mcnotifier
+    always_online: true
+  slash_commands:
+    - { command: /status,        description: Show online players,      should_escape: false }
+    - { command: /list,          description: List known players,       should_escape: false }
+    - { command: /stats,         description: Player statistics,        should_escape: false }
+    - { command: /playtime,      description: Playtime leaderboard,     should_escape: false }
+    - { command: /achievements,  description: Player achievements,      should_escape: false }
+    - { command: /deaths,        description: Death history,            should_escape: false }
+    - { command: /death_summary, description: Deaths grouped by cause,  should_escape: false }
+    - { command: /scan_achievements, description: Scan logs for achievements, should_escape: false }
+    - { command: /scan_deaths,   description: Scan logs for deaths,      should_escape: false }
+    - { command: /backup,        description: Trigger a backup now,     should_escape: false }
+    - { command: /restore_player, description: Restore one player,      should_escape: false }
+    - { command: /chat_id,       description: Show this chat's ID,      should_escape: false }
+    - { command: /authorize,     description: Whitelist a chat,         should_escape: false }
+    - { command: /revoke,        description: Remove a chat,            should_escape: false }
+    - { command: /listchats,     description: List authorized chats,    should_escape: false }
+    - { command: /help,          description: Show commands,            should_escape: false }
+oauth_config:
+  scopes:
+    bot: [commands, chat:write, chat:write.public]
+settings:
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+```
+
+Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/authorize` and the per-platform `auth.json` handle automatically.
 
 ## RCON setup
 
@@ -307,7 +365,7 @@ On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/a
 
 The bot writes the following at runtime (all excluded from git):
 
-- `auth.json` — admin user ID and authorised chat list
+- `auth.json` — per-platform admin user ID and authorised chat list (`{telegram: {...}, slack: {...}}`; an old flat file is auto-migrated into the `telegram` namespace)
 - `player_names.json` — *(Java)* UUID → username mappings learned from server logs
 - `player_achievements.json` — player achievements with timestamps, keyed by UUID
 - `player_deaths.json` — player death history with timestamps, keyed by UUID
