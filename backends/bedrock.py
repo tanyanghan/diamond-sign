@@ -19,6 +19,7 @@ target server's actual output (see the design doc's open questions).
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -26,14 +27,22 @@ from pathlib import Path
 from backup_utils import RE_FULL, RE_INCR
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE,
-    CAP_PLAYER_RESTORE,
+    CAP_PLAYER_RESTORE, CAP_STATS,
 )
 from .mux import detect
 
-# Learned, account-stable xuid -> {name, identities:[MsaId, SelfSignedId]}.
-# The data key is per-server random, but identities are stable, so we resolve a
-# player by trying their identities against each backup's sidecar mappings.
+logger = logging.getLogger("mcnotifier")
+
+# Portable player list / name registry. xuid -> {name, identities:[MsaId,
+# SelfSignedId], first_seen, last_seen}. Identities are account-stable (the data
+# key is per-server random), so this file can be copied to another instance.
 _PLAYERS_PATH = Path(__file__).resolve().parent.parent / "bedrock_players.json"
+_players_lock = threading.Lock()
+
+# Per-server online-time stats (NOT portable). xuid -> {name, total_seconds,
+# sessions, open_since}.
+_STATS_PATH = Path(__file__).resolve().parent.parent / "statistics.json"
+_stats_lock = threading.Lock()
 
 
 def _load_players() -> dict:
@@ -42,7 +51,7 @@ def _load_players() -> dict:
     except FileNotFoundError:
         return {}
     except Exception:
-        logging.getLogger("mcnotifier").exception("Failed to read bedrock_players.json")
+        logger.exception("Failed to read bedrock_players.json")
         return {}
 
 
@@ -50,9 +59,24 @@ def _save_players(data: dict) -> None:
     try:
         _PLAYERS_PATH.write_text(json.dumps(data, indent=2))
     except Exception:
-        logging.getLogger("mcnotifier").exception("Failed to write bedrock_players.json")
+        logger.exception("Failed to write bedrock_players.json")
 
-logger = logging.getLogger("mcnotifier")
+
+def _load_stats() -> dict:
+    try:
+        return json.loads(_STATS_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Failed to read statistics.json")
+        return {}
+
+
+def _save_stats(data: dict) -> None:
+    try:
+        _STATS_PATH.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logger.exception("Failed to write statistics.json")
 
 # `list` response: "There are 2/10 players online:" followed by a names line.
 _RE_LIST_HEADER = re.compile(r'There are (\d+)/\d+ players online:?')
@@ -68,7 +92,7 @@ def _strip_prefix(line: str) -> str:
 
 
 class BedrockBackend(ServerBackend):
-    CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, CAP_PLAYER_RESTORE}
+    CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, CAP_PLAYER_RESTORE, CAP_STATS}
 
     def __init__(self, config):
         super().__init__(config)
@@ -229,19 +253,143 @@ class BedrockBackend(ServerBackend):
         target = username.lower()
         return any(n.lower() == target for n in self.query_online_players())
 
-    # --- per-player restore (stop -> edit world LevelDB -> relaunch) ---
+    # --- name registry / portable player list (bedrock_players.json) ---
+    def load_names(self) -> dict:
+        return {xuid: e["name"] for xuid, e in _load_players().items()
+                if e.get("name")}
+
+    def register_name(self, player_id: str, name: str) -> bool:
+        """Merge name + first/last_seen for an xuid (called on every connect).
+        Returns True if the name was created/changed."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _players_lock:
+            data = _load_players()
+            entry = data.get(player_id, {})
+            changed = entry.get("name") != name
+            entry["name"] = name
+            entry.setdefault("first_seen", now)
+            entry["last_seen"] = now
+            data[player_id] = entry
+            _save_players(data)
+            return changed
+
     def learn_player(self, name: str, xuid: str, idents: list) -> bool:
-        """Persist a learned xuid -> identities binding (account-stable). Returns
-        True if newly learned/changed."""
-        players = _load_players()
-        if players.get(xuid, {}).get("identities") == idents:
-            return False
-        players[xuid] = {"name": name, "identities": idents}
-        _save_players(players)
-        return True
+        """Merge a learned xuid -> identities binding (account-stable), preserving
+        name/timestamps. Returns True if the identities were newly learned."""
+        with _players_lock:
+            data = _load_players()
+            entry = data.get(xuid, {})
+            if entry.get("identities") == idents:
+                return False
+            entry["identities"] = idents
+            if name and not entry.get("name"):
+                entry["name"] = name
+            data[xuid] = entry
+            _save_players(data)
+            return True
 
     def player_identities(self, xuid: str) -> list:
         return _load_players().get(xuid, {}).get("identities", [])
+
+    def known_identities(self) -> set:
+        out = set()
+        for e in _load_players().values():
+            out.update(e.get("identities", []))
+        return out
+
+    def list_known_players(self, names: dict) -> list:
+        return sorted(e["name"] for e in _load_players().values() if e.get("name"))
+
+    # --- online-time stats (statistics.json, accumulated from join/leave) ---
+    def record_player_session(self, event_type: str, player_id: str,
+                              now: float | None = None) -> None:
+        if not player_id:
+            return
+        now = time.time() if now is None else now
+        with _stats_lock:
+            data = _load_stats()
+            entry = data.get(player_id) or {"total_seconds": 0, "sessions": 0,
+                                            "open_since": None}
+            nm = _load_players().get(player_id, {}).get("name")
+            if nm:
+                entry["name"] = nm
+            if event_type == EVENT_JOIN:
+                entry["open_since"] = now  # overwrites any stale value
+            elif event_type == EVENT_LEAVE:
+                start = entry.get("open_since")
+                if start:
+                    entry["total_seconds"] = entry.get("total_seconds", 0) + max(0, now - start)
+                    entry["sessions"] = entry.get("sessions", 0) + 1
+                entry["open_since"] = None
+            data[player_id] = entry
+            _save_stats(data)
+
+    def reset_open_sessions(self) -> None:
+        """Clear any open_since left dangling by a crash (called at startup
+        before re-opening sessions for currently-online players)."""
+        with _stats_lock:
+            data = _load_stats()
+            touched = False
+            for entry in data.values():
+                if entry.get("open_since") is not None:
+                    entry["open_since"] = None
+                    touched = True
+            if touched:
+                _save_stats(data)
+
+    def close_open_sessions(self, now: float | None = None) -> None:
+        """Flush open sessions (graceful shutdown)."""
+        now = time.time() if now is None else now
+        with _stats_lock:
+            data = _load_stats()
+            touched = False
+            for entry in data.values():
+                start = entry.get("open_since")
+                if start:
+                    entry["total_seconds"] = entry.get("total_seconds", 0) + max(0, now - start)
+                    entry["sessions"] = entry.get("sessions", 0) + 1
+                    entry["open_since"] = None
+                    touched = True
+            if touched:
+                _save_stats(data)
+
+    def checkpoint_open_sessions(self, now: float | None = None) -> None:
+        """Bank elapsed time for open sessions but keep them open (open_since
+        advances to now). Unlike close_open_sessions this does NOT count a
+        session — it's a durability checkpoint, not a sign-off. Idempotent."""
+        now = time.time() if now is None else now
+        with _stats_lock:
+            data = _load_stats()
+            touched = False
+            for entry in data.values():
+                start = entry.get("open_since")
+                if start:
+                    entry["total_seconds"] = entry.get("total_seconds", 0) + max(0, now - start)
+                    entry["open_since"] = now
+                    touched = True
+            if touched:
+                _save_stats(data)
+
+    def player_stats(self, names: dict) -> list:
+        # Persist running time so the displayed value survives a later crash
+        # and /stats can't show a number that isn't on disk.
+        self.checkpoint_open_sessions()
+        players = _load_players()
+        result = []
+        for xuid, e in _load_stats().items():
+            secs = e.get("total_seconds", 0)
+            if e.get("open_since"):  # include the in-progress session
+                secs += max(0, time.time() - e["open_since"])
+            result.append({
+                "name": e.get("name") or players.get(xuid, {}).get("name")
+                or names.get(xuid, xuid),
+                "time_played_hours": round(secs / 3600, 2),
+                "sessions": e.get("sessions", 0),
+                "last_seen": players.get(xuid, {}).get("last_seen", ""),
+            })
+        return result
+
+    # --- per-player restore (stop -> edit world LevelDB -> relaunch) ---
 
     def list_player_versions(self, player_id: str, chain: tuple) -> list:
         """Restore points for a player from each backup zip's sidecar (deduped

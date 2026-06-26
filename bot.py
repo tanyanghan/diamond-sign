@@ -19,10 +19,10 @@ from backup_utils import (
     run_copy_command, wait_for_settle,
 )
 from config import (
-    load_config, get_level_name, backup_exclude_names, EDITION_BEDROCK,
+    load_config, backup_exclude_names, EDITION_BEDROCK,
 )
 from backends import (
-    make_backend, BackendUnavailable, CAP_PLAYER_RESTORE,
+    make_backend, BackendUnavailable, CAP_PLAYER_RESTORE, CAP_STATS,
     EVENT_DEATH, EVENT_ACHIEVEMENT,
 )
 
@@ -30,9 +30,8 @@ from backends import (
 # 1. Config
 # ---------------------------------------------------------------------------
 # All environment reading lives in config.load_config(); the rest of the module
-# reads from CONFIG (and a few thin aliases kept to minimise churn). The world
-# subdirectory name is configurable via `level-name` in server.properties — use
-# _stats_dir() / _get_level_name() at call time instead of a constant.
+# reads from CONFIG (and a few thin aliases kept to minimise churn). Per-player
+# data (stats dir, name registry) is owned by the backend, not bot.py.
 CONFIG = load_config()
 
 BOT_TOKEN = CONFIG.bot_token
@@ -115,47 +114,31 @@ def _send_long_message(bot, chat_id, text, reply_to_id=None, max_len=4096,
 # ---------------------------------------------------------------------------
 # 2. Player Name Registry
 # ---------------------------------------------------------------------------
-_NAMES_PATH = Path(__file__).parent / "player_names.json"
+# The {player_id: name} registry is owned by the backend (Java: player_names.json
+# keyed by UUID; Bedrock: projected from bedrock_players.json keyed by xuid). The
+# in-memory `names` dict and these helper signatures are kept so the rest of the
+# bot is unchanged; the `path` argument is vestigial (ignored).
+_NAMES_PATH = None  # retained only so existing call sites pass *something*
 _names_lock = threading.Lock()
 
 
-def load_player_names(path: Path) -> dict:
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            logger.exception("Failed to load player_names.json")
-    return {}
+def load_player_names(path=None) -> dict:
+    return BACKEND.load_names()
 
 
-def _save_player_names(names: dict, path: Path) -> None:
-    with open(path, "w") as f:
-        json.dump(names, f, indent=2)
-
-
-def refresh_player_names(names: dict, path: Path) -> None:
+def refresh_player_names(names: dict, path=None) -> None:
     with _names_lock:
-        try:
-            if path.exists():
-                with open(path) as f:
-                    disk_names = json.load(f)
-                names.clear()
-                names.update(disk_names)
-        except Exception:
-            logger.exception("Failed to reload player_names.json")
+        names.clear()
+        names.update(BACKEND.load_names())
 
 
-def register_player(uuid: str, name: str, names: dict, path: Path) -> None:
-    if names.get(uuid) == name:
-        return
-    with _names_lock:
-        old = names.get(uuid)
-        names[uuid] = name
-        _save_player_names(names, path)
-    if old:
-        logger.info("Player registry: UUID %s renamed %s -> %s", uuid, old, name)
-    else:
+def register_player(uuid: str, name: str, names: dict, path=None) -> None:
+    old = names.get(uuid)
+    names[uuid] = name
+    changed = BACKEND.register_name(uuid, name)
+    if old and old != name:
+        logger.info("Player registry: %s renamed %s -> %s", uuid, old, name)
+    elif changed and not old:
         logger.info("Player registry: registered %s (%s)", name, uuid)
 
 
@@ -244,6 +227,13 @@ def record_death(uuid: str, message: str, timestamp: str,
 _online_players: set = set()
 _online_lock = threading.Lock()
 
+# Bedrock identity learning: xuids seen online since the last backup (kept even
+# after a player leaves, so a short session that only triggers a post-leave
+# backup is still attributable). Pruned to the still-online set after each
+# learn attempt. See _maybe_learn_player.
+_session_xuids: set = set()
+_session_lock = threading.Lock()
+
 
 def player_join(name: str) -> None:
     with _online_lock:
@@ -258,6 +248,12 @@ def player_leave(name: str) -> None:
 def get_online_players() -> list:
     with _online_lock:
         return sorted(_online_players)
+
+
+def _note_active_xuid(xuid: str) -> None:
+    if xuid:
+        with _session_lock:
+            _session_xuids.add(xuid)
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +617,17 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
             return
 
         name = payload
+        # Online-time accumulation (Bedrock; no-op on Java). Done before the
+        # cooldown gate so a quick rejoin still records the session boundary.
+        pid = _uuid_by_name(name, names)
+        if pid:
+            BACKEND.record_player_session(event_type, pid)
+            _note_active_xuid(pid)  # candidate for identity learning
+            if event_type == "leave":
+                # Refresh last_seen to the disconnect time (connect already set
+                # it on join). No-op on Java for an unchanged name.
+                BACKEND.register_name(pid, name)
+
         key = f"{name}-{event_type}"
         now = time.time()
         if now - _last_event.get(key, 0) < _cooldown:
@@ -651,67 +658,28 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
 # ---------------------------------------------------------------------------
 # 7. Stats Logic
 # ---------------------------------------------------------------------------
-def _ticks_to_hours(ticks: int) -> float:
-    return round(ticks / 20 / 3600, 2)
-
-
-def _cm_to_km(cm: int) -> float:
-    return round(cm / 100000, 2)
-
-
-def read_player_stats(stats_dir: Path, names: dict) -> list:
-    if not stats_dir.exists():
-        return []
-    result = []
-    for stat_file in stats_dir.glob("*.json"):
-        try:
-            with open(stat_file) as f:
-                data = json.load(f)
-        except Exception:
-            logger.exception("Failed to read stats file %s", stat_file)
-            continue
-        uuid = stat_file.stem
-        name = names.get(uuid, uuid)
-        stats = data.get("stats", {})
-        custom = stats.get("minecraft:custom", {})
-        mined = stats.get("minecraft:mined", {})
-        killed = stats.get("minecraft:killed", {})
-
-        distance_cm = (
-            custom.get("minecraft:walk_one_cm", 0)
-            + custom.get("minecraft:sprint_one_cm", 0)
-            + custom.get("minecraft:swim_one_cm", 0)
-            + custom.get("minecraft:fly_one_cm", 0)
-        )
-        diamonds = (
-            mined.get("minecraft:diamond_ore", 0)
-            + mined.get("minecraft:deepslate_diamond_ore", 0)
-        )
-
-        result.append({
-            "name": name,
-            "time_played_hours": _ticks_to_hours(custom.get("minecraft:play_time", 0)),
-            "deaths": custom.get("minecraft:deaths", 0),
-            "diamonds_mined": diamonds,
-            "ancient_debris_mined": mined.get("minecraft:ancient_debris", 0),
-            "distance_travelled_km": _cm_to_km(distance_cm),
-            "villager_trades": custom.get("minecraft:traded_with_villager", 0),
-            "total_mobs_killed": sum(killed.values()) if killed else 0,
-        })
-    return result
+# Per-player stat dicts come from the backend (Java: world stat files; Bedrock:
+# accumulated online time). Every dict has `name` + `time_played_hours`; only
+# Java adds the richer fields, so the formatter shows whatever is present.
+_STAT_FIELDS = [
+    ("time_played_hours", "Time played", "h"),
+    ("sessions", "Sessions", ""),
+    ("deaths", "Deaths", ""),
+    ("diamonds_mined", "Diamonds mined", ""),
+    ("ancient_debris_mined", "Ancient debris mined", ""),
+    ("distance_travelled_km", "Distance travelled", " km"),
+    ("villager_trades", "Villager trades", ""),
+    ("total_mobs_killed", "Mobs killed", ""),
+    ("last_seen", "Last seen", ""),
+]
 
 
 def _format_stats(p: dict) -> str:
-    return (
-        f"Player: {p['name']}\n"
-        f"  Time played: {p['time_played_hours']}h\n"
-        f"  Deaths: {p['deaths']}\n"
-        f"  Diamonds mined: {p['diamonds_mined']}\n"
-        f"  Ancient debris mined: {p['ancient_debris_mined']}\n"
-        f"  Distance travelled: {p['distance_travelled_km']} km\n"
-        f"  Villager trades: {p['villager_trades']}\n"
-        f"  Mobs killed: {p['total_mobs_killed']}"
-    )
+    lines = [f"Player: {p['name']}"]
+    for key, label, unit in _STAT_FIELDS:
+        if key in p and p[key] != "":
+            lines.append(f"  {label}: {p[key]}{unit}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -790,30 +758,6 @@ _PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missi
 _RESTORE_PLAYER_PAGE_SIZE = 10  # versions shown per page in /restore_player listing
 
 
-def _get_level_name() -> str:
-    """Return the world directory name from server.properties' `level-name`.
-    Falls back to 'world' (the vanilla default) if the file is missing or
-    the key isn't set."""
-    return get_level_name(MINECRAFT_DIR)
-
-
-def _stats_dir() -> Path:
-    """Return the per-player stats directory under the active world.
-
-    Minecraft 26.1+ moved player stats from <world>/stats to
-    <world>/players/stats. Prefer the new layout but fall back to the old
-    one if it's still present (older servers, mid-migration).
-    """
-    world = Path(MINECRAFT_DIR) / _get_level_name()
-    new_path = world / "players" / "stats"
-    old_path = world / "stats"
-    if new_path.is_dir():
-        return new_path
-    if old_path.is_dir():
-        return old_path
-    return new_path  # default to new layout when neither exists yet
-
-
 def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> None:
     """Add ``fp`` to the zip under ``rel``, honouring an optional snapshot map.
 
@@ -864,28 +808,48 @@ def _save_player_state(hashes: dict) -> None:
 
 
 def _maybe_learn_player(sidecar: dict, log) -> None:
-    """Bind an online player's xuid to their (account-stable) identity uuids
-    when unambiguous: exactly one player online and exactly one player in the
-    (changed) sidecar. The binding is persisted by the backend and reused to
-    resolve the player in any backup. Stable, so learned once per player.
+    """Bind a player's xuid to their (account-stable) identity uuids by process
+    of elimination from a backup's changed-player sidecar.
 
-    Lives here (not the backend) because it needs the bot's in-memory online
-    set and the name registry; the backend just persists the result.
+    The xuid->identity link isn't in the world db, so it's inferred: the changed
+    sidecar lists exactly the players whose data changed since the last backup,
+    grouped into server keys (each with its MsaId+SelfSignedId). If exactly one
+    of those keys is still unattributed AND exactly one xuid that was online
+    since the last backup still has no identities, they must be the same player —
+    bind them. Handles a lone player (even one who already left) and "N online,
+    N-1 already known". Ambiguous cases are skipped and retried next backup.
+
+    Lives here (not the backend) because it needs the bot's session/online state
+    and the name registry; the backend supplies the known-identity facts.
     """
-    online = get_online_players()
-    if len(online) != 1:
+    # Changed server keys -> their identity uuids.
+    by_key: dict = {}
+    for ident, key in sidecar.get("mappings", {}).items():
+        by_key.setdefault(key, []).append(ident)
+    if not by_key:
         return
-    server_keys = set(sidecar.get("mappings", {}).values())
-    idents = list(sidecar.get("mappings", {}).keys())
-    if len(server_keys) != 1 or not idents:
-        return
-    name = online[0]
-    names = load_player_names(_NAMES_PATH)
-    xuid = _uuid_by_name(name, names)  # Bedrock registry key is the xuid
-    if not xuid:
-        return
-    if BACKEND.learn_player(name, xuid, idents):
-        log(f"Learned Bedrock player mapping for {name}")
+
+    known = BACKEND.known_identities()
+    unattributed = [k for k, idents in by_key.items()
+                    if not any(i in known for i in idents)]
+
+    names = load_player_names()
+    with _session_lock:
+        session = list(_session_xuids)
+    unknown_active = [x for x in session if not BACKEND.player_identities(x)]
+
+    if len(unattributed) == 1 and len(unknown_active) == 1:
+        key = unattributed[0]
+        xuid = unknown_active[0]
+        name = names.get(xuid, xuid)
+        if BACKEND.learn_player(name, xuid, by_key[key]):
+            log(f"Learned Bedrock identity for {name}")
+
+    # Drop players who have left; keep still-online ones for the next backup.
+    online_xuids = {_uuid_by_name(n, names) for n in get_online_players()}
+    online_xuids.discard(None)
+    with _session_lock:
+        _session_xuids.intersection_update(online_xuids)
 
 
 def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:
@@ -1299,6 +1263,10 @@ def run_incremental_backup() -> str | None:
             # Always resume normal saving
             BACKEND.end_save(inc_log)
 
+        # Checkpoint online-time stats so a crash loses at most one interval of
+        # in-progress playtime (no-op on Java).
+        BACKEND.checkpoint_open_sessions()
+
         # Copy off-server if configured
         run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
 
@@ -1454,7 +1422,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             "/status — show online players",
             "/list — list all known players",
         ]
-        if CONFIG.edition != EDITION_BEDROCK:  # Bedrock has no per-player stats
+        if BACKEND.supports(CAP_STATS):
             lines += [
                 "/stats [player] — player statistics",
                 "/playtime — playtime leaderboard",
@@ -1497,18 +1465,18 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_stats(message):
         if not guard(message):
             return
-        if CONFIG.edition == EDITION_BEDROCK:
-            bot.reply_to(message, "Player statistics are not available on Bedrock "
-                                  "(BDS keeps no per-player stats files).")
+        if not BACKEND.supports(CAP_STATS):
+            bot.reply_to(message, "Player statistics are not available on this "
+                                  "server edition.")
             return
         refresh_player_names(names, _NAMES_PATH)
         args = message.text.split(maxsplit=1)
         target = args[1].strip().lower() if len(args) > 1 else None
         logger.info("Stats: requested by %s (player=%s)", _tg_user(message), target or "all")
 
-        all_stats = read_player_stats(_stats_dir(), names)
+        all_stats = BACKEND.player_stats(names)
         if not all_stats:
-            bot.reply_to(message, "Stats directory not found or empty.")
+            bot.reply_to(message, "No player statistics recorded yet.")
             return
 
         if target:
@@ -1526,15 +1494,14 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
     def cmd_playtime(message):
         if not guard(message):
             return
-        if CONFIG.edition == EDITION_BEDROCK:
-            bot.reply_to(message, "Playtime stats are not available on Bedrock "
-                                  "(BDS keeps no per-player stats files).")
+        if not BACKEND.supports(CAP_STATS):
+            bot.reply_to(message, "Playtime is not available on this server edition.")
             return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("Playtime: requested by %s", _tg_user(message))
-        all_stats = read_player_stats(_stats_dir(), names)
+        all_stats = BACKEND.player_stats(names)
         if not all_stats:
-            bot.reply_to(message, "Stats directory not found or empty.")
+            bot.reply_to(message, "No player statistics recorded yet.")
             return
         ranked = sorted(all_stats, key=lambda p: p["time_played_hours"], reverse=True)
         lines = [f"{i+1}. {p['name']} — {p['time_played_hours']}h" for i, p in enumerate(ranked)]
@@ -1547,24 +1514,9 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             return
         refresh_player_names(names, _NAMES_PATH)
         logger.info("List: requested by %s", _tg_user(message))
-        # Bedrock has no per-player stats files; the known-players source is the
-        # name registry the bot builds from join events.
-        if CONFIG.edition == EDITION_BEDROCK:
-            entries = sorted(set(names.values()))
-            if not entries:
-                bot.reply_to(message, "No players seen yet.")
-                return
-            bot.reply_to(message, "Known players:\n" + "\n".join(entries))
-            return
-        if not _stats_dir().exists():
-            bot.reply_to(message, "Stats directory not found.")
-            return
-        entries = sorted(
-            names.get(f.stem, f.stem)
-            for f in _stats_dir().glob("*.json")
-        )
+        entries = BACKEND.list_known_players(names)
         if not entries:
-            bot.reply_to(message, "No players found in stats directory.")
+            bot.reply_to(message, "No players found.")
             return
         bot.reply_to(message, "Known players:\n" + "\n".join(entries))
 
@@ -2089,7 +2041,6 @@ def main():
     setup_logging(Path(__file__).parent / "logs")
 
     auth = load_auth(_AUTH_PATH)
-    names = load_player_names(_NAMES_PATH)
     achievements = load_achievements(_ACHIEVEMENTS_PATH)
     deaths = load_deaths(_DEATHS_PATH)
 
@@ -2099,8 +2050,9 @@ def main():
     _bot_ref = bot
     _auth_ref = auth
 
-    # Construct the edition-specific backend. Bedrock raises BackendUnavailable
-    # if no tmux/screen session is hosting the server — exit gracefully.
+    # Construct the edition-specific backend FIRST — the name registry is sourced
+    # from it. Bedrock raises BackendUnavailable if no tmux/screen session is
+    # hosting the server — exit gracefully.
     try:
         BACKEND = make_backend(CONFIG)
     except BackendUnavailable as e:
@@ -2113,6 +2065,8 @@ def main():
                 pass
         return
     logger.info("Server edition: %s", CONFIG.edition)
+
+    names = load_player_names()  # now backed by BACKEND.load_names()
 
     register_handlers(bot, auth, names, achievements, deaths)
 
@@ -2149,12 +2103,20 @@ def main():
                     logger.warning("Online query retry failed: %s", e2)
 
         if online is not None:
+            # Online-time bookkeeping: clear any sessions left open by a prior
+            # crash, then open a session for each currently-online player (their
+            # join event predates this bot run).
+            BACKEND.reset_open_sessions()
             for name in online:
                 player_join(name)
             current = get_online_players()
             if current:
                 logger.info("%d player(s) already online: %s",
                             len(current), ", ".join(current))
+                for name in current:
+                    pid = _uuid_by_name(name, names)
+                    if pid:
+                        BACKEND.record_player_session("join", pid)
                 # The join notify callback never fired for these players, so
                 # start the incremental backup cycle here.
                 _start_incremental_cycle()
@@ -2284,6 +2246,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Flush any open online-time sessions so playtime isn't lost on a clean
+        # stop (a hard crash still loses the in-progress session).
+        try:
+            BACKEND.close_open_sessions()
+        except Exception:
+            logger.exception("Failed to close open sessions on shutdown")
         observer.stop()
         observer.join()
         logger.info("Bot stopped")

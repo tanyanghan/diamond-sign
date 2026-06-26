@@ -133,8 +133,15 @@ If BDS runs in the window named `bedrock` of session `1`, set `MUX_SESSION=1:bed
 **Backups.** Instead of Java's `save-off` / `save-all` / `save-on`, the bot uses `save hold` → poll `save query` → `save resume`. `save query` reports each file with the exact number of bytes that belong to the snapshot, and the bot copies each file truncated to that length (BDS keeps appending past the snapshot point). Full and incremental backups and the [restore tool](#restoring-from-backups) work the same as Java otherwise.
 
 **Feature limitations (current).** BDS does not emit death or achievement events. So on Bedrock:
-- Join/leave notifications, full + incremental backups, whole-world restore, and per-player restore (see below) work.
+- Join/leave notifications, full + incremental backups, whole-world restore, per-player restore (see below), player list, and playtime stats (see below) all work.
 - `/deaths`, `/death_summary`, `/achievements`, and the `/scan_*` commands reply that they are not available on this edition.
+
+### Bedrock player list and online-time stats
+
+Bedrock has no per-player stats files (unlike Java), so the bot derives both the player list and playtime from the console join/leave events:
+
+- **Portable player list** — `bedrock_players.json` is the authoritative player registry, keyed by xuid, holding each player's name, account-stable identities (used for per-player restore), and first/last-seen times. Because the identities are the same on any server for a given Xbox account, this file is **portable**: copy it to another mcnotifier instance and that instance immediately knows your players (and can restore them) without re-learning. The bot merges by xuid on every write (union — copied-in entries and locally-learned ones are never lost). It replaces `player_names.json` on Bedrock.
+- **Online-time stats** — `statistics.json` accumulates each player's total connected time and session count from sign-in/sign-off. It drives `/stats` and `/playtime` on Bedrock. This file is **per-server, not portable** (playtime is server-specific). It is written on join/leave, on a clean shutdown, and checkpointed periodically (on each incremental backup and whenever `/stats` or `/playtime` is run) so in-progress time is persisted as you go. Caveats: a player already online when the bot starts is timed from bot-startup (slight undercount), and a hard crash loses only the in-progress time since the last checkpoint.
 
 ### Bedrock per-player restore
 
@@ -301,12 +308,13 @@ On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/a
 The bot writes the following at runtime (all excluded from git):
 
 - `auth.json` — admin user ID and authorised chat list
-- `player_names.json` — UUID → username mappings learned from server logs
+- `player_names.json` — *(Java)* UUID → username mappings learned from server logs
 - `player_achievements.json` — player achievements with timestamps, keyed by UUID
 - `player_deaths.json` — player death history with timestamps, keyed by UUID
 - `backup_manifest.json` — incremental backup state: chain ID, base full backup, and file modification timestamps
 - `bedrock_player_state.json` — *(Bedrock)* per-player data hashes, so incremental sidecars only carry players that changed
-- `bedrock_players.json` — *(Bedrock)* learned xuid → LevelDB-identity bindings for per-player restore
+- `bedrock_players.json` — *(Bedrock)* the player registry: xuid → name, identities, first/last-seen. Portable (see [Bedrock player list](#bedrock-player-list-and-online-time-stats)); replaces `player_names.json` on Bedrock
+- `statistics.json` — *(Bedrock)* accumulated online time + session counts per player; drives `/stats` and `/playtime`. Per-server (not portable)
 - `<MINECRAFT_DIR>/.mcnotifier_chain` — chain validity marker written in the server directory
 - `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file is created each time the bot starts
 
