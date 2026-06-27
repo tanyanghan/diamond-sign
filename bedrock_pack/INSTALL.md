@@ -33,15 +33,20 @@ is conventional and is probably already present:
 behavior_packs/mcnotifier_events/        # copy this bedrock_pack/ folder here
 ```
 
-Then activate it for your world by adding the **module** UUID (from
-`manifest.json`) to `worlds/<level-name>/world_behavior_packs.json` (create the
-file if absent; if it already lists other packs, append to the array):
+Then activate it for your world by adding the pack's **header** UUID — the
+`header.uuid` in `manifest.json`, NOT the module uuid — to
+`worlds/<level-name>/world_behavior_packs.json` (create the file if absent; if it
+already lists other packs, append to the array):
 
 ```json
 [
-  { "pack_id": "2b062566-9ef9-4de2-a5c3-c91875c79815", "version": [1, 0, 0] }
+  { "pack_id": "dd12725f-61ca-4f6a-bca2-170cef3008ed", "version": [1, 0, 0] }
 ]
 ```
+
+(`pack_id` is always the `header.uuid`. If the server log says
+"Configured pack (id: …) was not found", the id in `world_behavior_packs.json`
+doesn't match this header uuid.)
 
 ## 3. Enable Beta APIs (only needed for chat)
 
