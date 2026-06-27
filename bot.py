@@ -1464,6 +1464,8 @@ def register_commands(router, auth: dict, names: dict,
             if BACKEND.supports(EVENT_DEATH):
                 lines.append("/scan_deaths — scan all logs for deaths")
             lines.append("/backup — trigger a server backup now")
+            lines.append(f"/allowlist <on|off|add|remove|list|reload> [player] "
+                         f"— server {BACKEND.ALLOWLIST_VERB}")
         ctx.reply("\n".join(lines))
     router.register(["start", "help"], cmd_help)
 
@@ -1682,6 +1684,44 @@ def register_commands(router, auth: dict, names: dict,
 
         threading.Thread(target=run, daemon=True).start()
     router.register("backup", cmd_backup, private_only=True, admin_only=True)
+
+    # --- /allowlist (server whitelist/allowlist passthrough) ---
+    _ALLOWLIST_SUBS = {"on", "off", "add", "remove", "list", "reload"}
+
+    def cmd_allowlist(ctx):
+        verb = BACKEND.ALLOWLIST_VERB
+        usage = (f"Usage: /allowlist <on|off|add|remove|list|reload> [player]\n"
+                 f"(runs the server '{verb}' command)")
+        if not ctx.args:
+            ctx.reply(usage)
+            return
+        sub = ctx.args[0].lower()
+        if sub not in _ALLOWLIST_SUBS:
+            ctx.reply(f"Unknown subcommand '{ctx.args[0]}'.\n{usage}")
+            return
+        if sub in ("add", "remove") and len(ctx.args) < 2:
+            ctx.reply(f"Usage: /allowlist {sub} <player>")
+            return
+        if not BACKEND.is_available():
+            ctx.reply("Server is not reachable right now — try again once it's up.")
+            return
+        logger.info("Allowlist: %s ran '%s %s'", ctx.sender_label, verb,
+                    " ".join(ctx.args))
+
+        # Run in a thread: Bedrock capture polls the log for up to a few seconds.
+        def run():
+            try:
+                resp = BACKEND.allowlist_command(ctx.args)
+            except Exception as e:
+                logger.exception("Allowlist command failed")
+                ctx.adapter.send(ctx.chat_id, f"{verb} command failed: {e}")
+                return
+            ctx.adapter.send(ctx.chat_id,
+                             resp.strip() or "(server returned no output)",
+                             monospace=True)
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("allowlist", cmd_allowlist, private_only=True, admin_only=True)
 
     # --- /restore_player ---
     def cmd_restore_player(ctx):

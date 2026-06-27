@@ -44,6 +44,10 @@ _players_lock = threading.Lock()
 _STATS_PATH = Path(__file__).resolve().parent.parent / "statistics.json"
 _stats_lock = threading.Lock()
 
+# Serialises response-capturing commands so two concurrent captures can't read
+# each other's console.log output.
+_capture_lock = threading.Lock()
+
 
 def _load_players() -> dict:
     try:
@@ -93,6 +97,7 @@ def _strip_prefix(line: str) -> str:
 
 class BedrockBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, CAP_PLAYER_RESTORE, CAP_STATS}
+    ALLOWLIST_VERB = "allowlist"  # Bedrock's name for Java's "whitelist"
 
     def __init__(self, config):
         super().__init__(config)
@@ -123,6 +128,39 @@ class BedrockBackend(ServerBackend):
     def send_command(self, cmd: str) -> str:
         self._mux.send(cmd)
         return ""
+
+    def capture_command(self, full_cmd: str, timeout: float = 3.0) -> str:
+        """Send a command and read its response back from console.log.
+
+        BDS injection is fire-and-forget, so we record the log's current end,
+        send the command, then poll until the new content stops growing (or the
+        timeout elapses). Only prefixed server lines (``[.. INFO] …``) are kept —
+        the bare echo of the typed command is dropped.
+        """
+        log_path = self.config.log_path
+        with _capture_lock:
+            try:
+                start = log_path.stat().st_size
+            except OSError:
+                start = 0
+            self.send_command(full_cmd)
+            deadline = time.time() + timeout
+            data = b""
+            while time.time() < deadline:
+                time.sleep(0.3)
+                try:
+                    with open(log_path, "rb") as f:
+                        f.seek(start)
+                        new = f.read()
+                except OSError:
+                    new = b""
+                if new and new == data:
+                    break  # output has settled -> response complete
+                data = new
+        text = data.decode("utf-8", errors="replace")
+        lines = [_strip_prefix(ln.strip()) for ln in text.splitlines()
+                 if ln.strip() and _RE_LOG_PREFIX.match(ln.strip())]
+        return "\n".join(lines)
 
     def _send_confirmed(self, cmd: str, success_phrase: str, timeout: float = 30,
                         retries: int = 3, log=None) -> bool:
