@@ -95,6 +95,53 @@ def _strip_prefix(line: str) -> str:
     return _RE_LOG_PREFIX.sub("", line.strip())
 
 
+# BDS emits structured command output wrapped in ###* {json} *### markers (e.g.
+# `allowlist list`), where the closing *### sits on its own unprefixed line.
+_RE_STRUCTURED = re.compile(r'###\*\s*(.*?)\s*\*###', re.DOTALL)
+
+
+def _format_structured(payload: str):
+    """Render a BDS structured-JSON payload into readable text, or None if it
+    isn't a shape we special-case."""
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return None
+    if obj.get("command") == "allowlist" and isinstance(obj.get("result"), list):
+        names = [e.get("name", "?") for e in obj["result"]]
+        if not names:
+            return "The allowlist is empty."
+        noun = "entry" if len(names) == 1 else "entries"
+        return f"There are {len(names)} allowlist {noun}: " + ", ".join(names)
+    return None
+
+
+def _format_console_response(text: str) -> str:
+    """Turn raw captured console output into a clean reply.
+
+    Handles the ###* {json} *### structured block (e.g. `allowlist list`),
+    otherwise keeps the prefixed server lines and drops the echoed command and
+    bare marker lines.
+    """
+    m = _RE_STRUCTURED.search(text)
+    if m:
+        payload = " ".join(_strip_prefix(ln) for ln in m.group(1).splitlines()
+                           if ln.strip())
+        formatted = _format_structured(payload)
+        if formatted is not None:
+            return formatted
+    lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or not _RE_LOG_PREFIX.match(ln):
+            continue  # echoed command / blank / bare marker line
+        stripped = _strip_prefix(ln)
+        if stripped in ("###*", "*###") or not stripped:
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
 class BedrockBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, CAP_PLAYER_RESTORE, CAP_STATS}
     ALLOWLIST_VERB = "allowlist"  # Bedrock's name for Java's "whitelist"
@@ -157,10 +204,7 @@ class BedrockBackend(ServerBackend):
                 if new and new == data:
                     break  # output has settled -> response complete
                 data = new
-        text = data.decode("utf-8", errors="replace")
-        lines = [_strip_prefix(ln.strip()) for ln in text.splitlines()
-                 if ln.strip() and _RE_LOG_PREFIX.match(ln.strip())]
-        return "\n".join(lines)
+        return _format_console_response(data.decode("utf-8", errors="replace"))
 
     def _send_confirmed(self, cmd: str, success_phrase: str, timeout: float = 30,
                         retries: int = 3, log=None) -> bool:
