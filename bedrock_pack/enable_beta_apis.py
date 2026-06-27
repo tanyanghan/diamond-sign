@@ -81,9 +81,11 @@ def enable_experiments(raw: bytes, keys, CompoundTag, ByteTag, amulet_nbt):
 def main():
     ap = argparse.ArgumentParser(description="Enable Bedrock Beta APIs in level.dat")
     ap.add_argument("path", help="path to level.dat, or the world directory")
-    ap.add_argument("--keys", default="beta_api",
-                    help="comma-separated experiment keys to enable "
-                         "(default: beta_api; try beta_api,gametest if needed)")
+    ap.add_argument("--keys", default="beta_api,gametest",
+                    help="comma-separated experiment keys to enable. Default sets "
+                         "both known names for the Beta APIs experiment "
+                         "(gametest is the one current versions honor; it shows "
+                         "as 'gtst' in the server's active-experiments line).")
     ap.add_argument("--no-backup", action="store_true",
                     help="don't write a .bak copy (not recommended)")
     args = ap.parse_args()

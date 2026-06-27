@@ -54,6 +54,10 @@ class ServerConfig:
     # stop->edit->restart. Derived from minecraft_dir if not set explicitly.
     mux_start_cmd: str = ""
 
+    # Bedrock Script-API events (via the bedrock_pack behavior pack).
+    bedrock_script_events: bool = False   # ingest death markers; enables /deaths
+    chat_relay: bool = False              # relay in-game chat to the chat platforms
+
     # Backup behaviour (edition-agnostic)
     incremental_enabled: bool = False
     incremental_interval_minutes: int = 15
@@ -136,6 +140,8 @@ def load_config() -> ServerConfig:
         console_log=console_log,
         mux_session=os.environ.get("MUX_SESSION", "").strip(),
         mux_start_cmd=mux_start_cmd,
+        bedrock_script_events=_env_bool("BEDROCK_SCRIPT_EVENTS"),
+        chat_relay=_env_bool("CHAT_RELAY"),
         incremental_enabled=_env_bool("INCREMENTAL_BACKUP_ENABLED"),
         incremental_interval_minutes=int(
             os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15")),

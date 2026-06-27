@@ -3,8 +3,8 @@
 from config import EDITION_JAVA, EDITION_BEDROCK
 from .base import (
     ServerBackend, BackendUnavailable, NotSupported,
-    EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT, CAP_PLAYER_RESTORE,
-    CAP_STATS,
+    EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT, EVENT_CHAT,
+    CAP_PLAYER_RESTORE, CAP_STATS,
 )
 
 
@@ -25,6 +25,6 @@ def make_backend(config) -> ServerBackend:
 
 __all__ = [
     "ServerBackend", "BackendUnavailable", "NotSupported", "make_backend",
-    "EVENT_JOIN", "EVENT_LEAVE", "EVENT_DEATH", "EVENT_ACHIEVEMENT",
+    "EVENT_JOIN", "EVENT_LEAVE", "EVENT_DEATH", "EVENT_ACHIEVEMENT", "EVENT_CHAT",
     "CAP_PLAYER_RESTORE", "CAP_STATS",
 ]

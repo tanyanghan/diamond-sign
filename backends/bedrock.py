@@ -26,7 +26,7 @@ from pathlib import Path
 
 from backup_utils import RE_FULL, RE_INCR
 from .base import (
-    ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE,
+    ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH,
     CAP_PLAYER_RESTORE, CAP_STATS,
 )
 from .mux import detect
@@ -138,6 +138,8 @@ def _format_console_response(text: str) -> str:
         stripped = _strip_prefix(ln)
         if stripped in ("###*", "*###") or not stripped:
             continue
+        if "MCNOTIFIER " in stripped:
+            continue  # behavior-pack event marker (async; not command output)
         lines.append(stripped)
     return "\n".join(lines)
 
@@ -154,6 +156,10 @@ class BedrockBackend(ServerBackend):
             raise BackendUnavailable(
                 f"no tmux/screen session{looked} is hosting the Bedrock server. "
                 "Start the server inside byobu/tmux/screen and set MUX_SESSION.")
+        # The bedrock_pack behavior pack supplies death events, so /deaths and
+        # death announcements become available when it's enabled.
+        if config.bedrock_script_events:
+            self.CAPABILITIES = self.CAPABILITIES | {EVENT_DEATH}
 
     # --- availability / readiness ---
     def is_available(self, log_warnings: bool = False) -> bool:
