@@ -10,7 +10,6 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import telebot
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -25,6 +24,7 @@ from backends import (
     make_backend, BackendUnavailable, CAP_PLAYER_RESTORE, CAP_STATS,
     EVENT_DEATH, EVENT_ACHIEVEMENT,
 )
+from chat import make_adapters, CommandRouter
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -34,7 +34,6 @@ from backends import (
 # data (stats dir, name registry) is owned by the backend, not bot.py.
 CONFIG = load_config()
 
-BOT_TOKEN = CONFIG.bot_token
 MINECRAFT_DIR = CONFIG.minecraft_dir          # Path
 LOG_PATH = CONFIG.log_path                     # Java: logs/latest.log; Bedrock: console.log
 BACKUP_DIR = CONFIG.backup_dir
@@ -80,35 +79,6 @@ def setup_logging(logs_dir: Path) -> None:
     logger.info("Logging started — writing to %s", log_file)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _tg_user(message) -> str:
-    """Return a readable identifier for the Telegram sender."""
-    u = message.from_user
-    if u is None:
-        return "unknown"
-    return f"@{u.username}" if u.username else (u.full_name or str(u.id))
-
-
-def _send_long_message(bot, chat_id, text, reply_to_id=None, max_len=4096,
-                       parse_mode=None):
-    """Split text into chunks and send as separate messages."""
-    while text:
-        if len(text) <= max_len:
-            chunk, text = text, ""
-        else:
-            cut = text.rfind("\n", 0, max_len)
-            if cut <= 0:
-                cut = max_len
-            chunk, text = text[:cut], text[cut:].lstrip("\n")
-        if reply_to_id:
-            bot.send_message(chat_id, chunk, parse_mode=parse_mode,
-                             reply_parameters=telebot.types.ReplyParameters(
-                                 message_id=reply_to_id))
-            reply_to_id = None  # only reply on the first chunk
-        else:
-            bot.send_message(chat_id, chunk, parse_mode=parse_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -561,18 +531,12 @@ class LogWatcher(FileSystemEventHandler):
 # ---------------------------------------------------------------------------
 # 6. Notification Callback
 # ---------------------------------------------------------------------------
-def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
-                         achievements: dict, deaths: dict):
+def make_notify_callback(names: dict, achievements: dict, deaths: dict):
     _last_event: dict = {}
     _cooldown = 3
 
     def _send_to_chats(msg: str) -> None:
-        chat_ids = auth.get("authorized_chat_ids", [])
-        for chat_id in chat_ids:
-            try:
-                bot.send_message(chat_id, msg)
-            except Exception as e:
-                logger.warning("Failed to send notification to chat %s: %s", chat_id, e)
+        _announce(msg)
 
     def notify(event_type: str, payload) -> None:
         if event_type == "achievement":
@@ -594,9 +558,8 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
 
             verb = _ACH_VERB_MAP[ach_type]
             msg = f"{player} has {verb} [{achievement}]"
-            chat_ids = auth.get("authorized_chat_ids", [])
             logger.info("Achievement: %s — %s — sending to %d chat(s)",
-                        player, achievement, len(chat_ids))
+                        player, achievement, _announce_chat_count())
             _send_to_chats(msg)
             return
 
@@ -610,9 +573,8 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
                 record_death(uuid, death_msg, timestamp, deaths, _DEATHS_PATH)
 
             msg = f"{player} {death_msg}"
-            chat_ids = auth.get("authorized_chat_ids", [])
             logger.info("Death: %s %s — sending to %d chat(s)",
-                        player, death_msg, len(chat_ids))
+                        player, death_msg, _announce_chat_count())
             _send_to_chats(msg)
             return
 
@@ -642,8 +604,8 @@ def make_notify_callback(bot: telebot.TeleBot, auth: dict, names: dict,
         status = "online" if event_type == "join" else "offline"
         msg = f"{name} {verb}\nPlayers online: {count} ({names_str})"
 
-        chat_ids = auth.get("authorized_chat_ids", [])
-        logger.info("Notification: player %s %s — sending to %d chat(s)", name, status, len(chat_ids))
+        logger.info("Notification: player %s %s — sending to %d chat(s)",
+                    name, status, _announce_chat_count())
         _send_to_chats(msg)
 
         # Incremental backup triggers
@@ -741,13 +703,76 @@ def _scan_log_for_deaths(file_path: Path, date_str: str,
     return count
 
 
+def _scan_logs(scan_fn, names: dict, store: dict) -> int:
+    """Run ``scan_fn`` over every rotated ``*.log.gz`` (by embedded date) plus the
+    live log, returning the total newly-recorded count. Shared by /scan_deaths
+    and /scan_achievements."""
+    logs_dir = LOG_PATH.parent
+    total = 0
+    for gz_path in sorted(logs_dir.glob("*.log.gz")):
+        m = RE_GZ_DATE.match(gz_path.name)
+        if not m:
+            continue
+        date_str = m.group(1)
+        extracted = gz_path.with_suffix("")  # remove .gz
+        try:
+            with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
+                with open(extracted, "w", encoding="utf-8") as out_f:
+                    out_f.write(gz_f.read())
+            total += scan_fn(extracted, date_str, names, store)
+        except Exception as e:
+            logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
+        finally:
+            if extracted.exists():
+                extracted.unlink()
+    if LOG_PATH.exists():
+        total += scan_fn(LOG_PATH, datetime.now().strftime("%Y-%m-%d"), names, store)
+    return total
+
+
 # ---------------------------------------------------------------------------
 # 7d. RCON & Backup
 # ---------------------------------------------------------------------------
 _backup_lock = threading.Lock()
-_bot_ref: telebot.TeleBot | None = None
-_auth_ref: dict | None = None
 _watcher_ref: LogWatcher | None = None
+
+# Active chat adapters (Telegram, Slack, …) and the per-platform auth object,
+# set in main(). Announcements fan out across all of them; command replies go
+# only to the originating adapter (Context.reply).
+ADAPTERS: list = []
+_AUTH: dict = {}
+
+
+def _announce(msg: str) -> int:
+    """Send an announcement to every authorized chat on every platform. Returns
+    how many chats it was sent to."""
+    sent = 0
+    for adapter in ADAPTERS:
+        ns = _AUTH.get(adapter.name) or {}
+        for chat_id in ns.get("authorized_chat_ids", []):
+            try:
+                adapter.send(chat_id, msg)
+                sent += 1
+            except Exception as e:
+                logger.warning("Announce to %s/%s failed: %s",
+                               adapter.name, chat_id, e)
+    return sent
+
+
+def _alert_admins(msg: str) -> None:
+    """Send an operational alert to each platform's admin (if claimed)."""
+    for adapter in ADAPTERS:
+        admin = (_AUTH.get(adapter.name) or {}).get("admin_user_id")
+        if admin:
+            try:
+                adapter.send(admin, msg)
+            except Exception:
+                logger.warning("Failed to alert %s admin", adapter.name)
+
+
+def _announce_chat_count() -> int:
+    return sum(len((_AUTH.get(a.name) or {}).get("authorized_chat_ids", []))
+               for a in ADAPTERS)
 
 # /restore_player pending-state, keyed by admin user_id.
 # Forces the admin through the list -> select -> confirm sequence so a typo
@@ -887,7 +912,7 @@ def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:
         log(f"Player sidecar generation failed: {e}")
 
 
-def run_backup(bot: telebot.TeleBot, auth: dict, status_cb=None):
+def run_backup(status_cb=None):
     """Run a full server backup.
 
     Full backup process:
@@ -1345,14 +1370,32 @@ _AUTH_PATH = Path(__file__).parent / "auth.json"
 _auth_lock = threading.Lock()
 
 
+def _normalize_ns(ns: dict) -> dict:
+    """Normalize one platform's auth namespace: string IDs throughout."""
+    admin = ns.get("admin_user_id")
+    return {
+        "admin_user_id": str(admin) if admin is not None else None,
+        "authorized_chat_ids": [str(c) for c in ns.get("authorized_chat_ids", [])],
+    }
+
+
 def load_auth(path: Path) -> dict:
+    """Load per-platform auth: {platform: {admin_user_id, authorized_chat_ids}}.
+
+    Migrates the pre-multi-platform flat shape ({admin_user_id,
+    authorized_chat_ids}) into the ``telegram`` namespace so existing installs
+    keep their admin and whitelist.
+    """
+    data = {}
     if path.exists():
         try:
             with open(path) as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
             logger.exception("Failed to load auth.json")
-    return {"admin_user_id": None, "authorized_chat_ids": []}
+    if "admin_user_id" in data or "authorized_chat_ids" in data:
+        data = {"telegram": data}  # migrate flat -> telegram namespace
+    return {platform: _normalize_ns(ns) for platform, ns in data.items()}
 
 
 def save_auth(auth: dict, path: Path) -> None:
@@ -1360,63 +1403,38 @@ def save_auth(auth: dict, path: Path) -> None:
         json.dump(auth, f, indent=2)
 
 
-def is_admin(user_id: int, auth: dict) -> bool:
-    return auth.get("admin_user_id") == user_id
+def _auth_ns(auth: dict, platform: str) -> dict:
+    return auth.setdefault(
+        platform, {"admin_user_id": None, "authorized_chat_ids": []})
 
 
-def is_authorized(chat_id: int, auth: dict) -> bool:
-    if auth.get("admin_user_id") is not None and chat_id == auth["admin_user_id"]:
-        return True
-    return chat_id in auth.get("authorized_chat_ids", [])
+def is_admin(platform: str, user_id, auth: dict) -> bool:
+    admin = (auth.get(platform) or {}).get("admin_user_id")
+    return admin is not None and str(admin) == str(user_id)
 
 
-def _guard(message, auth: dict) -> bool:
-    """Return True if the message should be processed."""
-    chat_type = message.chat.type
-    chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else None
-
-    if chat_type == "private":
-        admin_id = auth.get("admin_user_id")
-        if admin_id is None:
-            return True  # unclaimed — allow for admin claim
-        return user_id == admin_id
-
-    if chat_type in ("group", "supergroup"):
-        return chat_id in auth.get("authorized_chat_ids", [])
-
-    return False
+def is_authorized(platform: str, chat_id, user_id, is_private: bool,
+                  auth: dict) -> bool:
+    """A command is processed only from the platform admin (in private) or an
+    authorized chat (in a group/channel)."""
+    ns = auth.get(platform) or {}
+    if is_private:
+        admin = ns.get("admin_user_id")
+        return admin is not None and str(admin) == str(user_id)
+    return str(chat_id) in ns.get("authorized_chat_ids", [])
 
 
 # ---------------------------------------------------------------------------
 # 9. Bot Commands
 # ---------------------------------------------------------------------------
-def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
+def register_commands(router, auth: dict, names: dict,
                       achievements: dict, deaths: dict) -> None:
-
-    def guard(message) -> bool:
-        return _guard(message, auth)
-
-    # --- Admin claim (private chat, unclaimed) ---
-    @bot.message_handler(func=lambda m: (
-        m.chat.type == "private"
-        and auth.get("admin_user_id") is None
-    ))
-    def claim_admin(message):
-        with _auth_lock:
-            if auth.get("admin_user_id") is not None:
-                return
-            auth["admin_user_id"] = message.from_user.id
-            save_auth(auth, _AUTH_PATH)
-        logger.info("Admin claimed by %s (id=%s)", _tg_user(message), message.from_user.id)
-        bot.reply_to(message, "You are now the admin.")
+    """Register every command on the platform-agnostic router. Handlers take a
+    Context and reply via it, so the same logic serves any chat platform."""
 
     # --- /start, /help ---
-    @bot.message_handler(commands=["start", "help"])
-    def cmd_help(message):
-        if not guard(message):
-            return
-        logger.info("Help: requested by %s", _tg_user(message))
+    def cmd_help(ctx):
+        logger.info("Help: requested by %s", ctx.sender_label)
         lines = [
             "Available commands:",
             "/status — show online players",
@@ -1435,7 +1453,7 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 "/death_summary — deaths grouped by cause",
             ]
         lines.append("/chat_id — show this chat's ID")
-        if message.chat.type == "private" and is_admin(message.from_user.id, auth):
+        if ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth):
             lines += [
                 "/authorize <chat_id> — whitelist a chat",
                 "/revoke <chat_id> — remove a chat from whitelist",
@@ -1446,260 +1464,160 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
             if BACKEND.supports(EVENT_DEATH):
                 lines.append("/scan_deaths — scan all logs for deaths")
             lines.append("/backup — trigger a server backup now")
-        bot.reply_to(message, "\n".join(lines))
+        ctx.reply("\n".join(lines))
+    router.register(["start", "help"], cmd_help)
 
     # --- /status ---
-    @bot.message_handler(commands=["status"])
-    def cmd_status(message):
-        if not guard(message):
-            return
-        logger.info("Status: requested by %s", _tg_user(message))
+    def cmd_status(ctx):
+        logger.info("Status: requested by %s", ctx.sender_label)
         online = get_online_players()
         if online:
-            bot.reply_to(message, f"Players online: {len(online)} ({', '.join(online)})")
+            ctx.reply(f"Players online: {len(online)} ({', '.join(online)})")
         else:
-            bot.reply_to(message, "No players currently online.")
+            ctx.reply("No players currently online.")
+    router.register("status", cmd_status)
 
     # --- /stats ---
-    @bot.message_handler(commands=["stats"])
-    def cmd_stats(message):
-        if not guard(message):
-            return
-        if not BACKEND.supports(CAP_STATS):
-            bot.reply_to(message, "Player statistics are not available on this "
-                                  "server edition.")
-            return
-        refresh_player_names(names, _NAMES_PATH)
-        args = message.text.split(maxsplit=1)
-        target = args[1].strip().lower() if len(args) > 1 else None
-        logger.info("Stats: requested by %s (player=%s)", _tg_user(message), target or "all")
-
+    def cmd_stats(ctx):
+        refresh_player_names(names)
+        target = ctx.args[0].lower() if ctx.args else None
+        logger.info("Stats: requested by %s (player=%s)", ctx.sender_label, target or "all")
         all_stats = BACKEND.player_stats(names)
         if not all_stats:
-            bot.reply_to(message, "No player statistics recorded yet.")
+            ctx.reply("No player statistics recorded yet.")
             return
-
         if target:
             matches = [p for p in all_stats if p["name"].lower() == target]
             if not matches:
-                bot.reply_to(message, f"No player found matching '{target}'.")
+                ctx.reply(f"No player found matching '{target}'.")
                 return
-            bot.reply_to(message, _format_stats(matches[0]))
+            ctx.reply(_format_stats(matches[0]))
         else:
             lines = [_format_stats(p) for p in sorted(all_stats, key=lambda p: p["name"].lower())]
-            bot.reply_to(message, "\n\n".join(lines))
+            ctx.reply("\n\n".join(lines))
+    router.register("stats", cmd_stats, cap=lambda: BACKEND.supports(CAP_STATS),
+                    cap_message="Player statistics are not available on this server edition.")
 
     # --- /playtime ---
-    @bot.message_handler(commands=["playtime"])
-    def cmd_playtime(message):
-        if not guard(message):
-            return
-        if not BACKEND.supports(CAP_STATS):
-            bot.reply_to(message, "Playtime is not available on this server edition.")
-            return
-        refresh_player_names(names, _NAMES_PATH)
-        logger.info("Playtime: requested by %s", _tg_user(message))
+    def cmd_playtime(ctx):
+        refresh_player_names(names)
+        logger.info("Playtime: requested by %s", ctx.sender_label)
         all_stats = BACKEND.player_stats(names)
         if not all_stats:
-            bot.reply_to(message, "No player statistics recorded yet.")
+            ctx.reply("No player statistics recorded yet.")
             return
         ranked = sorted(all_stats, key=lambda p: p["time_played_hours"], reverse=True)
         lines = [f"{i+1}. {p['name']} — {p['time_played_hours']}h" for i, p in enumerate(ranked)]
-        bot.reply_to(message, "Playtime leaderboard:\n" + "\n".join(lines))
+        ctx.reply("Playtime leaderboard:\n" + "\n".join(lines))
+    router.register("playtime", cmd_playtime, cap=lambda: BACKEND.supports(CAP_STATS),
+                    cap_message="Playtime is not available on this server edition.")
 
     # --- /list ---
-    @bot.message_handler(commands=["list"])
-    def cmd_list(message):
-        if not guard(message):
-            return
-        refresh_player_names(names, _NAMES_PATH)
-        logger.info("List: requested by %s", _tg_user(message))
+    def cmd_list(ctx):
+        refresh_player_names(names)
+        logger.info("List: requested by %s", ctx.sender_label)
         entries = BACKEND.list_known_players(names)
         if not entries:
-            bot.reply_to(message, "No players found.")
+            ctx.reply("No players found.")
             return
-        bot.reply_to(message, "Known players:\n" + "\n".join(entries))
+        ctx.reply("Known players:\n" + "\n".join(entries))
+    router.register("list", cmd_list)
 
     # --- /achievements ---
-    @bot.message_handler(commands=["achievements"])
-    def cmd_achievements(message):
-        if not guard(message):
-            return
-        if not BACKEND.supports(EVENT_ACHIEVEMENT):
-            bot.reply_to(message, "Achievements are not tracked on this server edition.")
-            return
-        refresh_player_names(names, _NAMES_PATH)
-        args = message.text.split(maxsplit=1)
-        target = args[1].strip().lower() if len(args) > 1 else None
-        logger.info("Achievements: requested by %s (player=%s)", _tg_user(message), target or "all")
-
+    def cmd_achievements(ctx):
+        refresh_player_names(names)
+        target = ctx.args[0].lower() if ctx.args else None
+        logger.info("Achievements: requested by %s (player=%s)", ctx.sender_label, target or "all")
         if not achievements:
-            bot.reply_to(message, "No achievements recorded yet.")
+            ctx.reply("No achievements recorded yet.")
             return
-
         if target:
-            uuid = None
-            for u, n in names.items():
-                if n.lower() == target:
-                    uuid = u
-                    break
+            uuid = next((u for u, n in names.items() if n.lower() == target), None)
             if not uuid or uuid not in achievements:
-                bot.reply_to(message, f"No achievements found for '{target}'.")
+                ctx.reply(f"No achievements found for '{target}'.")
                 return
             player_name = names.get(uuid, uuid)
-            entries = achievements[uuid]
             lines = [f"Achievements for {player_name}:"]
-            sorted_entries = sorted(entries, key=lambda x: x["timestamp"])
             current_date = None
-            for e in sorted_entries:
-                ts = e["timestamp"]
-                date_part, time_part = ts.split(" ", 1)
+            for e in sorted(achievements[uuid], key=lambda x: x["timestamp"]):
+                date_part, time_part = e["timestamp"].split(" ", 1)
                 try:
                     formatted_date = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%b-%Y")
                 except ValueError:
                     formatted_date = date_part
-                time_short = time_part[:5]  # HH:MM
                 if formatted_date != current_date:
                     current_date = formatted_date
                     lines.append(f"\n{formatted_date}")
-                lines.append(f"  {time_short} | {e['type']:<11} | {e['achievement']}")
-            text = "<pre>" + "\n".join(lines) + "</pre>"
-            _send_long_message(bot, message.chat.id, text,
-                               reply_to_id=message.message_id,
-                               parse_mode="HTML")
+                lines.append(f"  {time_part[:5]} | {e['type']:<11} | {e['achievement']}")
+            ctx.reply("\n".join(lines), monospace=True)
         else:
             lines = []
             for uuid, entries in sorted(achievements.items(),
                                         key=lambda x: names.get(x[0], x[0]).lower()):
-                player_name = names.get(uuid, uuid)
-                lines.append(f"{player_name}: {len(entries)} achievement(s)")
-            _send_long_message(bot, message.chat.id,
-                               "Achievements summary:\n" + "\n".join(lines),
-                               reply_to_id=message.message_id)
+                lines.append(f"{names.get(uuid, uuid)}: {len(entries)} achievement(s)")
+            ctx.reply("Achievements summary:\n" + "\n".join(lines))
+    router.register("achievements", cmd_achievements,
+                    cap=lambda: BACKEND.supports(EVENT_ACHIEVEMENT),
+                    cap_message="Achievements are not tracked on this server edition.")
 
     # --- /scan_achievements ---
-    @bot.message_handler(commands=["scan_achievements"])
-    def cmd_scan_achievements(message):
-        if message.chat.type != "private":
-            return
-        if not is_admin(message.from_user.id, auth):
-            return
-        if not BACKEND.supports(EVENT_ACHIEVEMENT):
-            bot.reply_to(message, "Achievements are not tracked on this server edition.")
-            return
-        logger.info("ScanAchievements: requested by %s", _tg_user(message))
-        refresh_player_names(names, _NAMES_PATH)
-        bot.reply_to(message, "Scanning log files for achievements...")
-
-        logs_dir = LOG_PATH.parent
-        total = 0
-
-        gz_files = sorted(logs_dir.glob("*.log.gz"))
-        for gz_path in gz_files:
-            m = RE_GZ_DATE.match(gz_path.name)
-            if not m:
-                continue
-            date_str = m.group(1)
-            extracted = gz_path.with_suffix("")  # remove .gz
-            try:
-                with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
-                    with open(extracted, "w", encoding="utf-8") as out_f:
-                        out_f.write(gz_f.read())
-                total += _scan_log_for_achievements(extracted, date_str,
-                                                    names, achievements)
-            except Exception as e:
-                logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
-            finally:
-                if extracted.exists():
-                    extracted.unlink()
-
-        # Scan latest.log
-        if LOG_PATH.exists():
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            total += _scan_log_for_achievements(LOG_PATH, date_str,
-                                                names, achievements)
-
-        bot.send_message(message.chat.id,
-                         f"Scan complete. {total} new achievement(s) recorded.")
+    def cmd_scan_achievements(ctx):
+        logger.info("ScanAchievements: requested by %s", ctx.sender_label)
+        refresh_player_names(names)
+        ctx.reply("Scanning log files for achievements...")
+        total = _scan_logs(_scan_log_for_achievements, names, achievements)
+        ctx.reply(f"Scan complete. {total} new achievement(s) recorded.")
         logger.info("ScanAchievements: %d new achievement(s) found", total)
+    router.register("scan_achievements", cmd_scan_achievements,
+                    private_only=True, admin_only=True,
+                    cap=lambda: BACKEND.supports(EVENT_ACHIEVEMENT),
+                    cap_message="Achievements are not tracked on this server edition.")
 
     # --- /deaths ---
-    @bot.message_handler(commands=["deaths"])
-    def cmd_deaths(message):
-        if not guard(message):
-            return
-        if not BACKEND.supports(EVENT_DEATH):
-            bot.reply_to(message, "Deaths are not tracked on this server edition.")
-            return
-        refresh_player_names(names, _NAMES_PATH)
-        args = message.text.split(maxsplit=1)
-        target = args[1].strip().lower() if len(args) > 1 else None
-        logger.info("Deaths: requested by %s (player=%s)", _tg_user(message), target or "all")
-
+    def cmd_deaths(ctx):
+        refresh_player_names(names)
+        target = ctx.args[0].lower() if ctx.args else None
+        logger.info("Deaths: requested by %s (player=%s)", ctx.sender_label, target or "all")
         if not deaths:
-            bot.reply_to(message, "No deaths recorded yet.")
+            ctx.reply("No deaths recorded yet.")
             return
-
         if target:
-            uuid = None
-            for u, n in names.items():
-                if n.lower() == target:
-                    uuid = u
-                    break
+            uuid = next((u for u, n in names.items() if n.lower() == target), None)
             if not uuid or uuid not in deaths:
-                bot.reply_to(message, f"No deaths found for '{target}'.")
+                ctx.reply(f"No deaths found for '{target}'.")
                 return
             player_name = names.get(uuid, uuid)
             entries = deaths[uuid]
             lines = [f"Deaths for {player_name} ({len(entries)} total):"]
-            sorted_entries = sorted(entries, key=lambda x: x["timestamp"])
             current_date = None
-            for e in sorted_entries:
-                ts = e["timestamp"]
-                date_part, time_part = ts.split(" ", 1)
+            for e in sorted(entries, key=lambda x: x["timestamp"]):
+                date_part, time_part = e["timestamp"].split(" ", 1)
                 try:
                     formatted_date = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%b-%Y")
                 except ValueError:
                     formatted_date = date_part
-                time_short = time_part[:5]
                 if formatted_date != current_date:
                     current_date = formatted_date
                     lines.append(f"\n{formatted_date}")
-                lines.append(f"  {time_short} | {e['message']}")
-            text = "<pre>" + "\n".join(lines) + "</pre>"
-            _send_long_message(bot, message.chat.id, text,
-                               reply_to_id=message.message_id,
-                               parse_mode="HTML")
+                lines.append(f"  {time_part[:5]} | {e['message']}")
+            ctx.reply("\n".join(lines), monospace=True)
         else:
-            ranked = []
-            for uuid, entries in deaths.items():
-                player_name = names.get(uuid, uuid)
-                ranked.append((player_name, len(entries)))
-            ranked.sort(key=lambda x: x[1], reverse=True)
+            ranked = sorted(((names.get(u, u), len(e)) for u, e in deaths.items()),
+                            key=lambda x: x[1], reverse=True)
             lines = ["Death summary:"]
             for player_name, count in ranked:
                 lines.append(f"  {player_name}: {count} death(s)")
-            text = "<pre>" + "\n".join(lines) + "</pre>"
-            _send_long_message(bot, message.chat.id, text,
-                               reply_to_id=message.message_id,
-                               parse_mode="HTML")
+            ctx.reply("\n".join(lines), monospace=True)
+    router.register("deaths", cmd_deaths, cap=lambda: BACKEND.supports(EVENT_DEATH),
+                    cap_message="Deaths are not tracked on this server edition.")
 
     # --- /death_summary ---
-    @bot.message_handler(commands=["death_summary"])
-    def cmd_death_summary(message):
-        if not guard(message):
-            return
-        if not BACKEND.supports(EVENT_DEATH):
-            bot.reply_to(message, "Deaths are not tracked on this server edition.")
-            return
-        refresh_player_names(names, _NAMES_PATH)
-        logger.info("DeathSummary: requested by %s", _tg_user(message))
-
+    def cmd_death_summary(ctx):
+        refresh_player_names(names)
+        logger.info("DeathSummary: requested by %s", ctx.sender_label)
         if not deaths:
-            bot.reply_to(message, "No deaths recorded yet.")
+            ctx.reply("No deaths recorded yet.")
             return
-
-        # Build category -> {player_name: count}
         categories = {}
         grand_total = 0
         for uuid, entries in deaths.items():
@@ -1709,329 +1627,241 @@ def register_handlers(bot: telebot.TeleBot, auth: dict, names: dict,
                 counts = categories.setdefault(cat, {})
                 counts[player_name] = counts.get(player_name, 0) + 1
                 grand_total += 1
-
-        # Format output
         lines = [f"Death Summary ({grand_total} total)", ""]
-
-        # Use the defined category order, then "Other" last
         ordered = [cat for cat, _ in _DEATH_CATEGORIES]
         for cat in ordered:
             if cat not in categories:
                 continue
             counts = categories.pop(cat)
-            cat_total = sum(counts.values())
-            lines.append(f"{cat}: {cat_total}")
-            ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-            for player_name, count in ranked:
+            lines.append(f"{cat}: {sum(counts.values())}")
+            for player_name, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
                 lines.append(f"  {player_name:<16} {count}")
             lines.append("")
-
-        # Any remaining "Other" deaths
         if "Other" in categories:
             counts = categories["Other"]
-            cat_total = sum(counts.values())
-            lines.append(f"Other: {cat_total}")
-            ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-            for player_name, count in ranked:
+            lines.append(f"Other: {sum(counts.values())}")
+            for player_name, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
                 lines.append(f"  {player_name:<16} {count}")
             lines.append("")
-
-        text = "<pre>" + "\n".join(lines).rstrip() + "</pre>"
-        _send_long_message(bot, message.chat.id, text,
-                           reply_to_id=message.message_id,
-                           parse_mode="HTML")
+        ctx.reply("\n".join(lines).rstrip(), monospace=True)
+    router.register("death_summary", cmd_death_summary,
+                    cap=lambda: BACKEND.supports(EVENT_DEATH),
+                    cap_message="Deaths are not tracked on this server edition.")
 
     # --- /scan_deaths ---
-    @bot.message_handler(commands=["scan_deaths"])
-    def cmd_scan_deaths(message):
-        if message.chat.type != "private":
-            return
-        if not is_admin(message.from_user.id, auth):
-            return
-        if not BACKEND.supports(EVENT_DEATH):
-            bot.reply_to(message, "Deaths are not tracked on this server edition.")
-            return
-        logger.info("ScanDeaths: requested by %s", _tg_user(message))
-        refresh_player_names(names, _NAMES_PATH)
-        bot.reply_to(message, "Scanning log files for deaths...")
-
-        logs_dir = LOG_PATH.parent
-        total = 0
-
-        gz_files = sorted(logs_dir.glob("*.log.gz"))
-        for gz_path in gz_files:
-            m = RE_GZ_DATE.match(gz_path.name)
-            if not m:
-                continue
-            date_str = m.group(1)
-            extracted = gz_path.with_suffix("")
-            try:
-                with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
-                    with open(extracted, "w", encoding="utf-8") as out_f:
-                        out_f.write(gz_f.read())
-                total += _scan_log_for_deaths(extracted, date_str,
-                                              names, deaths)
-            except Exception as e:
-                logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
-            finally:
-                if extracted.exists():
-                    extracted.unlink()
-
-        if LOG_PATH.exists():
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            total += _scan_log_for_deaths(LOG_PATH, date_str, names, deaths)
-
-        bot.send_message(message.chat.id,
-                         f"Scan complete. {total} new death(s) recorded.")
+    def cmd_scan_deaths(ctx):
+        logger.info("ScanDeaths: requested by %s", ctx.sender_label)
+        refresh_player_names(names)
+        ctx.reply("Scanning log files for deaths...")
+        total = _scan_logs(_scan_log_for_deaths, names, deaths)
+        ctx.reply(f"Scan complete. {total} new death(s) recorded.")
         logger.info("ScanDeaths: %d new death(s) found", total)
+    router.register("scan_deaths", cmd_scan_deaths,
+                    private_only=True, admin_only=True,
+                    cap=lambda: BACKEND.supports(EVENT_DEATH),
+                    cap_message="Deaths are not tracked on this server edition.")
 
     # --- /backup ---
-    @bot.message_handler(commands=["backup"])
-    def cmd_backup(message):
-        if message.chat.type != "private":
-            return
-        if not is_admin(message.from_user.id, auth):
-            return
+    def cmd_backup(ctx):
         if not _backup_lock.acquire(blocking=False):
-            bot.reply_to(message, "A backup is already in progress.")
+            ctx.reply("A backup is already in progress.")
             return
-        logger.info("Backup: manually triggered by %s", _tg_user(message))
-        bot.reply_to(message, "Starting backup...")
+        logger.info("Backup: manually triggered by %s", ctx.sender_label)
+        ctx.reply("Starting backup...")
+        say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
         def run():
             try:
-                def status_cb(msg):
-                    bot.send_message(message.chat.id, msg)
-                path = run_backup(bot, auth, status_cb=status_cb)
-                bot.send_message(message.chat.id, f"Backup complete: {Path(path).name}")
+                path = run_backup(status_cb=say)
+                say(f"Backup complete: {Path(path).name}")
             except Exception as e:
                 logger.exception("Backup failed")
-                bot.send_message(message.chat.id, f"Backup failed: {e}")
+                say(f"Backup failed: {e}")
             finally:
                 _backup_lock.release()
 
         threading.Thread(target=run, daemon=True).start()
+    router.register("backup", cmd_backup, private_only=True, admin_only=True)
 
     # --- /restore_player ---
-    @bot.message_handler(commands=["restore_player"])
-    def cmd_restore_player(message):
-        if message.chat.type != "private":
+    def cmd_restore_player(ctx):
+        pkey = f"{ctx.platform}:{ctx.user_id}"
+        if not ctx.args:
+            ctx.reply("Usage:\n"
+                      "  /restore_player <username>\n"
+                      "  /restore_player <username> more\n"
+                      "  /restore_player <username> <N>\n"
+                      "  /restore_player <username> <N> confirm")
             return
-        if not is_admin(message.from_user.id, auth):
-            return
-        if not BACKEND.supports(CAP_PLAYER_RESTORE):
-            bot.reply_to(message, "Per-player restore is not available on this "
-                                  "server edition.")
-            return
-
-        # Parse: /restore_player <username> [<N>] [confirm]
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message,
-                         "Usage:\n"
-                         "  /restore_player <username>\n"
-                         "  /restore_player <username> more\n"
-                         "  /restore_player <username> <N>\n"
-                         "  /restore_player <username> <N> confirm")
-            return
-        typed_name = args[1]
-        typed_n = args[2] if len(args) >= 3 else None
-        typed_confirm = args[3] if len(args) >= 4 else None
+        typed_name = ctx.args[0]
+        typed_n = ctx.args[1] if len(ctx.args) >= 2 else None
+        typed_confirm = ctx.args[2] if len(ctx.args) >= 3 else None
         if typed_confirm is not None and typed_confirm.lower() != "confirm":
-            bot.reply_to(message, f"Unexpected argument: '{typed_confirm}' "
-                                  f"(did you mean 'confirm'?)")
+            ctx.reply(f"Unexpected argument: '{typed_confirm}' (did you mean 'confirm'?)")
             return
-
-        # Resolve UUID and canonical name
         resolved = BACKEND.resolve_player(typed_name, names)
         if resolved is None:
-            bot.reply_to(message, f"Unknown player: {typed_name}")
+            ctx.reply(f"Unknown player: {typed_name}")
             return
         canonical, uuid = resolved
-        user_id = message.from_user.id
 
-        # --- Step 1: list ---
         if typed_n is None:
             versions = BACKEND.list_player_versions(uuid, _load_manifest()[:2])
             if not versions:
-                _clear_pending_player_restore(user_id)
-                bot.reply_to(message, _format_versions_reply(canonical, uuid, versions))
+                _clear_pending_player_restore(pkey)
+                ctx.reply(_format_versions_reply(canonical, uuid, versions))
                 return
             _set_pending_player_restore(
-                user_id, stage="listed", username=canonical, uuid=uuid,
+                pkey, stage="listed", username=canonical, uuid=uuid,
                 versions=versions, selected_n=None, page_offset=0)
             logger.info("RestorePlayer: %s listed %d version(s) for %s",
-                        _tg_user(message), len(versions), canonical)
-            bot.reply_to(message, _format_versions_reply(canonical, uuid, versions, offset=0))
+                        ctx.sender_label, len(versions), canonical)
+            ctx.reply(_format_versions_reply(canonical, uuid, versions, offset=0))
             return
 
-        # --- "more": show next page of the listing ---
         if typed_n.lower() == "more":
-            entry = _get_pending_player_restore(user_id, expected_username=canonical)
+            entry = _get_pending_player_restore(pkey, expected_username=canonical)
             if entry is None:
-                bot.reply_to(message,
-                             f"Run /restore_player {canonical} first to see the list.")
+                ctx.reply(f"Run /restore_player {canonical} first to see the list.")
                 return
             new_offset = entry.get("page_offset", 0) + _RESTORE_PLAYER_PAGE_SIZE
             versions = entry["versions"]
             if new_offset >= len(versions):
-                bot.reply_to(message, f"No more versions for {canonical}.")
+                ctx.reply(f"No more versions for {canonical}.")
                 return
-            _set_pending_player_restore(user_id, page_offset=new_offset)
+            _set_pending_player_restore(pkey, page_offset=new_offset)
             logger.info("RestorePlayer: %s paged to offset %d for %s",
-                        _tg_user(message), new_offset, canonical)
-            bot.reply_to(message,
-                         _format_versions_reply(canonical, uuid, versions, offset=new_offset))
+                        ctx.sender_label, new_offset, canonical)
+            ctx.reply(_format_versions_reply(canonical, uuid, versions, offset=new_offset))
             return
 
-        # Steps 2 and 3 require numeric N
         try:
             n = int(typed_n)
         except ValueError:
-            bot.reply_to(message, f"Invalid selection: '{typed_n}'. "
-                                  "Use a number or 'more'.")
+            ctx.reply(f"Invalid selection: '{typed_n}'. Use a number or 'more'.")
             return
 
-        # --- Step 3: confirm + execute ---
         if typed_confirm is not None:
             entry = _get_pending_player_restore(
-                user_id, expected_username=canonical, expected_stage="selected")
+                pkey, expected_username=canonical, expected_stage="selected")
             if entry is None or entry.get("selected_n") != n:
-                bot.reply_to(message,
-                             f"You must select a timestamp first with "
-                             f"/restore_player {canonical} {n}")
+                ctx.reply(f"You must select a timestamp first with "
+                          f"/restore_player {canonical} {n}")
                 return
-            # Re-scan and validate the chosen version still exists. Backup files
-            # could in theory have been deleted between selection and confirm.
             versions = BACKEND.list_player_versions(uuid, _load_manifest()[:2])
             if not (1 <= n <= len(versions)):
-                _clear_pending_player_restore(user_id)
-                bot.reply_to(message,
-                             f"Selection {n} is no longer valid (only "
-                             f"{len(versions)} version(s) available). "
-                             f"Run /restore_player {canonical} again.")
+                _clear_pending_player_restore(pkey)
+                ctx.reply(f"Selection {n} is no longer valid (only "
+                          f"{len(versions)} version(s) available). "
+                          f"Run /restore_player {canonical} again.")
                 return
             version = versions[n - 1]
-            logger.info("RestorePlayer: %s confirmed restore of %s to %s "
-                        "(source: %s)", _tg_user(message), canonical,
-                        version["timestamp"], version["source"])
-            bot.reply_to(message, f"Starting restore of {canonical} to "
-                                  f"{version['timestamp']}...")
-            _clear_pending_player_restore(user_id)
+            logger.info("RestorePlayer: %s confirmed restore of %s to %s (source: %s)",
+                        ctx.sender_label, canonical, version["timestamp"], version["source"])
+            ctx.reply(f"Starting restore of {canonical} to {version['timestamp']}...")
+            _clear_pending_player_restore(pkey)
+            say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
             def run():
-                # Hold the backup mutex for the whole restore (mutex with
-                # /backup and the incremental cycle). The backend does the
-                # edition-specific work; we just forward progress to Telegram.
                 if not _backup_lock.acquire(blocking=False):
-                    bot.send_message(message.chat.id,
-                                     "A backup or restore is in progress.")
+                    say("A backup or restore is in progress.")
                     return
-                chat_id = message.chat.id
-
-                def status_cb(msg):
-                    try:
-                        bot.send_message(chat_id, msg)
-                    except Exception:
-                        logger.exception("Failed to send status message")
-
                 try:
-                    BACKEND.restore_player(canonical, uuid, version, status_cb)
+                    BACKEND.restore_player(canonical, uuid, version, say)
                 finally:
                     _backup_lock.release()
 
             threading.Thread(target=run, daemon=True).start()
             return
 
-        # --- Step 2: select ---
-        # Must have come from step 1 (or a previous step 2) for this same user.
-        entry = _get_pending_player_restore(
-            user_id, expected_username=canonical)
+        entry = _get_pending_player_restore(pkey, expected_username=canonical)
         if entry is None:
-            bot.reply_to(message,
-                         f"Run /restore_player {canonical} first to see the list.")
+            ctx.reply(f"Run /restore_player {canonical} first to see the list.")
             return
         versions = entry["versions"]
         if not (1 <= n <= len(versions)):
-            bot.reply_to(message,
-                         f"Invalid selection: {n}. Choose 1-{len(versions)}.")
+            ctx.reply(f"Invalid selection: {n}. Choose 1-{len(versions)}.")
             return
         version = versions[n - 1]
         _set_pending_player_restore(
-            user_id, stage="selected", username=canonical, uuid=uuid,
+            pkey, stage="selected", username=canonical, uuid=uuid,
             versions=versions, selected_n=n)
         logger.info("RestorePlayer: %s selected version %d (%s) for %s",
-                    _tg_user(message), n, version["source"], canonical)
-        bot.reply_to(message, _format_confirm_reply(canonical, uuid, n, version))
+                    ctx.sender_label, n, version["source"], canonical)
+        ctx.reply(_format_confirm_reply(canonical, uuid, n, version))
+    router.register("restore_player", cmd_restore_player,
+                    private_only=True, admin_only=True,
+                    cap=lambda: BACKEND.supports(CAP_PLAYER_RESTORE),
+                    cap_message="Per-player restore is not available on this server edition.")
 
-    # --- /chat_id ---
-    @bot.message_handler(commands=["chat_id"])
-    def cmd_chat_id(message):
-        logger.info("ChatID: requested by %s (chat=%s)", _tg_user(message), message.chat.id)
-        bot.reply_to(message, f"Chat ID: {message.chat.id}")
+    # --- /chat_id (public — lets an unauthorized chat learn its ID) ---
+    def cmd_chat_id(ctx):
+        logger.info("ChatID: requested by %s (chat=%s)", ctx.sender_label, ctx.chat_id)
+        ctx.reply(f"Chat ID: {ctx.chat_id}")
+    router.register("chat_id", cmd_chat_id, public=True)
 
     # --- /authorize ---
-    @bot.message_handler(commands=["authorize"])
-    def cmd_authorize(message):
-        if message.chat.type != "private":
+    def cmd_authorize(ctx):
+        if not ctx.args:
+            ctx.reply("Usage: /authorize <chat_id>")
             return
-        if not is_admin(message.from_user.id, auth):
-            return
-        args = message.text.split(maxsplit=1)
-        if len(args) > 1:
-            try:
-                target_id = int(args[1].strip())
-            except ValueError:
-                bot.reply_to(message, "Invalid chat ID.")
-                return
-        else:
-            bot.reply_to(message, "Usage: /authorize <chat_id>")
-            return
+        target_id = str(ctx.args[0]).strip()
         with _auth_lock:
-            if target_id not in auth["authorized_chat_ids"]:
-                auth["authorized_chat_ids"].append(target_id)
+            ns = _auth_ns(auth, ctx.platform)
+            if target_id not in ns["authorized_chat_ids"]:
+                ns["authorized_chat_ids"].append(target_id)
                 save_auth(auth, _AUTH_PATH)
-        logger.info("Authorize: chat %s added by %s", target_id, _tg_user(message))
-        bot.reply_to(message, f"Chat {target_id} is now authorized.")
+        logger.info("Authorize: chat %s added by %s on %s",
+                    target_id, ctx.sender_label, ctx.platform)
+        ctx.reply(f"Chat {target_id} is now authorized.")
+    router.register("authorize", cmd_authorize, private_only=True, admin_only=True)
 
     # --- /revoke ---
-    @bot.message_handler(commands=["revoke"])
-    def cmd_revoke(message):
-        if message.chat.type != "private":
+    def cmd_revoke(ctx):
+        if not ctx.args:
+            ctx.reply("Usage: /revoke <chat_id>")
             return
-        if not is_admin(message.from_user.id, auth):
-            return
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2:
-            bot.reply_to(message, "Usage: /revoke <chat_id>")
-            return
-        try:
-            target_id = int(args[1].strip())
-        except ValueError:
-            bot.reply_to(message, "Invalid chat ID.")
-            return
+        target_id = str(ctx.args[0]).strip()
         with _auth_lock:
-            if target_id in auth["authorized_chat_ids"]:
-                auth["authorized_chat_ids"].remove(target_id)
+            ns = _auth_ns(auth, ctx.platform)
+            if target_id in ns["authorized_chat_ids"]:
+                ns["authorized_chat_ids"].remove(target_id)
                 save_auth(auth, _AUTH_PATH)
-                logger.info("Revoke: chat %s removed by %s", target_id, _tg_user(message))
-                bot.reply_to(message, f"Chat {target_id} has been revoked.")
+                logger.info("Revoke: chat %s removed by %s on %s",
+                            target_id, ctx.sender_label, ctx.platform)
+                ctx.reply(f"Chat {target_id} has been revoked.")
             else:
-                bot.reply_to(message, f"Chat {target_id} was not authorized.")
+                ctx.reply(f"Chat {target_id} was not authorized.")
+    router.register("revoke", cmd_revoke, private_only=True, admin_only=True)
 
     # --- /listchats ---
-    @bot.message_handler(commands=["listchats"])
-    def cmd_listchats(message):
-        if message.chat.type != "private":
-            return
-        if not is_admin(message.from_user.id, auth):
-            return
-        logger.info("ListChats: requested by %s", _tg_user(message))
-        ids = auth.get("authorized_chat_ids", [])
+    def cmd_listchats(ctx):
+        logger.info("ListChats: requested by %s", ctx.sender_label)
+        ids = (auth.get(ctx.platform) or {}).get("authorized_chat_ids", [])
         if ids:
-            bot.reply_to(message, "Authorized chats:\n" + "\n".join(str(i) for i in ids))
+            ctx.reply("Authorized chats:\n" + "\n".join(str(i) for i in ids))
         else:
-            bot.reply_to(message, "No authorized chats.")
+            ctx.reply("No authorized chats.")
+    router.register("listchats", cmd_listchats, private_only=True, admin_only=True)
+
+
+def _make_unclaimed_handler(auth: dict):
+    """Build the admin-claim hook: the first private message on a platform with
+    no admin yet claims that platform's admin."""
+    def on_unclaimed(ctx) -> bool:
+        ns = auth.get(ctx.platform) or {}
+        if ns.get("admin_user_id") is not None or not ctx.is_private:
+            return False
+        with _auth_lock:
+            if _auth_ns(auth, ctx.platform).get("admin_user_id") is not None:
+                return False
+            _auth_ns(auth, ctx.platform)["admin_user_id"] = ctx.user_id
+            save_auth(auth, _AUTH_PATH)
+        logger.info("Admin claimed on %s by %s (id=%s)",
+                    ctx.platform, ctx.sender_label, ctx.user_id)
+        ctx.reply("You are now the admin.")
+        return True
+    return on_unclaimed
 
 
 # ---------------------------------------------------------------------------
@@ -2044,33 +1874,39 @@ def main():
     achievements = load_achievements(_ACHIEVEMENTS_PATH)
     deaths = load_deaths(_DEATHS_PATH)
 
-    bot = telebot.TeleBot(BOT_TOKEN)
+    global _watcher_ref, BACKEND, ADAPTERS, _AUTH
+    _AUTH = auth
 
-    global _bot_ref, _auth_ref, _watcher_ref, BACKEND
-    _bot_ref = bot
-    _auth_ref = auth
+    # Build the chat adapters (Telegram, Slack, …). They're constructed now but
+    # only started later, after the backend and command router are ready.
+    ADAPTERS = make_adapters(CONFIG)
+    logger.info("Chat platforms: %s", ", ".join(a.name for a in ADAPTERS))
 
-    # Construct the edition-specific backend FIRST — the name registry is sourced
-    # from it. Bedrock raises BackendUnavailable if no tmux/screen session is
-    # hosting the server — exit gracefully.
+    # Construct the edition-specific backend — the name registry is sourced from
+    # it. Bedrock raises BackendUnavailable if no tmux/screen session is hosting
+    # the server — exit gracefully (alerting each platform's admin).
     try:
         BACKEND = make_backend(CONFIG)
     except BackendUnavailable as e:
         logger.error("Cannot start backend for edition '%s': %s", CONFIG.edition, e)
-        admin_id = auth.get("admin_user_id")
-        if admin_id:
-            try:
-                bot.send_message(admin_id, f"⚠️ mcnotifier cannot start: {e}")
-            except Exception:
-                pass
+        _alert_admins(f"⚠️ mcnotifier cannot start: {e}")
         return
     logger.info("Server edition: %s", CONFIG.edition)
 
     names = load_player_names()  # now backed by BACKEND.load_names()
 
-    register_handlers(bot, auth, names, achievements, deaths)
+    # Command router shared by all adapters; replies go to the originating chat.
+    router = CommandRouter(
+        auth,
+        is_admin=lambda platform, uid: is_admin(platform, uid, auth),
+        is_authorized=lambda platform, cid, uid, priv:
+            is_authorized(platform, cid, uid, priv, auth),
+        on_unclaimed=_make_unclaimed_handler(auth),
+        logger=logger,
+    )
+    register_commands(router, auth, names, achievements, deaths)
 
-    notify = make_notify_callback(bot, auth, names, achievements, deaths)
+    notify = make_notify_callback(names, achievements, deaths)
     watcher = LogWatcher(LOG_PATH, names, notify)
     _watcher_ref = watcher
     BACKEND.attach_watcher(watcher)
@@ -2126,16 +1962,10 @@ def main():
             # Never connected — server is likely not running. Alert the admin.
             logger.error("Could not connect to the Minecraft server. "
                          "Server may not be running.")
-            admin_id = auth.get("admin_user_id")
-            if admin_id:
-                try:
-                    bot.send_message(
-                        admin_id,
-                        "\u26a0\ufe0f Could not connect to the Minecraft server.\n"
-                        "The server may not be running or not ready yet.\n"
-                        "Backups and /list will not work until the server is up.")
-                except Exception:
-                    logger.warning("Failed to send connection alert to admin")
+            _alert_admins(
+                "\u26a0\ufe0f Could not connect to the Minecraft server.\n"
+                "The server may not be running or not ready yet.\n"
+                "Backups and /list will not work until the server is up.")
 
     # Validate incremental backup chain
     chain_id, base_full, _ = _load_manifest()
@@ -2151,31 +1981,6 @@ def main():
             _save_manifest({}, chain_id="", base_full="")
     else:
         logger.info("No backup chain established. Run /backup to start one.")
-
-    class _NetworkErrorFilter(logging.Filter):
-        _TRANSIENT = (
-            ("Network is unreachable", "network unreachable"),
-            ("NewConnectionError",     "network unreachable"),
-            ("Max retries exceeded",   "network unreachable"),
-            ("Read timed out",         "read timed out"),
-            ("read operation timed out", "read timed out"),
-            ("handshake operation timed out", "SSL handshake timed out"),
-            ("Bad Gateway",            "Telegram returned 502 Bad Gateway"),
-            ("Connection reset by peer", "connection reset by peer"),
-            ("Remote end closed connection without response", "remote end closed connection"),
-        )
-
-        def filter(self, record):
-            msg = record.getMessage()
-            for phrase, description in self._TRANSIENT:
-                if phrase in msg:
-                    # Only log warning for the exception line, not the traceback
-                    if "Exception traceback" not in msg:
-                        logger.warning("Polling: %s, retrying...", description)
-                    return False  # suppress from TeleBot logger
-            return True
-
-    logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter())
 
     # Scheduled full backup
     _BACKUP_HOUR = CONFIG.backup_hour
@@ -2224,15 +2029,10 @@ def main():
 
             logger.info("Scheduled %s backup starting", _BACKUP_SCHEDULE)
             def status_cb(msg):
-                admin_id = auth.get("admin_user_id")
-                if admin_id:
-                    try:
-                        bot.send_message(admin_id, f"[Backup] {msg}")
-                    except Exception:
-                        pass
+                _alert_admins(f"[Backup] {msg}")
 
             try:
-                path = run_backup(bot, auth, status_cb=status_cb)
+                path = run_backup(status_cb=status_cb)
                 status_cb(f"Complete: {Path(path).name}")
             except Exception as e:
                 logger.exception("Scheduled backup failed")
@@ -2241,11 +2041,24 @@ def main():
     backup_thread = threading.Thread(target=_scheduled_backup_loop, daemon=True)
     backup_thread.start()
 
+    # Start each chat adapter in its own daemon thread (each runs a blocking
+    # poll/socket loop); the main thread waits for Ctrl-C.
+    for adapter in ADAPTERS:
+        threading.Thread(target=adapter.start, args=(router.dispatch,),
+                         name=f"chat-{adapter.name}", daemon=True).start()
+        logger.info("Started %s adapter", adapter.name)
+
     try:
-        bot.infinity_polling(timeout=30, long_polling_timeout=20)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
+        for adapter in ADAPTERS:
+            try:
+                adapter.stop()
+            except Exception:
+                logger.exception("Failed to stop %s adapter", adapter.name)
         # Flush any open online-time sessions so playtime isn't lost on a clean
         # stop (a hard crash still loses the in-progress session).
         try:

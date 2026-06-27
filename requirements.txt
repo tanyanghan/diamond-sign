@@ -1,8 +1,12 @@
 watchdog
 python-dotenv
 pyTelegramBotAPI
+slack_bolt
 mcrcon
 windows-curses; sys_platform == "win32"
+# pyTelegramBotAPI / slack_bolt are the chat-platform SDKs. Each is only needed
+# for the platforms in CHAT_PLATFORMS (both adapters import their SDK lazily),
+# but both install cleanly everywhere so they're listed for a one-step setup.
 # Bedrock per-player restore needs amulet-leveldb + amulet-nbt. They are NOT
 # listed here because amulet-leveldb has no Linux wheels and its sdist needs a
 # specific build toolchain — installing them here would break this whole file
