@@ -65,6 +65,14 @@ Authorization is **per platform** (each has its own admin and whitelist, stored 
 
 The bot then sends join/leave (and death/achievement) announcements to every authorized chat on every platform, and answers commands in whichever chat they're sent.
 
+## Chat relay
+
+`CHAT_RELAY=true` mirrors in-game chat to every authorized chat as
+`💬 <player>: <message>` (one-way; chat platforms → game is not relayed). On
+**Java** this works out of the box — chat is read from `latest.log`. On
+**Bedrock** it needs the behavior pack (BDS doesn't log chat); see
+[Bedrock chat + death events](#bedrock-chat--death-events).
+
 ## Chat platforms
 
 `CHAT_PLATFORMS` (comma-separated) selects which platforms run; the bot serves them **all at once** from one process. Commands are answered on the platform they arrive on; only announcements broadcast to every platform. A `/backup` (or `/restore_player`) started on one platform while one is already running anywhere replies "already in progress" — backups are globally serialized.

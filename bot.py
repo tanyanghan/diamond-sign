@@ -245,6 +245,10 @@ _ACH_TYPE_MAP = {
 _ACH_VERB_MAP = {v: k for k, v in _ACH_TYPE_MAP.items()}
 
 RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
+# Player chat, e.g. "[12:34:56] [Server thread/INFO]: <Steve> hello" (or a
+# Paper-style "[Async Chat Thread - #0/INFO]:"). The <> brackets distinguish it
+# from join/leave/death lines (which start with a bare \w name).
+RE_CHAT = re.compile(r'^\[[\d:]+\] \[[^\]]*/INFO\]: <([^>]+)> (.+)$')
 _DEATH_PHRASES = (
     "was slain by", "was shot by", "was killed",
     "was blown up by", "was squashed by", "was fireballed by",
@@ -356,6 +360,11 @@ def _parse_line_java(line: str, names: dict) -> tuple:
                 "message": msg,
                 "time": time_str,
             }
+
+    if CONFIG.chat_relay:
+        m = RE_CHAT.match(line)
+        if m:
+            return "chat", {"player": m.group(1), "message": m.group(2)}
 
     return None, None
 
