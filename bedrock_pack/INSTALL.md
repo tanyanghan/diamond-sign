@@ -45,10 +45,27 @@ file if absent; if it already lists other packs, append to the array):
 
 ## 3. Enable Beta APIs (only needed for chat)
 
-Edit the world so the **Beta APIs** experiment is on. On a dedicated server, in
-`worlds/<level-name>/level.dat` this is the `experiments` toggle; the easiest way
-is to enable "Beta APIs" when creating/editing the world in the client, or via a
-world-editing tool. Deaths work without this — chat does not.
+Chat capture uses an experimental Script API, so the world needs the **Beta
+APIs** experiment on (deaths don't — skip this step if you only want deaths).
+
+With the **server stopped**, run the bundled helper (needs `amulet-nbt` from
+`requirements-bedrock-restore.txt`) — it edits the world's `level.dat` directly,
+so you don't need the game client:
+
+```bash
+python bedrock_pack/enable_beta_apis.py "worlds/<level-name>"
+```
+
+It backs up `level.dat` first and is idempotent. If chat events don't appear
+after installing the pack, the experiment key may differ on your version — rerun
+with both candidates:
+
+```bash
+python bedrock_pack/enable_beta_apis.py --keys beta_api,gametest "worlds/<level-name>"
+```
+
+> Enabling an experiment is **irreversible** for that world and disables
+> achievements (moot on a dedicated server).
 
 ## 4. Restart the server
 
