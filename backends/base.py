@@ -22,6 +22,7 @@ EVENT_JOIN = "join"
 EVENT_LEAVE = "leave"
 EVENT_DEATH = "death"
 EVENT_ACHIEVEMENT = "achievement"
+EVENT_CHAT = "chat"
 
 # Non-event capabilities.
 CAP_PLAYER_RESTORE = "player_restore"

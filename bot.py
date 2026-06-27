@@ -245,6 +245,10 @@ _ACH_TYPE_MAP = {
 _ACH_VERB_MAP = {v: k for k, v in _ACH_TYPE_MAP.items()}
 
 RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
+# Player chat, e.g. "[12:34:56] [Server thread/INFO]: <Steve> hello" (or a
+# Paper-style "[Async Chat Thread - #0/INFO]:"). The <> brackets distinguish it
+# from join/leave/death lines (which start with a bare \w name).
+RE_CHAT = re.compile(r'^\[[\d:]+\] \[[^\]]*/INFO\]: <([^>]+)> (.+)$')
 _DEATH_PHRASES = (
     "was slain by", "was shot by", "was killed",
     "was blown up by", "was squashed by", "was fireballed by",
@@ -357,21 +361,80 @@ def _parse_line_java(line: str, names: dict) -> tuple:
                 "time": time_str,
             }
 
+    if CONFIG.chat_relay:
+        m = RE_CHAT.match(line)
+        if m:
+            return "chat", {"player": m.group(1), "message": m.group(2)}
+
     return None, None
 
 
 # Bedrock Dedicated Server console lines (terser than Java's log). Names may
-# contain spaces, so capture up to the ", xuid:" delimiter. BDS emits no death
-# or achievement lines, so only join/leave are parsed.
+# contain spaces, so capture up to the ", xuid:" delimiter. BDS's own console
+# reports only join/leave; death and chat come from the bedrock_pack behavior
+# pack as `MCNOTIFIER {json}` marker lines (see below).
 RE_BEDROCK_CONNECT = re.compile(r'Player connected:\s*(.+?),\s*xuid:\s*(\d+)')
 RE_BEDROCK_DISCONNECT = re.compile(r'Player disconnected:\s*(.+?),\s*xuid:\s*(\d+)')
+
+# Behavior-pack event marker, e.g.
+#   [<ts> WARN] [Scripting] MCNOTIFIER {"t":"death","player":"X","cause":"lava"}
+_BEDROCK_MARKER = "MCNOTIFIER "
+
+# Bedrock damage cause -> death phrase, worded to mirror Java so the same
+# _categorize_death / _DEATH_CATEGORIES logic works for /death_summary. "{by}"
+# is filled with the prettified killer entity when present.
+_BEDROCK_DEATH_PHRASES = {
+    "lava": "tried to swim in lava",
+    "fire": "went up in flames",
+    "fire_tick": "burned to death",
+    "fall": "fell from a high place",
+    "drowning": "drowned",
+    "suffocation": "suffocated in a wall",
+    "starve": "starved to death",
+    "freezing": "froze to death",
+    "lightning": "was struck by lightning",
+    "void": "fell out of the world",
+    "contact": "was pricked to death",
+    "magma": "discovered the floor was lava",
+    "wither": "withered away",
+    "anvil": "was squashed by a falling anvil",
+    "falling_block": "was squashed by a falling block",
+    "magic": "was killed by magic",
+    "sonic_boom": "was obliterated by a sonically-charged shriek",
+    "block_explosion": "blew up",
+    "entity_explosion": "blew up",
+    "entity_attack": "was slain",
+    "projectile": "was shot",
+    "thorns": "was killed trying to hurt",
+    "self_destruct": "blew up",
+}
+
+
+def _pretty_entity(type_id: str) -> str:
+    """'minecraft:zombie' -> 'Zombie'."""
+    return type_id.split(":")[-1].replace("_", " ").title()
+
+
+def _bedrock_death_message(cause: str, by) -> str:
+    """Build a Java-style death message from a Bedrock damage cause + killer."""
+    phrase = _BEDROCK_DEATH_PHRASES.get((cause or "").lower())
+    killer = _pretty_entity(by) if by else None
+    if phrase is None:
+        return f"was killed by {killer}" if killer else "died"
+    # Causes that read naturally with a "by <killer>" suffix.
+    if cause.lower() in ("entity_attack", "projectile", "thorns") and killer:
+        verb = {"entity_attack": "was slain by", "projectile": "was shot by",
+                "thorns": "was killed trying to hurt"}[cause.lower()]
+        return f"{verb} {killer}"
+    return phrase
 
 
 def _parse_line_bedrock(line: str, names: dict) -> tuple:
     """Return (event_type, payload) or (None, None) for a Bedrock console line.
 
-    Only join/leave are available on Bedrock (see RE_BEDROCK_*). The player's
-    xuid is used as the registry key (Bedrock has no per-player UUID file).
+    Join/leave come from BDS itself; death/chat come from the bedrock_pack
+    behavior pack's MCNOTIFIER marker lines (gated by config). The player's xuid
+    is the registry key (Bedrock has no per-player UUID file).
     """
     line = line.strip()
     m = RE_BEDROCK_CONNECT.search(line)
@@ -386,6 +449,24 @@ def _parse_line_bedrock(line: str, names: dict) -> tuple:
         name = m.group(1).strip()
         player_leave(name)
         return "leave", name
+
+    # Behavior-pack markers (anywhere after the log/[Scripting] prefixes).
+    idx = line.find(_BEDROCK_MARKER)
+    if idx != -1:
+        try:
+            ev = json.loads(line[idx + len(_BEDROCK_MARKER):])
+        except (ValueError, TypeError):
+            return None, None
+        t = ev.get("t")
+        if t == "death" and CONFIG.bedrock_script_events:
+            return "death", {
+                "player": ev.get("player", "?"),
+                "message": _bedrock_death_message(ev.get("cause"), ev.get("by")),
+                "time": datetime.now().strftime("%H:%M:%S"),
+            }
+        if t == "chat" and CONFIG.chat_relay:
+            return "chat", {"player": ev.get("player", "?"),
+                            "message": ev.get("msg", "")}
     return None, None
 
 
@@ -576,6 +657,17 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
             logger.info("Death: %s %s — sending to %d chat(s)",
                         player, death_msg, _announce_chat_count())
             _send_to_chats(msg)
+            return
+
+        if event_type == "chat":
+            # In-game chat relayed to the platforms (one-way; no cooldown so
+            # distinct messages aren't suppressed). Gated by config.chat_relay
+            # at the parser; nothing recorded.
+            player = payload["player"]
+            message = payload["message"]
+            logger.info("Chat: %s: %s — sending to %d chat(s)",
+                        player, message, _announce_chat_count())
+            _send_to_chats(f"\U0001f4ac {player}: {message}")
             return
 
         name = payload

@@ -1,0 +1,25 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "mcnotifier events",
+    "description": "Emits player chat and death events to the server console so mcnotifier can relay them.",
+    "uuid": "dd12725f-61ca-4f6a-bca2-170cef3008ed",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    {
+      "type": "script",
+      "language": "javascript",
+      "uuid": "2b062566-9ef9-4de2-a5c3-c91875c79815",
+      "entry": "scripts/main.js",
+      "version": [1, 0, 0]
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "beta"
+    }
+  ]
+}

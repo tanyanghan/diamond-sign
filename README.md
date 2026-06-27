@@ -17,6 +17,7 @@ Both **Java** and **Bedrock** dedicated servers are supported (set `SERVER_EDITI
 | `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base` (interface), `java` (RCON), `bedrock` (tmux/screen), `mux` (multiplexer detection) |
 | `bedrock_player.py` | Bedrock world-LevelDB access + backup sidecar for per-player restore |
+| `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events (Script API) + `enable_beta_apis.py` |
 | `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
 | `requirements-bedrock-restore.txt` | Optional deps for Bedrock per-player restore (amulet-leveldb/amulet-nbt) |
 | `restore.py` | Interactive CLI tool for restoring from backup chains |
@@ -63,6 +64,14 @@ Authorization is **per platform** (each has its own admin and whitelist, stored 
 3. In a private message/DM to the bot, send `/authorize <chat_id>` to whitelist it.
 
 The bot then sends join/leave (and death/achievement) announcements to every authorized chat on every platform, and answers commands in whichever chat they're sent.
+
+## Chat relay
+
+`CHAT_RELAY=true` mirrors in-game chat to every authorized chat as
+`💬 <player>: <message>` (one-way; chat platforms → game is not relayed). On
+**Java** this works out of the box — chat is read from `latest.log`. On
+**Bedrock** it needs the behavior pack (BDS doesn't log chat); see
+[Bedrock chat + death events](#bedrock-chat--death-events).
 
 ## Chat platforms
 
@@ -190,9 +199,10 @@ If BDS runs in the window named `bedrock` of session `1`, set `MUX_SESSION=1:bed
 
 **Backups.** Instead of Java's `save-off` / `save-all` / `save-on`, the bot uses `save hold` → poll `save query` → `save resume`. `save query` reports each file with the exact number of bytes that belong to the snapshot, and the bot copies each file truncated to that length (BDS keeps appending past the snapshot point). Full and incremental backups and the [restore tool](#restoring-from-backups) work the same as Java otherwise.
 
-**Feature limitations (current).** BDS does not emit death or achievement events. So on Bedrock:
+**Feature limitations (current).** BDS's console reports only join/leave — no death, chat, or achievement events. So out of the box on Bedrock:
 - Join/leave notifications, full + incremental backups, whole-world restore, per-player restore (see below), player list, and playtime stats (see below) all work.
 - `/deaths`, `/death_summary`, `/achievements`, and the `/scan_*` commands reply that they are not available on this edition.
+- **Deaths and in-game chat can be added** with an optional behavior pack (see [Bedrock chat + death events](#bedrock-chat--death-events)); achievements remain unavailable (Xbox-bound, not script-exposed).
 
 ### Bedrock player list and online-time stats
 
@@ -200,6 +210,34 @@ Bedrock has no per-player stats files (unlike Java), so the bot derives both the
 
 - **Portable player list** — `bedrock_players.json` is the authoritative player registry, keyed by xuid, holding each player's name, account-stable identities (used for per-player restore), and first/last-seen times. Because the identities are the same on any server for a given Xbox account, this file is **portable**: copy it to another mcnotifier instance and that instance immediately knows your players (and can restore them) without re-learning. The bot merges by xuid on every write (union — copied-in entries and locally-learned ones are never lost). It replaces `player_names.json` on Bedrock.
 - **Online-time stats** — `statistics.json` accumulates each player's total connected time and session count from sign-in/sign-off. It drives `/stats` and `/playtime` on Bedrock. This file is **per-server, not portable** (playtime is server-specific). It is written on join/leave, on a clean shutdown, and checkpointed periodically (on each incremental backup and whenever `/stats` or `/playtime` is run) so in-progress time is persisted as you go. Caveats: a player already online when the bot starts is timed from bot-startup (slight undercount), and a hard crash loses only the in-progress time since the last checkpoint.
+
+### Bedrock chat + death events
+
+BDS's console doesn't report deaths or chat, so an optional **behavior pack**
+(`bedrock_pack/`) supplies them via the Script API. It emits `console.warn` marker
+lines (`MCNOTIFIER {…}`) which — with `content-log-console-output-enabled=true` —
+land in the same `console.log` the bot already tails, so no HTTP endpoint or extra
+network permission is needed. The bot parses these into the normal notify
+pipeline: deaths announce + record (so `/deaths` and `/death_summary` work, with a
+Bedrock-cause→message map that mirrors Java's wording), and chat is relayed to
+every authorized chat as `💬 <player>: <message>`.
+
+Setup is in [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md). In brief:
+
+1. Set `content-log-console-output-enabled=true` in `server.properties`.
+2. Copy `bedrock_pack/` into `behavior_packs/` and activate it in the world's
+   `world_behavior_packs.json` (by the pack's **header** UUID).
+3. **Chat** needs the world's **Beta APIs** experiment (deaths don't if you pin a
+   stable module version). Enable it with the server stopped via the bundled
+   helper, which edits `level.dat` directly (no client needed):
+   `python bedrock_pack/enable_beta_apis.py "worlds/<level-name>"`.
+4. In the bot's `.env`, set `BEDROCK_SCRIPT_EVENTS=true` (deaths) and/or
+   `CHAT_RELAY=true` (chat).
+
+Caveats: the pack uses the Script API, so it tracks Minecraft's update cadence;
+and enabling an experiment is **irreversible** for that world (and disables
+achievements — moot on a dedicated server). Both flags default off, and the bot
+runs fine without the pack (deaths/chat simply absent).
 
 ### Bedrock per-player restore
 
@@ -360,7 +398,7 @@ The player must be offline before the restore proceeds; the command refuses with
 | `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back to the chat |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore a single player's `.dat` file from any backup or live working copy |
 
-On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/achievements`, `/scan_deaths`, `/scan_achievements`) are unavailable and reply that they are not supported on this edition. `/restore_player` works via a different mechanism — see [Bedrock per-player restore](#bedrock-per-player-restore).
+On **Bedrock**, the achievement commands (`/achievements`, `/scan_achievements`) are unavailable. `/deaths` and `/death_summary` work only with the optional behavior pack + `BEDROCK_SCRIPT_EVENTS=true` (see [Bedrock chat + death events](#bedrock-chat--death-events)); the `/scan_*` commands stay Java-only (they scan log history, which Bedrock doesn't keep). `/restore_player` works via a different mechanism — see [Bedrock per-player restore](#bedrock-per-player-restore).
 
 `/allowlist` runs the server's allow/whitelist command and pipes the response back: it calls `whitelist` on Java (via RCON) and `allowlist` on Bedrock (injected via tmux/screen, with the response read back from `console.log`). Subcommands are identical on both: `on`, `off`, `add <player>`, `remove <player>`, `list`, `reload`.
 
