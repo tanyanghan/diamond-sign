@@ -23,14 +23,19 @@ stdout, which your `tee -a console.log` captures.
 
 ## 2. Install the pack
 
-Copy this `bedrock_pack/` folder into the server's world behavior packs, e.g.:
+A pack directory only makes the pack *available*; the world's
+`world_behavior_packs.json` is what *activates* it. BDS scans both the
+server-root `behavior_packs/` (the global pool) and
+`worlds/<level-name>/behavior_packs/`, so either works — the server-root one
+is conventional and is probably already present:
 
 ```
-worlds/<level-name>/behavior_packs/mcnotifier_events/
+behavior_packs/mcnotifier_events/        # copy this bedrock_pack/ folder here
 ```
 
-Then add it to `worlds/<level-name>/world_behavior_packs.json` (create the file
-if absent), using the **module** UUID from `manifest.json`:
+Then activate it for your world by adding the **module** UUID (from
+`manifest.json`) to `worlds/<level-name>/world_behavior_packs.json` (create the
+file if absent; if it already lists other packs, append to the array):
 
 ```json
 [
