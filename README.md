@@ -357,9 +357,12 @@ The player must be offline before the restore proceeds; the command refuses with
 | `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
 | `/backup` | *(Admin)* Trigger a server backup now |
+| `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back to the chat |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore a single player's `.dat` file from any backup or live working copy |
 
 On **Bedrock**, the death/achievement commands (`/deaths`, `/death_summary`, `/achievements`, `/scan_deaths`, `/scan_achievements`) are unavailable and reply that they are not supported on this edition. `/restore_player` works via a different mechanism — see [Bedrock per-player restore](#bedrock-per-player-restore).
+
+`/allowlist` runs the server's allow/whitelist command and pipes the response back: it calls `whitelist` on Java (via RCON) and `allowlist` on Bedrock (injected via tmux/screen, with the response read back from `console.log`). Subcommands are identical on both: `on`, `off`, `add <player>`, `remove <player>`, `list`, `reload`.
 
 ## Runtime state
 

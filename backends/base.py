@@ -78,6 +78,27 @@ class ServerBackend(ABC):
         the transport supports it (Java/RCON); returns ``""`` for fire-and-forget
         transports (Bedrock mux), where output must be read from the log."""
 
+    def capture_command(self, full_cmd: str, timeout: float = 3.0) -> str:
+        """Run a console command and return its textual response.
+
+        Default suits transports whose ``send_command`` already returns the
+        response (Java/RCON). Fire-and-forget transports (Bedrock mux) override
+        this to read the server's output back from the captured log.
+        """
+        return self.send_command(full_cmd)
+
+    # The server-side command that manages the player allow/whitelist. Java calls
+    # it ``whitelist``; Bedrock calls it ``allowlist``. Subclasses override.
+    ALLOWLIST_VERB = "whitelist"
+
+    def allowlist_command(self, args: list, timeout: float = 3.0) -> str:
+        """Run an allow/whitelist subcommand (on/off/add/remove/list/reload) and
+        return the server's response. ``args`` is the subcommand + operands."""
+        cmd = self.ALLOWLIST_VERB
+        if args:
+            cmd += " " + " ".join(args)
+        return self.capture_command(cmd, timeout=timeout)
+
     # --- backup freeze/flush ---
     @abstractmethod
     def begin_save(self, log_fn=None) -> None:
