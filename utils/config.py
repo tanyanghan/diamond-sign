@@ -11,6 +11,7 @@ here avoids a circular import between ``bot.py`` and ``backends``.
 """
 
 import os
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,86 @@ from dotenv import load_dotenv
 EDITION_JAVA = "java"
 EDITION_BEDROCK = "bedrock"
 _EDITIONS = (EDITION_JAVA, EDITION_BEDROCK)
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ENV_PATH = _REPO_ROOT / ".env"
+_ENV_EXAMPLE_PATH = _REPO_ROOT / ".env.example"
+
+# A line like ``KEY=value`` or a commented ``#KEY=value`` placeholder.
+_SETTING_RE = re.compile(r"^\s*#?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+class ConfigError(Exception):
+    """Raised when the .env is missing or misconfigured. The message lists every
+    problem; the caller (bot.py) prints it and stops."""
+
+
+def _iter_example_entries(text: str):
+    """Yield (key, block_lines) for each setting in .env.example, where
+    block_lines is the contiguous preceding comment/blank lines plus the setting
+    line. Lets us append a missing field together with its explanatory comment."""
+    pending = []
+    for line in text.splitlines():
+        m = _SETTING_RE.match(line)
+        if m:
+            yield m.group(1), pending + [line]
+            pending = []
+        else:
+            pending.append(line)
+
+
+def _example_settings(text: str) -> dict:
+    """{key: (is_commented, value)} for every setting in .env.example. Used to
+    detect a .env value that's still the example placeholder."""
+    out = {}
+    for line in text.splitlines():
+        m = _SETTING_RE.match(line)
+        if m:
+            out[m.group(1)] = (line.lstrip().startswith("#"), m.group(2).strip())
+    return out
+
+
+def sync_env_from_example(env_path=_ENV_PATH, example_path=_ENV_EXAMPLE_PATH) -> list:
+    """Add any fields/comments present in .env.example but missing from .env,
+    preserving all existing values. Returns the list of keys added (or a single
+    sentinel when .env was created from scratch). Idempotent: nothing is written
+    when nothing is missing. Best-effort — a write failure is non-fatal."""
+    env_path, example_path = Path(env_path), Path(example_path)
+    if not example_path.exists():
+        return []
+    example_text = example_path.read_text()
+
+    if not env_path.exists():
+        try:
+            env_path.write_text(example_text)
+        except OSError:
+            return []
+        return ["(created .env from .env.example)"]
+
+    env_text = env_path.read_text()
+    present = {m.group(1) for line in env_text.splitlines()
+               if (m := _SETTING_RE.match(line))}
+
+    additions, added = [], []
+    for key, block in _iter_example_entries(example_text):
+        if key in present:
+            continue
+        present.add(key)
+        block = list(block)
+        while block and not block[0].strip():   # drop leading blank separators
+            block.pop(0)
+        additions.append("\n".join(block))
+        added.append(key)
+
+    if additions:
+        sep = "" if env_text.endswith("\n") else "\n"
+        new = (env_text + sep + "\n# --- added from .env.example ---\n"
+               + "\n\n".join(additions) + "\n")
+        try:
+            env_path.write_text(new)
+        except OSError:
+            return []
+    return added
 
 
 @dataclass
@@ -76,38 +157,70 @@ def _env_bool(name: str) -> bool:
 
 
 def load_config() -> ServerConfig:
-    """Load and validate configuration from ``.env`` / the environment."""
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")  # repo root
+    """Load and validate configuration from ``.env``.
 
-    minecraft_dir = os.environ.get("MINECRAFT_DIR")
-    if not minecraft_dir:
-        raise EnvironmentError("Missing required environment variable: MINECRAFT_DIR")
+    On startup the .env is first brought up to date with .env.example (missing
+    fields and their comments are appended; existing values are kept). All
+    missing/misconfigured required fields are then collected and raised together
+    as a single ``ConfigError`` so the bot stops with a clear, complete list.
+    """
+    added = sync_env_from_example(_ENV_PATH, _ENV_EXAMPLE_PATH)
+    load_dotenv(_ENV_PATH)
+
+    example = (_example_settings(_ENV_EXAMPLE_PATH.read_text())
+               if _ENV_EXAMPLE_PATH.exists() else {})
+
+    def _missing(key: str) -> bool:
+        """True if a required key is unset or still the example placeholder."""
+        val = os.environ.get(key, "").strip()
+        if not val:
+            return True
+        commented, exval = example.get(key, (True, ""))
+        return (not commented) and val == exval  # untouched placeholder
+
+    problems = []
+
+    minecraft_dir = os.environ.get("MINECRAFT_DIR", "").strip()
+    if _missing("MINECRAFT_DIR"):
+        problems.append("MINECRAFT_DIR: set it to your Minecraft server directory")
+    elif not Path(os.path.expanduser(minecraft_dir)).is_dir():
+        problems.append(f"MINECRAFT_DIR: directory does not exist: {minecraft_dir}")
 
     # Chat platforms (csv). Each enabled platform requires its own token(s).
     platforms = tuple(p.strip().lower() for p in
                       os.environ.get("CHAT_PLATFORMS", "telegram").split(",")
-                      if p.strip())
-    if not platforms:
-        platforms = ("telegram",)
+                      if p.strip()) or ("telegram",)
     _KNOWN = ("telegram", "slack")
     bad = [p for p in platforms if p not in _KNOWN]
     if bad:
-        raise EnvironmentError(
-            f"CHAT_PLATFORMS must be from {_KNOWN}, got {bad}")
+        problems.append(f"CHAT_PLATFORMS: unknown {bad}; allowed: {list(_KNOWN)}")
+    platforms = tuple(p for p in platforms if p in _KNOWN) or ("telegram",)
 
-    bot_token = os.environ.get("BOT_TOKEN", "")
-    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
-    slack_app_token = os.environ.get("SLACK_APP_TOKEN", "")
-    if "telegram" in platforms and not bot_token:
-        raise EnvironmentError("CHAT_PLATFORMS includes telegram but BOT_TOKEN is not set")
-    if "slack" in platforms and not (slack_bot_token and slack_app_token):
-        raise EnvironmentError("CHAT_PLATFORMS includes slack but SLACK_BOT_TOKEN / "
-                               "SLACK_APP_TOKEN are not set")
+    bot_token = os.environ.get("BOT_TOKEN", "").strip()
+    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    slack_app_token = os.environ.get("SLACK_APP_TOKEN", "").strip()
+    if "telegram" in platforms and _missing("BOT_TOKEN"):
+        problems.append("BOT_TOKEN: required for telegram (get one from @BotFather)")
+    if "slack" in platforms:
+        if not slack_bot_token:
+            problems.append("SLACK_BOT_TOKEN: required for slack (xoxb-...)")
+        if not slack_app_token:
+            problems.append("SLACK_APP_TOKEN: required for slack (xapp-...)")
 
     edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
     if edition not in _EDITIONS:
-        raise EnvironmentError(
-            f"SERVER_EDITION must be one of {_EDITIONS}, got '{edition}'")
+        problems.append(f"SERVER_EDITION: must be one of {list(_EDITIONS)} "
+                        f"(got '{edition}')")
+
+    if problems:
+        msg = ("mcnotifier cannot start - fix the following in "
+               f"{_ENV_PATH}:\n" + "\n".join(f"  - {p}" for p in problems))
+        if added and added != ["(created .env from .env.example)"]:
+            msg += "\n\n(.env was updated with new template fields: "
+            msg += ", ".join(added) + ")"
+        elif added:
+            msg += "\n\n(a fresh .env was created from .env.example - fill it in)"
+        raise ConfigError(msg)
 
     mc_dir = Path(minecraft_dir)
     backup_dir = Path(os.path.expanduser(

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import zipfile
@@ -18,7 +19,7 @@ from utils.backup_utils import (
     run_copy_command, wait_for_settle,
 )
 from utils.config import (
-    load_config, backup_exclude_names, EDITION_BEDROCK,
+    load_config, backup_exclude_names, EDITION_BEDROCK, ConfigError,
 )
 from backends import (
     make_backend, BackendUnavailable, CAP_PLAYER_RESTORE, CAP_STATS,
@@ -32,7 +33,13 @@ from chat import make_adapters, CommandRouter
 # All environment reading lives in config.load_config(); the rest of the module
 # reads from CONFIG (and a few thin aliases kept to minimise churn). Per-player
 # data (stats dir, name registry) is owned by the backend, not bot.py.
-CONFIG = load_config()
+# load_config() syncs .env with .env.example and validates required fields; on a
+# misconfiguration it raises ConfigError, which we surface cleanly and stop.
+try:
+    CONFIG = load_config()
+except ConfigError as e:
+    print(f"\n{e}\n", file=sys.stderr)
+    sys.exit(1)
 
 MINECRAFT_DIR = CONFIG.minecraft_dir          # Path
 LOG_PATH = CONFIG.log_path                     # Java: logs/latest.log; Bedrock: console.log
