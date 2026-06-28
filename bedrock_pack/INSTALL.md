@@ -10,6 +10,31 @@ The pack ships pinned to the **`"beta"`** script module (chat uses an
 experimental API), which requires the world's **Beta APIs** experiment. Deaths
 work on the stable module too — see "Deaths only" below to skip the experiment.
 
+## Quick install (one command)
+
+With the **server stopped**, from the repo root:
+
+```bash
+python bedrock_pack/install.py
+```
+
+It reads `MINECRAFT_DIR` from your `.env` and the world's `level-name` from
+`server.properties`, then: copies the pack into `behavior_packs/`, activates it in
+the world's `world_behavior_packs.json`, verifies the server isn't running and
+enables the **Beta APIs** experiment in `level.dat`, and sets
+`BEDROCK_SCRIPT_EVENTS=true` + `CHAT_RELAY=true` in `.env`. Flags:
+
+- `--deaths-only` — skip the experiment (deaths only; no chat, no amulet libs, sets
+  only `BEDROCK_SCRIPT_EVENTS`).
+- `--force` — skip the "server not running" check (only if you stopped it yourself).
+- `--no-env` — don't modify `.env`.
+
+The experiment step needs `amulet-nbt`/`amulet-leveldb`
+(`requirements-bedrock-restore.txt`). Then do step 1 below (console capture) and
+restart. The manual steps that follow document what the installer does.
+
+---
+
 ## 1. Enable console capture (required)
 
 In `server.properties`:

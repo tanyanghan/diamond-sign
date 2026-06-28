@@ -479,17 +479,20 @@ deaths announce + record (`/deaths`, `/death_summary` work, with a Bedrock
 damage-cause→message map that mirrors Java's wording), and chat is relayed like on
 Java.
 
-Setup is in [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md). In brief:
+**Install — one command** (with the server stopped, from the repo root):
 
-1. Set `content-log-console-output-enabled=true` in `server.properties`.
-2. Copy `bedrock_pack/` into `behavior_packs/` and activate it in the world's
-   `world_behavior_packs.json` (by the pack's **header** UUID).
-3. **Chat** needs the world's **Beta APIs** experiment (deaths don't, if you pin a
-   stable module version). Enable it with the server stopped via the bundled
-   helper, which edits `level.dat` directly (no game client needed):
-   `python bedrock_pack/enable_beta_apis.py "worlds/<level-name>"`.
-4. In `.env`, set `BEDROCK_SCRIPT_EVENTS=true` (deaths) and/or `CHAT_RELAY=true`
-   (chat).
+```bash
+python bedrock_pack/install.py
+```
+
+It reads `MINECRAFT_DIR` from `.env` and the world's `level-name` from
+`server.properties`, copies the pack into `behavior_packs/`, activates it in the
+world's `world_behavior_packs.json`, verifies the server isn't running and enables
+the **Beta APIs** experiment in `level.dat`, and sets `BEDROCK_SCRIPT_EVENTS=true`
++ `CHAT_RELAY=true` in `.env`. Use `--deaths-only` to skip the experiment (deaths
+only, no chat). Then set `content-log-console-output-enabled=true` in
+`server.properties` and restart the server + bot. Full details and the manual
+steps are in [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
 
 Caveats: the pack uses the Script API, so it tracks Minecraft's update cadence;
 and enabling an experiment is **irreversible** for that world (and disables
