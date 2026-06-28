@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from backup_utils import RE_FULL, RE_INCR
+from utils.backup_utils import RE_FULL, RE_INCR
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH,
     CAP_PLAYER_RESTORE, CAP_STATS,
@@ -302,7 +302,7 @@ class BedrockBackend(ServerBackend):
 
     def wait_for_db_unlock(self, timeout: float = 120) -> bool:
         """Poll until the world db LevelDB lock is released (server fully down)."""
-        import bedrock_player
+        from utils import bedrock_player
         db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -486,7 +486,7 @@ class BedrockBackend(ServerBackend):
         if not idents:
             return []
         try:
-            import bedrock_player
+            from utils import bedrock_player
         except Exception:
             return []
         chain_id, base_full = chain
@@ -530,7 +530,7 @@ class BedrockBackend(ServerBackend):
         """Stop the server, overwrite the player's value in the world LevelDB
         from the chosen backup, relaunch. Fail-safe: everything that can fail is
         done before the stop, and a relaunch failure alerts loudly."""
-        import bedrock_player
+        from utils import bedrock_player
 
         def status(msg):
             logger.info("RestorePlayer(BR): %s", msg)

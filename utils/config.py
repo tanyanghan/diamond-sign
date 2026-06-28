@@ -77,7 +77,7 @@ def _env_bool(name: str) -> bool:
 
 def load_config() -> ServerConfig:
     """Load and validate configuration from ``.env`` / the environment."""
-    load_dotenv(Path(__file__).parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")  # repo root
 
     minecraft_dir = os.environ.get("MINECRAFT_DIR")
     if not minecraft_dir:

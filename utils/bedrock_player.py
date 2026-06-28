@@ -39,7 +39,7 @@ def _leveldb():
 
 def world_db_path(minecraft_dir) -> Path:
     """The Bedrock world LevelDB directory: ``<dir>/worlds/<level-name>/db``."""
-    from config import get_level_name
+    from .config import get_level_name
     return Path(minecraft_dir) / "worlds" / get_level_name(minecraft_dir) / "db"
 
 

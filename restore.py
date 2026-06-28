@@ -62,11 +62,11 @@ from pathlib import Path
 import curses
 from dotenv import load_dotenv
 
-from backup_utils import (
+from utils.backup_utils import (
     CHAIN_MARKER_NAME, META_FILES, RE_FULL, RE_INCR,
     build_file_manifest, new_chain_id, run_copy_command,
 )
-from config import backup_exclude_names
+from utils.config import backup_exclude_names
 
 # Load .env for defaults (BACKUP_DIR, MINECRAFT_DIR)
 load_dotenv(Path(__file__).parent / ".env")

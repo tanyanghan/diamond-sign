@@ -20,8 +20,8 @@ from pathlib import Path
 
 from mcrcon import MCRcon
 
-from backup_utils import RE_FULL, RE_INCR, wait_for_settle
-from config import read_server_properties, get_level_name, backup_exclude_names
+from utils.backup_utils import RE_FULL, RE_INCR, wait_for_settle
+from utils.config import read_server_properties, get_level_name, backup_exclude_names
 from .base import (
     ServerBackend, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
     CAP_PLAYER_RESTORE, CAP_STATS,

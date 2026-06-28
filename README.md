@@ -561,17 +561,22 @@ chain, delete `backup_manifest.json` and `.mcnotifier_chain`.
 
 ### Source layout
 
+Entry points (run directly):
+
 | File | Description |
 |------|-------------|
 | `bot.py` | Main bot — log watcher, command handlers, stats, orchestration |
-| `config.py` | Central config (`ServerConfig`) and world-layout helpers |
+| `restore.py` | Interactive CLI to restore from backup chains |
+| `install_bedrock_pack.py` | One-command installer/uninstaller for the Bedrock behavior pack |
+
+Packages and helpers (imported):
+
+| Path | Description |
+|------|-------------|
 | `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base`, `java` (RCON), `bedrock` (tmux/screen), `mux` |
-| `bedrock_player.py` | Bedrock world-LevelDB access + backup sidecar (per-player restore) |
+| `utils/` | Imported helpers: `config` (`ServerConfig` + world-layout), `backup_utils` (chain/manifest), `bedrock_player` (world-LevelDB + sidecar) |
 | `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events (Script API) |
-| `install_bedrock_pack.py` | One-command installer for the behavior pack |
-| `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
-| `restore.py` | Interactive CLI to restore from backup chains |
 | `requirements.txt` | Python dependencies |
 | `requirements-bedrock-restore.txt` | Optional deps for Bedrock per-player restore |
 | `.env.example` | Template for environment variables |

@@ -13,11 +13,11 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from backup_utils import (
+from utils.backup_utils import (
     CHAIN_MARKER_NAME, RE_FULL, RE_INCR, build_file_manifest, new_chain_id,
     run_copy_command, wait_for_settle,
 )
-from config import (
+from utils.config import (
     load_config, backup_exclude_names, EDITION_BEDROCK,
 )
 from backends import (
@@ -982,7 +982,7 @@ def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:
     if CONFIG.edition != EDITION_BEDROCK or not ready:
         return
     try:
-        import bedrock_player
+        from utils import bedrock_player
     except Exception as e:
         log(f"Player sidecar skipped (amulet libs unavailable: {e})")
         return

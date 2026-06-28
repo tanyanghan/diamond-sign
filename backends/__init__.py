@@ -1,6 +1,6 @@
 """Server backends and the factory that selects one by edition."""
 
-from config import EDITION_JAVA, EDITION_BEDROCK
+from utils.config import EDITION_JAVA, EDITION_BEDROCK
 from .base import (
     ServerBackend, BackendUnavailable, NotSupported,
     EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT, EVENT_CHAT,

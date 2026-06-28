@@ -263,7 +263,7 @@ def main():
 
     # Level name comes from server.properties (get_level_name), so no path arg.
     sys.path.insert(0, str(_REPO_ROOT))
-    from config import get_level_name
+    from utils.config import get_level_name
     level_name = get_level_name(mc_dir)
     world_dir = mc_dir / "worlds" / level_name
     if not world_dir.is_dir():
@@ -316,7 +316,7 @@ def _do_install(mc_dir, world_dir, uuid, version, args):
                 _fail("amulet-leveldb is needed to verify the server is stopped "
                       "(pip install -r requirements-bedrock-restore.txt), or pass "
                       f"--force after stopping the server yourself. ({e})")
-            import bedrock_player
+            from utils import bedrock_player
             if bedrock_player.is_db_locked(bedrock_player.world_db_path(mc_dir)):
                 _fail("the world database is locked — the server appears to be "
                       "running (or another tool has it open). Stop it and re-run.")
