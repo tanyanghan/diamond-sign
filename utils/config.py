@@ -37,18 +37,17 @@ class ConfigError(Exception):
     problem; the caller (bot.py) prints it and stops."""
 
 
-def _iter_example_entries(text: str):
-    """Yield (key, block_lines) for each setting in .env.example, where
-    block_lines is the contiguous preceding comment/blank lines plus the setting
-    line. Lets us append a missing field together with its explanatory comment."""
-    pending = []
+def _active_env_values(text: str) -> dict:
+    """{key: raw_value} for the uncommented settings in a .env body — the user's
+    data, preserved verbatim (everything after the first ``=``)."""
+    out = {}
     for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
         m = _SETTING_RE.match(line)
         if m:
-            yield m.group(1), pending + [line]
-            pending = []
-        else:
-            pending.append(line)
+            out[m.group(1)] = m.group(2)
+    return out
 
 
 def _example_settings(text: str) -> dict:
@@ -63,10 +62,17 @@ def _example_settings(text: str) -> dict:
 
 
 def sync_env_from_example(env_path=_ENV_PATH, example_path=_ENV_EXAMPLE_PATH) -> list:
-    """Add any fields/comments present in .env.example but missing from .env,
-    preserving all existing values. Returns the list of keys added (or a single
-    sentinel when .env was created from scratch). Idempotent: nothing is written
-    when nothing is missing. Best-effort — a write failure is non-fatal."""
+    """Rewrite .env so it mirrors .env.example line for line, filling in the
+    user's existing values for each key as it goes.
+
+    The result has the exact same ordering, comments and blank lines as the
+    template, with the user's active settings substituted in — so .env and
+    .env.example diff cleanly at a glance. Existing values are preserved; any
+    user settings not present in the template are kept under a trailing marker.
+    Returns the list of template keys newly introduced (or a single sentinel when
+    .env was created from scratch). Idempotent and best-effort — a write failure
+    is non-fatal, and an already-aligned .env is left untouched.
+    """
     env_path, example_path = Path(env_path), Path(example_path)
     if not example_path.exists():
         return []
@@ -79,30 +85,35 @@ def sync_env_from_example(env_path=_ENV_PATH, example_path=_ENV_EXAMPLE_PATH) ->
             return []
         return ["(created .env from .env.example)"]
 
-    env_text = env_path.read_text()
-    present = {m.group(1) for line in env_text.splitlines()
-               if (m := _SETTING_RE.match(line))}
+    old_text = env_path.read_text()
+    user_values = _active_env_values(old_text)          # the user's data to keep
+    present_before = {m.group(1) for line in old_text.splitlines()
+                      if (m := _SETTING_RE.match(line))}
 
-    additions, added = [], []
-    for key, block in _iter_example_entries(example_text):
-        if key in present:
-            continue
-        present.add(key)
-        block = list(block)
-        while block and not block[0].strip():   # drop leading blank separators
-            block.pop(0)
-        additions.append("\n".join(block))
-        added.append(key)
+    out, used = [], set()
+    for line in example_text.splitlines():
+        m = _SETTING_RE.match(line)
+        if m and m.group(1) in user_values:
+            key = m.group(1)
+            out.append(f"{key}={user_values[key]}")     # fill in the user's value
+            used.add(key)
+        else:
+            out.append(line)                             # comment / blank / placeholder
+            if m:
+                used.add(m.group(1))
 
-    if additions:
-        sep = "" if env_text.endswith("\n") else "\n"
-        new = (env_text + sep + "\n# --- added from .env.example ---\n"
-               + "\n\n".join(additions) + "\n")
+    leftover = [k for k in user_values if k not in used]
+    if leftover:                                         # keys not in the template
+        out += ["", "# --- settings not in .env.example (kept) ---"]
+        out += [f"{k}={user_values[k]}" for k in leftover]
+
+    new_text = "\n".join(out) + "\n"
+    if new_text != old_text:
         try:
-            env_path.write_text(new)
+            env_path.write_text(new_text)
         except OSError:
             return []
-    return added
+    return [k for k in used if k not in present_before]
 
 
 @dataclass
