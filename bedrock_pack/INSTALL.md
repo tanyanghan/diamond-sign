@@ -29,6 +29,11 @@ It first confirms the server is a Bedrock server and prompts you to confirm it's
 stopped (the install edits the world and irreversibly enables an experiment).
 Flags:
 
+- `--uninstall` — reverse it: remove the pack, deactivate it in
+  `world_behavior_packs.json` (preserving other packs), turn
+  `content-log-console-output-enabled` and the two `.env` flags back off. The Beta
+  APIs experiment is **not** undone — Bedrock can't disable an experiment once a
+  world has used it, so `level.dat` is left as-is (harmless with the pack gone).
 - `--deaths-only` — skip the experiment (deaths only; no chat, no amulet libs, sets
   only `BEDROCK_SCRIPT_EVENTS`).
 - `--yes` / `-y` — skip the "is the server stopped?" prompt (non-interactive use).

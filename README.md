@@ -491,8 +491,10 @@ It confirms the server is Bedrock and stopped, then reads `MINECRAFT_DIR` from
 `content-log-console-output-enabled=true` in `server.properties`, enables the
 **Beta APIs** experiment in `level.dat`, and sets `BEDROCK_SCRIPT_EVENTS=true` +
 `CHAT_RELAY=true` in `.env` — then you just restart the server and bot. Use
-`--deaths-only` to skip the experiment (deaths only, no chat). Full details and the
-manual steps are in [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
+`--deaths-only` to skip the experiment (deaths only, no chat), or `--uninstall` to
+reverse it (the Beta APIs experiment can't be undone — Bedrock flags a world
+permanently once used). Full details and the manual steps are in
+[`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
 
 Caveats: the pack uses the Script API, so it tracks Minecraft's update cadence;
 and enabling an experiment is **irreversible** for that world (and disables
