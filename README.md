@@ -48,7 +48,14 @@ and automated backups with point-in-time restore. Works with **Java** and
    pip install -r requirements.txt
    ```
 
-2. **Configure** — copy the template and edit it:
+2. **Configure** — easiest is to just **skip to step 3 and run `python bot.py`**:
+   if `.env` is missing or a required field is unset, the bot runs a short
+   interactive setup, asks for what it needs, and writes `.env` for you. On every
+   later start it also tops `.env` up with any new fields from `.env.example`
+   (your values are kept), and stops with a clear list if anything required is
+   missing in a non-interactive launch (e.g. under systemd).
+
+   To configure by hand instead, copy the template and edit it:
    ```bash
    cp .env.example .env
    ```
