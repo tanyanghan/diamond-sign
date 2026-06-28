@@ -15,7 +15,7 @@ work on the stable module too — see "Deaths only" below to skip the experiment
 With the **server stopped**, from the repo root:
 
 ```bash
-python bedrock_pack/install.py
+python install_bedrock_pack.py
 ```
 
 It reads `MINECRAFT_DIR` from your `.env` and the world's `level-name` from
@@ -82,16 +82,12 @@ doesn't match this header uuid.)
 
 ## 3. Enable Beta APIs (required for chat / the default `"beta"` module)
 
-With the **server stopped**, run the bundled helper (needs `amulet-nbt` from
-`requirements-bedrock-restore.txt`) — it edits the world's `level.dat` directly,
-so you don't need the game client:
-
-```bash
-python bedrock_pack/enable_beta_apis.py "worlds/<level-name>"
-```
-
-It sets both known experiment keys (`gametest` is the one current versions
-honor), backs up `level.dat`, and is idempotent.
+The quick installer above does this for you (needs `amulet-nbt` from
+`requirements-bedrock-restore.txt`): with the server stopped it edits the world's
+`level.dat` directly — no game client — setting both known experiment keys
+(`gametest` is the one current versions honor), backing up `level.dat` first, and
+is idempotent. To do *only* this step, run the installer with everything else
+already in place; it skips work that's done and enables the experiment.
 
 > Enabling an experiment is **irreversible** for that world and disables
 > achievements (moot on a dedicated server).

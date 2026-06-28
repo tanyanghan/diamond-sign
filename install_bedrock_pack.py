@@ -9,27 +9,33 @@ Reads the server location from the bot's ``.env`` (``MINECRAFT_DIR``), then:
      ``level.dat`` — but only after confirming the **server is not running**
      (the world LevelDB must be unlocked).
 
+It also enables the Bedrock **Beta APIs** experiment in ``level.dat`` for chat
+(deaths don't need it). The experiment toggle lives in ``level.dat`` — a
+little-endian NBT file with an 8-byte header — so this uses ``amulet-nbt`` (from
+``requirements-bedrock-restore.txt``), not the LevelDB.
+
 Run it with the server stopped:
 
-    python bedrock_pack/install.py                # pack + activate + experiment (chat & deaths)
-    python bedrock_pack/install.py --deaths-only  # skip the experiment (deaths only; no amulet libs)
-    python bedrock_pack/install.py --force        # bypass the running check (you stopped it yourself)
+    python install_bedrock_pack.py                # pack + activate + experiment (chat & deaths)
+    python install_bedrock_pack.py --deaths-only  # skip the experiment (deaths only; no amulet libs)
+    python install_bedrock_pack.py --force        # bypass the running check (you stopped it yourself)
 
-Afterwards: set ``content-log-console-output-enabled=true`` in server.properties,
-set ``BEDROCK_SCRIPT_EVENTS=true`` (and ``CHAT_RELAY=true`` for chat) in ``.env``,
-then start the server. See bedrock_pack/INSTALL.md for the manual steps.
+It sets ``content-log-console-output-enabled=true`` in server.properties and
+``BEDROCK_SCRIPT_EVENTS=true`` (and ``CHAT_RELAY=true``) in ``.env`` for you; then
+start the server and restart the bot. See bedrock_pack/INSTALL.md for details.
 """
 
 import argparse
 import json
 import os
 import shutil
+import struct
 import sys
 from pathlib import Path
 
-_PACK_DIR = Path(__file__).resolve().parent          # bedrock_pack/
-_REPO_ROOT = _PACK_DIR.parent
-# Pack files that belong in the world (everything else here is tooling/docs).
+_REPO_ROOT = Path(__file__).resolve().parent         # repo root (this file's dir)
+_PACK_DIR = _REPO_ROOT / "bedrock_pack"
+# Pack files that belong in the world (everything else there is tooling/docs).
 _PACK_CONTENTS = ("manifest.json", "scripts")
 _INSTALLED_NAME = "mcnotifier_events"
 
@@ -134,16 +140,50 @@ def _activate(world_dir: Path, uuid: str, version) -> bool:
     return True
 
 
+def _load_amulet_nbt():
+    try:
+        import amulet_nbt
+        from amulet_nbt import CompoundTag, ByteTag
+        return amulet_nbt, CompoundTag, ByteTag
+    except Exception as e:
+        _fail("amulet-nbt is required for the experiment step. Install it with:\n"
+              "  pip install -r requirements-bedrock-restore.txt\n"
+              f"(import failed: {e})")
+
+
+def _build_enabled_level_dat(raw: bytes, keys, CompoundTag, ByteTag, amulet_nbt):
+    """Return (new_level_dat_bytes, after_experiments_dict). Sets each experiment
+    key plus the two meta flags in the ``experiments`` compound, preserving the
+    8-byte header (storage version + recomputed body length)."""
+    storage_version = struct.unpack_from("<i", raw, 0)[0]
+    nt = amulet_nbt.load(raw[8:], little_endian=True, compressed=False)
+    comp = nt.compound
+    exp = comp.get("experiments")
+    if not isinstance(exp, CompoundTag):
+        exp = CompoundTag()
+        comp["experiments"] = exp
+    for k in keys:
+        exp[k] = ByteTag(1)
+    exp["experiments_ever_used"] = ByteTag(1)
+    exp["saved_with_toggled_experiments"] = ByteTag(1)
+    after = {k: int(exp[k]) for k in exp}
+    body = nt.to_nbt(compressed=False, little_endian=True)
+    new = struct.pack("<i", storage_version) + struct.pack("<i", len(body)) + body
+    return new, after
+
+
 def _enable_experiment(world_dir: Path):
-    """Enable the Beta APIs experiment via the sibling enable_beta_apis module."""
-    sys.path.insert(0, str(_PACK_DIR))
-    import enable_beta_apis as eba
-    amulet_nbt, CompoundTag, ByteTag = eba._load_amulet_nbt()
+    """Enable the Beta APIs / GameTest experiment in the world's level.dat.
+
+    "gametest" is the key current versions honor (shows as 'gtst' in the
+    server's active-experiments line); "beta_api" is the historical name. We set
+    both — unknown keys are ignored. Backs up level.dat and writes atomically."""
+    amulet_nbt, CompoundTag, ByteTag = _load_amulet_nbt()
     level_dat = world_dir / "level.dat"
     if not level_dat.is_file():
         _fail(f"no level.dat in {world_dir}")
     raw = level_dat.read_bytes()
-    new, before, after = eba.enable_experiments(
+    new, after = _build_enabled_level_dat(
         raw, ["beta_api", "gametest"], CompoundTag, ByteTag, amulet_nbt)
     if new == raw:
         print("  experiment already enabled")

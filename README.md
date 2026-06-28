@@ -482,7 +482,7 @@ Java.
 **Install — one command** (with the server stopped, from the repo root):
 
 ```bash
-python bedrock_pack/install.py
+python install_bedrock_pack.py
 ```
 
 It confirms the server is Bedrock and stopped, then reads `MINECRAFT_DIR` from
@@ -566,7 +566,8 @@ chain, delete `backup_manifest.json` and `.mcnotifier_chain`.
 | `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base`, `java` (RCON), `bedrock` (tmux/screen), `mux` |
 | `bedrock_player.py` | Bedrock world-LevelDB access + backup sidecar (per-player restore) |
-| `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events + `enable_beta_apis.py` |
+| `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events (Script API) |
+| `install_bedrock_pack.py` | One-command installer for the behavior pack |
 | `backup_utils.py` | Shared backup utilities (chain IDs, manifest, constants) |
 | `restore.py` | Interactive CLI to restore from backup chains |
 | `requirements.txt` | Python dependencies |
