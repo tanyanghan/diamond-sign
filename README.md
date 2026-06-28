@@ -485,14 +485,14 @@ Java.
 python bedrock_pack/install.py
 ```
 
-It reads `MINECRAFT_DIR` from `.env` and the world's `level-name` from
-`server.properties`, copies the pack into `behavior_packs/`, activates it in the
-world's `world_behavior_packs.json`, verifies the server isn't running and enables
-the **Beta APIs** experiment in `level.dat`, and sets `BEDROCK_SCRIPT_EVENTS=true`
-+ `CHAT_RELAY=true` in `.env`. Use `--deaths-only` to skip the experiment (deaths
-only, no chat). Then set `content-log-console-output-enabled=true` in
-`server.properties` and restart the server + bot. Full details and the manual
-steps are in [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
+It confirms the server is Bedrock and stopped, then reads `MINECRAFT_DIR` from
+`.env` and the world's `level-name` from `server.properties`, copies the pack into
+`behavior_packs/`, activates it in the world's `world_behavior_packs.json`, sets
+`content-log-console-output-enabled=true` in `server.properties`, enables the
+**Beta APIs** experiment in `level.dat`, and sets `BEDROCK_SCRIPT_EVENTS=true` +
+`CHAT_RELAY=true` in `.env` — then you just restart the server and bot. Use
+`--deaths-only` to skip the experiment (deaths only, no chat). Full details and the
+manual steps are in [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
 
 Caveats: the pack uses the Script API, so it tracks Minecraft's update cadence;
 and enabling an experiment is **irreversible** for that world (and disables

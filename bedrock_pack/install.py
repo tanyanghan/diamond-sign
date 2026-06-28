@@ -38,6 +38,23 @@ def _fail(msg: str):
     sys.exit(f"error: {msg}")
 
 
+def _confirm_stopped(assume_yes: bool):
+    """Ask the operator to confirm the server is stopped before any edits.
+    ``--yes``/``--force`` skip the prompt; a non-interactive shell must pass one."""
+    if assume_yes:
+        return
+    print("The Minecraft server must be STOPPED before installing (this edits the "
+          "world, and enables an irreversible world experiment unless --deaths-only).")
+    try:
+        ans = input("Is the server stopped? [y/N] ").strip().lower()
+    except EOFError:
+        # No interactive input available (piped / redirected / no TTY).
+        _fail("no input available — stop the server, then re-run with --yes "
+              "(or --force) to confirm it's stopped")
+    if ans not in ("y", "yes"):
+        _fail("aborted — stop the server, then re-run")
+
+
 def _load_env():
     """Return (minecraft_dir: Path, edition: str) from the bot's .env."""
     try:
@@ -60,21 +77,29 @@ def _read_manifest():
     return data["header"]["uuid"], data["header"]["version"]
 
 
-def _set_env_var(key: str, value: str):
-    """Set KEY=value in the bot's .env, in place. Replaces an existing line
-    (commented or not), else appends. Other lines (incl. secrets) untouched."""
+def _set_kv(path: Path, key: str, value: str) -> bool:
+    """Set ``key=value`` in a key=value file (.env / server.properties), in place.
+    Replaces an existing line (commented or not), else appends. Returns True if
+    the content changed. Other lines (incl. secrets like rcon.password) untouched."""
     import re
-    env = _REPO_ROOT / ".env"
-    lines = env.read_text().splitlines() if env.exists() else []
+    lines = path.read_text().splitlines() if path.exists() else []
     pat = re.compile(rf"^\s*#?\s*{re.escape(key)}\s*=")
     line = f"{key}={value}"
+    changed = True
     for i, ln in enumerate(lines):
         if pat.match(ln):
+            changed = ln != line
             lines[i] = line
             break
     else:
         lines.append(line)
-    env.write_text("\n".join(lines) + "\n")
+    if changed:
+        path.write_text("\n".join(lines) + "\n")
+    return changed
+
+
+def _set_env_var(key: str, value: str):
+    _set_kv(_REPO_ROOT / ".env", key, value)
 
 
 def _copy_pack(mc_dir: Path) -> Path:
@@ -145,12 +170,24 @@ def main():
     ap.add_argument("--no-env", action="store_true",
                     help="don't touch .env (otherwise BEDROCK_SCRIPT_EVENTS, and "
                          "CHAT_RELAY unless --deaths-only, are set to true)")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="skip the interactive 'server stopped?' confirmation "
+                         "(for non-interactive use)")
     args = ap.parse_args()
 
     mc_dir, edition = _load_env()
+    # Confirm this is a Bedrock server two ways: the configured edition, and the
+    # directory layout (a bedrock_server binary or a worlds/ folder). The pack and
+    # the experiment edit are Bedrock-only and would be meaningless on Java.
     if edition != "bedrock":
-        _fail(f"SERVER_EDITION is '{edition}', not 'bedrock' — this pack is "
-              "Bedrock-only")
+        _fail(f"SERVER_EDITION is '{edition}', not 'bedrock' — set it to bedrock; "
+              "this pack is Bedrock-only")
+    looks_bedrock = ((mc_dir / "bedrock_server").exists()
+                     or (mc_dir / "bedrock_server.exe").exists()
+                     or (mc_dir / "worlds").is_dir())
+    if not looks_bedrock:
+        _fail(f"{mc_dir} doesn't look like a Bedrock server (no bedrock_server "
+              "binary or worlds/ directory). Check MINECRAFT_DIR.")
 
     # Level name comes from server.properties (get_level_name), so no path arg.
     sys.path.insert(0, str(_REPO_ROOT))
@@ -165,12 +202,27 @@ def main():
     print(f"Server:  {mc_dir}")
     print(f"World:   {world_dir}")
 
+    # The server MUST be stopped: this edits world files and (unless --deaths-only)
+    # irreversibly enables a world experiment. Confirm before touching anything.
+    _confirm_stopped(args.yes or args.force)
+
     dest = _copy_pack(mc_dir)
     print(f"Copied:  {dest}")
 
     added = _activate(world_dir, uuid, version)
     print(f"Activated in world_behavior_packs.json "
           f"({'added' if added else 'already present'})")
+
+    # Mirror the content log (incl. script console output) to stdout/console.log —
+    # required for the bot to see the pack's markers at all.
+    props = mc_dir / "server.properties"
+    if props.is_file():
+        ch = _set_kv(props, "content-log-console-output-enabled", "true")
+        print("server.properties: content-log-console-output-enabled=true "
+              f"({'set' if ch else 'already enabled'})")
+    else:
+        print(f"warning: no server.properties at {props}; set "
+              "content-log-console-output-enabled=true yourself")
 
     if args.deaths_only:
         print("Skipped the Beta APIs experiment (--deaths-only); chat disabled.")
@@ -204,9 +256,7 @@ def main():
             flags += ", CHAT_RELAY=true"
         print(f".env updated: {flags}")
 
-    print("\nDone. Next:")
-    print("  1. server.properties: content-log-console-output-enabled=true")
-    print("  2. Start the server, then restart the bot.")
+    print("\nDone. Start the server, then restart the bot.")
 
 
 if __name__ == "__main__":
