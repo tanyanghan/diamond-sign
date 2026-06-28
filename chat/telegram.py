@@ -5,7 +5,10 @@ its own thread (started by ``bot.main``). Monospace blocks use Telegram's HTML
 ``<pre>`` parse mode; long messages are chunked at 4096 chars.
 """
 
+import collections
 import logging
+import threading
+import time
 
 import telebot
 
@@ -16,8 +19,61 @@ logger = logging.getLogger("mcnotifier")
 _MAX_LEN = 4096
 
 
+class _PollingHealth:
+    """Tracks getUpdates 409 conflicts to tell a transient self-conflict from a
+    genuine second poller.
+
+    A lone 409 after a network blip is the bot's *own* orphaned long-poll, which
+    Telegram releases within the long-poll window — it self-heals, so it's logged
+    quietly. But a sustained run of 409s means another process is polling the same
+    bot token, which never resolves on its own, so we escalate to a loud warning.
+
+    A successful transaction (a dispatched update) resets the streak; so does a
+    long enough quiet gap, since that means polling recovered. The loud warning is
+    throttled to at most once per window so a true double-instance keeps reminding
+    without spamming every poll.
+    """
+
+    WINDOW_SECONDS = 120      # look-back window for "sustained"
+    ESCALATE_AFTER = 5        # this many 409s within the window -> escalate
+    RESET_AFTER_QUIET = 60    # a 409 this long after the last starts a fresh streak
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hits = collections.deque()
+        self._last_escalation = None
+
+    def record_conflict(self, now) -> tuple:
+        """Register a 409 at monotonic time ``now``; return (verdict, count)
+        where verdict is 'escalate' or 'quiet'."""
+        with self._lock:
+            if self._hits and now - self._hits[-1] > self.RESET_AFTER_QUIET:
+                self._hits.clear()                # recovered, then broke again
+                self._last_escalation = None
+            self._hits.append(now)
+            while self._hits and now - self._hits[0] > self.WINDOW_SECONDS:
+                self._hits.popleft()
+            sustained = len(self._hits) >= self.ESCALATE_AFTER
+            if sustained and (self._last_escalation is None
+                              or now - self._last_escalation >= self.WINDOW_SECONDS):
+                self._last_escalation = now
+                return "escalate", len(self._hits)
+            return "quiet", len(self._hits)
+
+    def record_success(self) -> None:
+        """A successful transaction clears the streak."""
+        with self._lock:
+            self._hits.clear()
+            self._last_escalation = None
+
+
 class _NetworkErrorFilter(logging.Filter):
-    """Collapse TeleBot's noisy transient network tracebacks into one warning."""
+    """Collapse TeleBot's noisy transient tracebacks into one-line warnings.
+
+    Network errors and the transient getUpdates 409 conflict (see
+    ``_PollingHealth``) are folded into a single ``retrying...`` warning; a
+    sustained 409 streak escalates to an explicit "second instance?" warning.
+    """
     _TRANSIENT = (
         ("Network is unreachable", "network unreachable"),
         ("NewConnectionError", "network unreachable"),
@@ -29,9 +85,29 @@ class _NetworkErrorFilter(logging.Filter):
         ("Connection reset by peer", "connection reset by peer"),
         ("Remote end closed connection without response", "remote end closed connection"),
     )
+    _CONFLICT = "terminated by other getUpdates"
+
+    def __init__(self, health: _PollingHealth):
+        super().__init__()
+        self._health = health
 
     def filter(self, record):
         msg = record.getMessage()
+        # telebot logs the 409 twice (a message line and an "Exception traceback"
+        # line); count/announce on the first, suppress both.
+        if self._CONFLICT in msg:
+            if "Exception traceback" not in msg:
+                verdict, count = self._health.record_conflict(time.monotonic())
+                if verdict == "escalate":
+                    logger.warning(
+                        "Polling: getUpdates 409 conflict is persisting (%d in the "
+                        "last %d min) - another process is polling this bot token; "
+                        "check for a second mcnotifier instance using the same "
+                        "BOT_TOKEN.", count, self._health.WINDOW_SECONDS // 60)
+                else:
+                    logger.warning("Polling: getUpdates conflict (transient, "
+                                   "self-resolving), retrying...")
+            return False
         for phrase, description in self._TRANSIENT:
             if phrase in msg:
                 if "Exception traceback" not in msg:
@@ -53,11 +129,14 @@ class TelegramAdapter(ChatAdapter):
     def __init__(self, config):
         super().__init__(config)
         self._bot = telebot.TeleBot(config.bot_token)
-        logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter())
+        self._health = _PollingHealth()
+        logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter(self._health))
 
     def start(self, dispatch) -> None:
         @self._bot.message_handler(func=lambda m: True)
         def _on_message(message):
+            # A delivered update means getUpdates succeeded -> clear any 409 streak.
+            self._health.record_success()
             text = message.text or ""
             ctx = Context(
                 adapter=self,
