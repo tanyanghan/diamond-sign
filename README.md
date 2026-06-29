@@ -103,8 +103,9 @@ Uses **Socket Mode** (an outbound websocket), so no public URL or webhook is
 needed — it works behind NAT like Telegram. Set `CHAT_PLATFORMS=...,slack` and
 both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
 
-1. Create an app at <https://api.slack.com/apps> → **From an app manifest**, and
-   paste the manifest below (it declares every slash command and the scopes).
+1. Create an app at <https://api.slack.com/apps> → **From an app manifest**,
+   select your workspace, choose the **JSON** tab, and paste the manifest below
+   (it declares every slash command and the scopes).
 2. **Basic Information → App-Level Tokens →** generate a token with the
    `connections:write` scope → that's `SLACK_APP_TOKEN` (`xapp-…`).
 3. **Install App** to your workspace → **Bot User OAuth Token** is
@@ -112,37 +113,46 @@ both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
 4. Invite the bot to each channel you want notifications in (`/invite @yourbot`).
    `chat:write.public` lets it also post to public channels it hasn't joined.
 
-```yaml
-display_information:
-  name: mcnotifier
-features:
-  bot_user:
-    display_name: mcnotifier
-    always_online: true
-  slash_commands:
-    - { command: /online,        description: Show online players,      should_escape: false }
-    - { command: /list,          description: List known players,       should_escape: false }
-    - { command: /stats,         description: Player statistics,        should_escape: false }
-    - { command: /playtime,      description: Playtime leaderboard,     should_escape: false }
-    - { command: /achievements,  description: Player achievements,      should_escape: false }
-    - { command: /deaths,        description: Death history,            should_escape: false }
-    - { command: /death_summary, description: Deaths grouped by cause,  should_escape: false }
-    - { command: /scan_achievements, description: Scan logs for achievements, should_escape: false }
-    - { command: /scan_deaths,   description: Scan logs for deaths,      should_escape: false }
-    - { command: /backup,        description: Trigger a backup now,     should_escape: false }
-    - { command: /allowlist,     description: Manage the allow/whitelist, should_escape: false }
-    - { command: /restore_player, description: Restore one player,      should_escape: false }
-    - { command: /chat_id,       description: Show this chat's ID,      should_escape: false }
-    - { command: /authorize,     description: Whitelist a chat,         should_escape: false }
-    - { command: /revoke,        description: Remove a chat,            should_escape: false }
-    - { command: /listchats,     description: List authorized chats,    should_escape: false }
-    - { command: /commands,      description: Show commands,            should_escape: false }
-oauth_config:
-  scopes:
-    bot: [commands, chat:write, chat:write.public]
-settings:
-  socket_mode_enabled: true
-  org_deploy_enabled: false
+```json
+{
+  "display_information": {
+    "name": "mcnotifier"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "mcnotifier",
+      "always_online": true
+    },
+    "slash_commands": [
+      { "command": "/online", "description": "Show online players", "should_escape": false },
+      { "command": "/list", "description": "List known players", "should_escape": false },
+      { "command": "/stats", "description": "Player statistics", "should_escape": false },
+      { "command": "/playtime", "description": "Playtime leaderboard", "should_escape": false },
+      { "command": "/achievements", "description": "Player achievements", "should_escape": false },
+      { "command": "/deaths", "description": "Death history", "should_escape": false },
+      { "command": "/death_summary", "description": "Deaths grouped by cause", "should_escape": false },
+      { "command": "/scan_achievements", "description": "Scan logs for achievements", "should_escape": false },
+      { "command": "/scan_deaths", "description": "Scan logs for deaths", "should_escape": false },
+      { "command": "/backup", "description": "Trigger a backup now", "should_escape": false },
+      { "command": "/allowlist", "description": "Manage the allow/whitelist", "should_escape": false },
+      { "command": "/restore_player", "description": "Restore one player", "should_escape": false },
+      { "command": "/chat_id", "description": "Show this chat's ID", "should_escape": false },
+      { "command": "/authorize", "description": "Whitelist a chat", "should_escape": false },
+      { "command": "/revoke", "description": "Remove a chat", "should_escape": false },
+      { "command": "/listchats", "description": "List authorized chats", "should_escape": false },
+      { "command": "/commands", "description": "Show commands", "should_escape": false }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["commands", "chat:write", "chat:write.public"]
+    }
+  },
+  "settings": {
+    "socket_mode_enabled": true,
+    "org_deploy_enabled": false
+  }
+}
 ```
 
 > **Why `/online` and `/commands` instead of `/status` and `/help`?** Slack
