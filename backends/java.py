@@ -369,7 +369,8 @@ class JavaBackend(ServerBackend):
             self.begin_save(status)
             save_started = True
             wait_for_settle(self.config.minecraft_dir, self.config.backup_dir,
-                            log_fn=status, exclude_names=backup_exclude_names())
+                            log_fn=status,
+                            exclude_names=backup_exclude_names(self.config))
 
             target = self._live_playerdata_dir() / f"{uuid}.dat"
             source_bytes = _read_player_data_bytes(version)

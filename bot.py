@@ -15,8 +15,8 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from utils.backup_utils import (
-    CHAIN_MARKER_NAME, RE_FULL, RE_INCR, build_file_manifest, new_chain_id,
-    run_copy_command, wait_for_settle,
+    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, RE_FULL, RE_INCR,
+    build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
 )
 from utils.config import (
     load_config, backup_exclude_names, EDITION_BEDROCK, ConfigError,
@@ -30,22 +30,30 @@ from chat import make_adapters, CommandRouter
 # ---------------------------------------------------------------------------
 # 1. Config
 # ---------------------------------------------------------------------------
-# All environment reading lives in config.load_config(); the rest of the module
-# reads from CONFIG (and a few thin aliases kept to minimise churn). Per-player
-# data (stats dir, name registry) is owned by the backend, not bot.py.
-# load_config() syncs .env with .env.example and validates required fields; on a
-# misconfiguration it raises ConfigError, which we surface cleanly and stop.
+# All config reading lives in config.load_config(), which returns an AppConfig
+# (bots -> servers). load_config() reads diamondsign.json, migrates a legacy
+# .env, or runs a first-run wizard; on a misconfiguration it raises ConfigError,
+# which we surface cleanly and stop.
 try:
-    CONFIG = load_config()
+    APP_CONFIG = load_config()
 except ConfigError as e:
     print(f"\n{e}\n", file=sys.stderr)
     sys.exit(1)
 
-MINECRAFT_DIR = CONFIG.minecraft_dir          # Path
-LOG_PATH = CONFIG.log_path                     # Java: logs/latest.log; Bedrock: console.log
-BACKUP_DIR = CONFIG.backup_dir
-INCREMENTAL_BACKUP_ENABLED = CONFIG.incremental_enabled
-INCREMENTAL_INTERVAL_MINUTES = CONFIG.incremental_interval_minutes
+# Step-1 shim: this refactor still drives a single bot + single server. The
+# module-level helpers and main() read BOT_CONFIG / SERVER_CONFIG; later steps
+# move per-server/per-bot state onto Server/Bot objects and loop over all of
+# them. ``CONFIG`` aliases the single ServerConfig so existing CONFIG.<field>
+# reads (all server-level) keep working unchanged.
+BOT_CONFIG = APP_CONFIG.bots[0]
+SERVER_CONFIG = BOT_CONFIG.servers[0]
+CONFIG = SERVER_CONFIG
+
+MINECRAFT_DIR = SERVER_CONFIG.minecraft_dir    # Path
+LOG_PATH = SERVER_CONFIG.log_path              # Java: logs/latest.log; Bedrock: console.log
+BACKUP_DIR = SERVER_CONFIG.backup_dir
+INCREMENTAL_BACKUP_ENABLED = SERVER_CONFIG.incremental_enabled
+INCREMENTAL_INTERVAL_MINUTES = SERVER_CONFIG.incremental_interval_minutes
 
 # Server backend (Java RCON / Bedrock mux). Constructed in main().
 BACKEND = None
@@ -55,7 +63,7 @@ BACKEND = None
 # data. On Bedrock this is the captured-stdout console.log the bot tails, which
 # tee appends to constantly (it would otherwise appear changed in every
 # incremental). Matched by basename anywhere in the tree.
-_BACKUP_EXCLUDE_NAMES = frozenset(backup_exclude_names())
+_BACKUP_EXCLUDE_NAMES = frozenset(backup_exclude_names(SERVER_CONFIG))
 
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
@@ -1074,8 +1082,10 @@ def run_backup(status_cb=None):
                 except ValueError:
                     pass
                 for fn in filenames:
-                    # Chain marker and bot infrastructure are not server data
-                    if fn == CHAIN_MARKER_NAME or fn in _BACKUP_EXCLUDE_NAMES:
+                    # Chain marker (new + legacy) and bot infrastructure are not
+                    # server data
+                    if fn in (CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY) \
+                            or fn in _BACKUP_EXCLUDE_NAMES:
                         continue
                     fp = dp / fn
                     rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
@@ -1137,7 +1147,8 @@ def run_backup(status_cb=None):
 # ---------------------------------------------------------------------------
 
 _MANIFEST_PATH = Path(__file__).parent / "backup_manifest.json"
-_CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / ".mcnotifier_chain"
+_CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / CHAIN_MARKER_NAME
+_CHAIN_MARKER_PATH_LEGACY = Path(MINECRAFT_DIR) / CHAIN_MARKER_NAME_LEGACY
 _incr_timer: threading.Timer | None = None
 _incr_lock = threading.Lock()  # protects _incr_timer
 
@@ -1182,28 +1193,35 @@ def _save_manifest(files: dict, chain_id: str, base_full: str) -> None:
 
 
 def _write_chain_marker(chain_id: str) -> None:
-    """Write chain ID to .mcnotifier_chain in MINECRAFT_DIR.
+    """Write chain ID to the chain marker (CHAIN_MARKER_NAME) in MINECRAFT_DIR.
 
     This marker file lets the bot detect on startup if the server state
     was replaced while it was offline (e.g., manual restore). If the marker
     doesn't match the manifest's chain_id, the chain is considered invalid.
+    A leftover legacy marker is removed so only one marker remains.
     """
     try:
         with open(_CHAIN_MARKER_PATH, "w") as f:
             f.write(chain_id)
+        if _CHAIN_MARKER_PATH_LEGACY.exists():
+            _CHAIN_MARKER_PATH_LEGACY.unlink()
     except Exception:
         logger.exception("Failed to write chain marker")
 
 
 def _read_chain_marker() -> str:
-    """Read chain ID from .mcnotifier_chain, returns '' if missing."""
-    try:
-        return _CHAIN_MARKER_PATH.read_text().strip()
-    except FileNotFoundError:
-        return ""
-    except Exception:
-        logger.exception("Failed to read chain marker")
-        return ""
+    """Read the chain ID from the chain marker, falling back to the legacy
+    (.mcnotifier_chain) name so pre-rename installs keep their chain. '' if
+    neither exists."""
+    for path in (_CHAIN_MARKER_PATH, _CHAIN_MARKER_PATH_LEGACY):
+        try:
+            return path.read_text().strip()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.exception("Failed to read chain marker")
+            return ""
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -2018,7 +2036,7 @@ def main():
 
     # Build the chat adapters (Telegram, Slack, …). They're constructed now but
     # only started later, after the backend and command router are ready.
-    ADAPTERS = make_adapters(CONFIG)
+    ADAPTERS = make_adapters(BOT_CONFIG)
     logger.info("Chat platforms: %s", ", ".join(a.name for a in ADAPTERS))
 
     # Construct the edition-specific backend — the name registry is sourced from
@@ -2028,7 +2046,7 @@ def main():
         BACKEND = make_backend(CONFIG)
     except BackendUnavailable as e:
         logger.error("Cannot start backend for edition '%s': %s", CONFIG.edition, e)
-        _alert_admins(f"⚠️ mcnotifier cannot start: {e}")
+        _alert_admins(f"⚠️ Diamond Sign cannot start: {e}")
         return
     logger.info("Server edition: %s", CONFIG.edition)
 

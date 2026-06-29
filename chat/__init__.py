@@ -4,13 +4,14 @@ from .base import ChatAdapter, Context, CommandRouter, chunk_text
 
 
 def make_adapters(config) -> list:
-    """Construct one ChatAdapter per platform in ``config.chat_platforms``.
+    """Construct one ChatAdapter per platform in ``config.platforms``.
 
-    Adapters are imported lazily so a missing optional SDK (e.g. slack_bolt when
-    only Telegram is enabled) doesn't break startup.
+    ``config`` is a ``BotConfig`` (one chat identity). Adapters are imported
+    lazily so a missing optional SDK (e.g. slack_bolt when only Telegram is
+    enabled) doesn't break startup.
     """
     adapters = []
-    for platform in config.chat_platforms:
+    for platform in config.platforms:
         if platform == "telegram":
             from .telegram import TelegramAdapter
             adapters.append(TelegramAdapter(config))
