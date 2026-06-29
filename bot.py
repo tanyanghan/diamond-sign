@@ -65,6 +65,28 @@ BACKEND = None
 # incremental). Matched by basename anywhere in the tree.
 _BACKUP_EXCLUDE_NAMES = frozenset(backup_exclude_names(SERVER_CONFIG))
 
+# Per-server state lives under data/<server-name>/ so multiple servers in one
+# process never collide. (auth.json stays at the repo root — it's per-bot, not
+# per-server.) The single server's data dir is created here; later steps make
+# this per-Server instance state.
+_DATA_DIR = SERVER_CONFIG.data_dir
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _server_data_path(filename: str) -> Path:
+    """Resolve a per-server state file under data/<key>/, migrating a legacy
+    repo-root copy into place once (so existing single-server installs keep
+    their data after the move)."""
+    target = _DATA_DIR / filename
+    legacy = Path(__file__).parent / filename
+    if not target.exists() and legacy.exists():
+        try:
+            shutil.move(str(legacy), str(target))
+        except OSError:
+            logger.warning("Could not migrate %s into %s", filename, _DATA_DIR)
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
 # ---------------------------------------------------------------------------
@@ -137,7 +159,7 @@ def _uuid_by_name(player_name: str, names: dict) -> str | None:
 # ---------------------------------------------------------------------------
 # 2b. Achievements Storage
 # ---------------------------------------------------------------------------
-_ACHIEVEMENTS_PATH = Path(__file__).parent / "player_achievements.json"
+_ACHIEVEMENTS_PATH = _server_data_path("player_achievements.json")
 _achievements_lock = threading.Lock()
 
 
@@ -175,7 +197,7 @@ def record_achievement(uuid: str, achievement: str, ach_type: str,
 # ---------------------------------------------------------------------------
 # 2c. Deaths Storage
 # ---------------------------------------------------------------------------
-_DEATHS_PATH = Path(__file__).parent / "player_deaths.json"
+_DEATHS_PATH = _server_data_path("player_deaths.json")
 _deaths_lock = threading.Lock()
 
 
@@ -919,7 +941,7 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
 # Bedrock per-player restore reads player data from a sidecar embedded in each
 # backup zip (the live LevelDB is locked while the server runs). Dedup state of
 # {player_server_key: sha256} so incrementals only carry players that changed.
-_PLAYER_STATE_PATH = Path(__file__).parent / "bedrock_player_state.json"
+_PLAYER_STATE_PATH = _server_data_path("bedrock_player_state.json")
 
 
 def _load_player_state() -> dict:
@@ -1146,7 +1168,7 @@ def run_backup(status_cb=None):
 #   - Stops when the last player leaves (with one final backup)
 # ---------------------------------------------------------------------------
 
-_MANIFEST_PATH = Path(__file__).parent / "backup_manifest.json"
+_MANIFEST_PATH = _server_data_path("backup_manifest.json")
 _CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / CHAIN_MARKER_NAME
 _CHAIN_MARKER_PATH_LEGACY = Path(MINECRAFT_DIR) / CHAIN_MARKER_NAME_LEGACY
 _incr_timer: threading.Timer | None = None
