@@ -36,12 +36,11 @@ logger = logging.getLogger("mcnotifier")
 # Portable player list / name registry. xuid -> {name, identities:[MsaId,
 # SelfSignedId], first_seen, last_seen}. Identities are account-stable (the data
 # key is per-server random), so this file can be copied to another instance.
-_PLAYERS_PATH = Path(__file__).resolve().parent.parent / "bedrock_players.json"
+# bedrock_players.json and statistics.json now live under data/<server-name>/
+# (paths set per-instance in __init__), so two Bedrock servers in one process
+# can't clobber each other's player list / stats. The player list is still
+# portable (identities are account-stable; the data key is per-server random).
 _players_lock = threading.Lock()
-
-# Per-server online-time stats (NOT portable). xuid -> {name, total_seconds,
-# sessions, open_since}.
-_STATS_PATH = Path(__file__).resolve().parent.parent / "statistics.json"
 _stats_lock = threading.Lock()
 
 # Serialises response-capturing commands so two concurrent captures can't read
@@ -49,9 +48,9 @@ _stats_lock = threading.Lock()
 _capture_lock = threading.Lock()
 
 
-def _load_players() -> dict:
+def _load_players(path) -> dict:
     try:
-        return json.loads(_PLAYERS_PATH.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception:
@@ -59,16 +58,16 @@ def _load_players() -> dict:
         return {}
 
 
-def _save_players(data: dict) -> None:
+def _save_players(path, data: dict) -> None:
     try:
-        _PLAYERS_PATH.write_text(json.dumps(data, indent=2))
+        path.write_text(json.dumps(data, indent=2))
     except Exception:
         logger.exception("Failed to write bedrock_players.json")
 
 
-def _load_stats() -> dict:
+def _load_stats(path) -> dict:
     try:
-        return json.loads(_STATS_PATH.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception:
@@ -76,9 +75,9 @@ def _load_stats() -> dict:
         return {}
 
 
-def _save_stats(data: dict) -> None:
+def _save_stats(path, data: dict) -> None:
     try:
-        _STATS_PATH.write_text(json.dumps(data, indent=2))
+        path.write_text(json.dumps(data, indent=2))
     except Exception:
         logger.exception("Failed to write statistics.json")
 
@@ -150,6 +149,8 @@ class BedrockBackend(ServerBackend):
 
     def __init__(self, config):
         super().__init__(config)
+        self.players_path = self._data_path("bedrock_players.json")
+        self.stats_path = self._data_path("statistics.json")
         self._mux = detect(config.mux_session)
         if self._mux is None:
             looked = f" '{config.mux_session}'" if config.mux_session else ""
@@ -343,7 +344,7 @@ class BedrockBackend(ServerBackend):
 
     # --- name registry / portable player list (bedrock_players.json) ---
     def load_names(self) -> dict:
-        return {xuid: e["name"] for xuid, e in _load_players().items()
+        return {xuid: e["name"] for xuid, e in _load_players(self.players_path).items()
                 if e.get("name")}
 
     def register_name(self, player_id: str, name: str) -> bool:
@@ -351,21 +352,21 @@ class BedrockBackend(ServerBackend):
         Returns True if the name was created/changed."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with _players_lock:
-            data = _load_players()
+            data = _load_players(self.players_path)
             entry = data.get(player_id, {})
             changed = entry.get("name") != name
             entry["name"] = name
             entry.setdefault("first_seen", now)
             entry["last_seen"] = now
             data[player_id] = entry
-            _save_players(data)
+            _save_players(self.players_path, data)
             return changed
 
     def learn_player(self, name: str, xuid: str, idents: list) -> bool:
         """Merge a learned xuid -> identities binding (account-stable), preserving
         name/timestamps. Returns True if the identities were newly learned."""
         with _players_lock:
-            data = _load_players()
+            data = _load_players(self.players_path)
             entry = data.get(xuid, {})
             if entry.get("identities") == idents:
                 return False
@@ -373,20 +374,20 @@ class BedrockBackend(ServerBackend):
             if name and not entry.get("name"):
                 entry["name"] = name
             data[xuid] = entry
-            _save_players(data)
+            _save_players(self.players_path, data)
             return True
 
     def player_identities(self, xuid: str) -> list:
-        return _load_players().get(xuid, {}).get("identities", [])
+        return _load_players(self.players_path).get(xuid, {}).get("identities", [])
 
     def known_identities(self) -> set:
         out = set()
-        for e in _load_players().values():
+        for e in _load_players(self.players_path).values():
             out.update(e.get("identities", []))
         return out
 
     def list_known_players(self, names: dict) -> list:
-        return sorted(e["name"] for e in _load_players().values() if e.get("name"))
+        return sorted(e["name"] for e in _load_players(self.players_path).values() if e.get("name"))
 
     # --- online-time stats (statistics.json, accumulated from join/leave) ---
     def record_player_session(self, event_type: str, player_id: str,
@@ -395,10 +396,10 @@ class BedrockBackend(ServerBackend):
             return
         now = time.time() if now is None else now
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             entry = data.get(player_id) or {"total_seconds": 0, "sessions": 0,
                                             "open_since": None}
-            nm = _load_players().get(player_id, {}).get("name")
+            nm = _load_players(self.players_path).get(player_id, {}).get("name")
             if nm:
                 entry["name"] = nm
             if event_type == EVENT_JOIN:
@@ -410,26 +411,26 @@ class BedrockBackend(ServerBackend):
                     entry["sessions"] = entry.get("sessions", 0) + 1
                 entry["open_since"] = None
             data[player_id] = entry
-            _save_stats(data)
+            _save_stats(self.stats_path, data)
 
     def reset_open_sessions(self) -> None:
         """Clear any open_since left dangling by a crash (called at startup
         before re-opening sessions for currently-online players)."""
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             touched = False
             for entry in data.values():
                 if entry.get("open_since") is not None:
                     entry["open_since"] = None
                     touched = True
             if touched:
-                _save_stats(data)
+                _save_stats(self.stats_path, data)
 
     def close_open_sessions(self, now: float | None = None) -> None:
         """Flush open sessions (graceful shutdown)."""
         now = time.time() if now is None else now
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             touched = False
             for entry in data.values():
                 start = entry.get("open_since")
@@ -439,7 +440,7 @@ class BedrockBackend(ServerBackend):
                     entry["open_since"] = None
                     touched = True
             if touched:
-                _save_stats(data)
+                _save_stats(self.stats_path, data)
 
     def checkpoint_open_sessions(self, now: float | None = None) -> None:
         """Bank elapsed time for open sessions but keep them open (open_since
@@ -447,7 +448,7 @@ class BedrockBackend(ServerBackend):
         session — it's a durability checkpoint, not a sign-off. Idempotent."""
         now = time.time() if now is None else now
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             touched = False
             for entry in data.values():
                 start = entry.get("open_since")
@@ -456,15 +457,15 @@ class BedrockBackend(ServerBackend):
                     entry["open_since"] = now
                     touched = True
             if touched:
-                _save_stats(data)
+                _save_stats(self.stats_path, data)
 
     def player_stats(self, names: dict) -> list:
         # Persist running time so the displayed value survives a later crash
         # and /stats can't show a number that isn't on disk.
         self.checkpoint_open_sessions()
-        players = _load_players()
+        players = _load_players(self.players_path)
         result = []
-        for xuid, e in _load_stats().items():
+        for xuid, e in _load_stats(self.stats_path).items():
             secs = e.get("total_seconds", 0)
             if e.get("open_since"):  # include the in-progress session
                 secs += max(0, time.time() - e["open_since"])

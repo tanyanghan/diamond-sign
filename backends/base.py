@@ -14,8 +14,11 @@ Line parsing and the shared player-state bookkeeping deliberately stay in
 command transport, the save/flush sequence, and server-side queries.
 """
 
+import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Normalized event types yielded by line parsing.
 EVENT_JOIN = "join"
@@ -49,7 +52,24 @@ class ServerBackend(ABC):
 
     def __init__(self, config):
         self.config = config
+        # Per-server state lives under data/<server-name>/ (config.data_dir),
+        # so two servers in one process never share a state file.
+        self.data_dir = config.data_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self._watcher = None  # LogWatcher, attached after construction
+
+    def _data_path(self, filename: str) -> Path:
+        """Resolve a per-server state file under ``data/<key>/``, migrating a
+        legacy repo-root copy into place once (so existing installs keep their
+        data after the move)."""
+        target = self.data_dir / filename
+        legacy = _REPO_ROOT / filename
+        if not target.exists() and legacy.exists():
+            try:
+                shutil.move(str(legacy), str(target))
+            except OSError:
+                pass
+        return target
 
     def attach_watcher(self, watcher) -> None:
         """Give the backend the LogWatcher it uses to await server log lines.

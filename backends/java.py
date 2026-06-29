@@ -32,8 +32,8 @@ logger = logging.getLogger("mcnotifier")
 # Response to the `list` command: "There are X of a max of Y players online: a, b"
 _RE_LIST = re.compile(r'There are \d+ of a max of \d+ players online:(.*)')
 
-# Java name registry: UUID -> name, learned from server logs.
-_NAMES_PATH = Path(__file__).resolve().parent.parent / "player_names.json"
+# Java name registry: UUID -> name, learned from server logs. The file
+# (player_names.json) lives under data/<server-name>/ — path set per-instance.
 _names_lock = threading.Lock()
 
 
@@ -48,6 +48,10 @@ def _cm_to_km(cm: int) -> float:
 class JavaBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
                     CAP_PLAYER_RESTORE, CAP_STATS}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.names_path = self._data_path("player_names.json")
 
     # --- availability / readiness ---
     def is_available(self, log_warnings: bool = False) -> bool:
@@ -163,9 +167,9 @@ class JavaBackend(ServerBackend):
 
     # --- name registry (player_names.json, keyed by UUID) ---
     def load_names(self) -> dict:
-        if _NAMES_PATH.exists():
+        if self.names_path.exists():
             try:
-                with open(_NAMES_PATH) as f:
+                with open(self.names_path) as f:
                     return json.load(f)
             except Exception:
                 logger.exception("Failed to load player_names.json")
@@ -178,7 +182,7 @@ class JavaBackend(ServerBackend):
                 return False
             data[player_id] = name
             try:
-                with open(_NAMES_PATH, "w") as f:
+                with open(self.names_path, "w") as f:
                     json.dump(data, f, indent=2)
             except Exception:
                 logger.exception("Failed to write player_names.json")
