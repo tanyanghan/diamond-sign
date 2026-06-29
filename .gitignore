@@ -1,5 +1,9 @@
-# Environment
+# Config (holds tokens/passwords)
 .env
+diamondsign.json
+
+# Per-server runtime state (data/<server-name>/…)
+data/
 
 # Virtual environment
 .venv/

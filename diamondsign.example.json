@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "bots": [
+    {
+      "name": "survival-bot",
+      "platforms": ["telegram"],
+      "telegram": { "bot_token": "123456:your-telegram-bot-token" },
+      "servers": [
+        {
+          "name": "survival",
+          "edition": "java",
+          "minecraft_dir": "/srv/survival",
+          "rcon": { "password": "your_rcon_password", "host": "localhost", "port": 25575 },
+          "backup": {
+            "dir": "~/backup/survival",
+            "schedule": "daily",
+            "hour": 4,
+            "incremental": { "enabled": true, "interval_minutes": 15 }
+          },
+          "chat_relay": false
+        }
+      ]
+    },
+    {
+      "name": "hub-bot",
+      "platforms": ["telegram", "slack"],
+      "telegram": { "bot_token": "789012:another-telegram-bot-token" },
+      "slack": { "bot_token": "xoxb-...", "app_token": "xapp-..." },
+      "servers": [
+        {
+          "name": "creative",
+          "edition": "java",
+          "minecraft_dir": "/srv/creative",
+          "rcon": { "password": "your_rcon_password" },
+          "backup": { "dir": "~/backup/creative" }
+        },
+        {
+          "name": "bedrock-smp",
+          "edition": "bedrock",
+          "minecraft_dir": "/srv/bedrock",
+          "mux": { "session": "", "start_cmd": "" },
+          "console_log": null,
+          "bedrock_script_events": true,
+          "chat_relay": true,
+          "backup": { "dir": "~/backup/bedrock", "incremental": { "enabled": true } }
+        }
+      ]
+    }
+  ]
+}
