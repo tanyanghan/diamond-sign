@@ -1536,7 +1536,7 @@ def register_commands(router, auth: dict, names: dict,
         logger.info("Help: requested by %s", ctx.sender_label)
         lines = [
             "Available commands:",
-            "/status — show online players",
+            f"{ctx.adapter.command_label('status')} — show online players",
             "/list — list all known players",
         ]
         if BACKEND.supports(CAP_STATS):

@@ -20,9 +20,19 @@ logger = logging.getLogger("mcnotifier")
 # Slack hard limit is 40k chars; keep well under for readable, un-truncated posts.
 _MAX_LEN = 3500
 
+# Slack reserves some slash-command names (e.g. /status, /help) and rejects them
+# in an app manifest. Those commands are declared under alternate names in the
+# manifest (see README) and mapped back to the bot's canonical command here, so
+# routing — and parity with Telegram — is unchanged. Canonical name -> Slack name.
+_RENAMED = {"status": "online", "help": "commands"}
+_RENAMED_INV = {slack: canon for canon, slack in _RENAMED.items()}
+
 
 class SlackAdapter(ChatAdapter):
     name = "slack"
+
+    def command_label(self, name: str) -> str:
+        return "/" + _RENAMED.get(name, name)
 
     def __init__(self, config):
         super().__init__(config)
@@ -37,7 +47,9 @@ class SlackAdapter(ChatAdapter):
         def _on_command(ack, command):
             ack()  # Slack requires acknowledging within 3s
             try:
-                cmd = command.get("command", "")           # e.g. "/status"
+                cmd = command.get("command", "")           # e.g. "/online"
+                name = cmd[1:] if cmd.startswith("/") else cmd
+                cmd = "/" + _RENAMED_INV.get(name, name)    # map "/online" -> "/status"
                 arg_text = command.get("text", "") or ""    # args after the command
                 full = cmd + ((" " + arg_text) if arg_text else "")
                 channel_id = command["channel_id"]

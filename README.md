@@ -120,7 +120,7 @@ features:
     display_name: mcnotifier
     always_online: true
   slash_commands:
-    - { command: /status,        description: Show online players,      should_escape: false }
+    - { command: /online,        description: Show online players,      should_escape: false }
     - { command: /list,          description: List known players,       should_escape: false }
     - { command: /stats,         description: Player statistics,        should_escape: false }
     - { command: /playtime,      description: Playtime leaderboard,     should_escape: false }
@@ -136,7 +136,7 @@ features:
     - { command: /authorize,     description: Whitelist a chat,         should_escape: false }
     - { command: /revoke,        description: Remove a chat,            should_escape: false }
     - { command: /listchats,     description: List authorized chats,    should_escape: false }
-    - { command: /help,          description: Show commands,            should_escape: false }
+    - { command: /commands,      description: Show commands,            should_escape: false }
 oauth_config:
   scopes:
     bot: [commands, chat:write, chat:write.public]
@@ -144,6 +144,13 @@ settings:
   socket_mode_enabled: true
   org_deploy_enabled: false
 ```
+
+> **Why `/online` and `/commands` instead of `/status` and `/help`?** Slack
+> reserves `/status` and `/help` for its own built-in commands and rejects an app
+> manifest that tries to register them ("invalid name"). The Slack adapter maps
+> `/online → status` and `/commands → help` internally, so they behave exactly
+> like the Telegram `/status` and `/help`. All other commands are identical
+> across platforms.
 
 Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/authorize` and
 the per-platform `auth.json` handle automatically.
@@ -277,6 +284,10 @@ chat on every platform, and answers commands in whichever chat they're sent.
 | `/backup` | *(Admin)* Trigger a server backup now |
 | `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore one player's data |
+
+**Slack note.** Slack reserves `/status` and `/help`, so on Slack they're
+`/online` and `/commands` respectively (the bot maps them back internally). Every
+other command name is the same on both platforms.
 
 **Edition notes.** On **Bedrock**, `/achievements` and `/scan_achievements` are
 unavailable (achievements are Xbox-bound and not exposed to servers). `/deaths`

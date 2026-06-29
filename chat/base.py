@@ -60,6 +60,14 @@ class ChatAdapter(ABC):
         """Send ``text`` to ``chat_id``. The adapter formats monospace for its
         platform and splits over-long messages into chunks."""
 
+    def command_label(self, name: str) -> str:
+        """The user-facing ``/command`` string for a canonical command name on
+        this platform. Defaults to ``/name``; a platform overrides this where it
+        must expose a command under a different name (e.g. Slack reserves
+        ``/status`` and ``/help``, so it renames them). Used to render help text
+        that matches what users can actually type."""
+        return "/" + name
+
 
 def chunk_text(text, max_len):
     """Split ``text`` into <= max_len pieces, preferring to break on newlines."""
