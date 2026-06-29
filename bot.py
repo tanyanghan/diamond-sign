@@ -229,38 +229,64 @@ def record_death(uuid: str, message: str, timestamp: str,
 
 
 # ---------------------------------------------------------------------------
-# 3. Online Players State
+# 3. Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
-_online_players: set = set()
-_online_lock = threading.Lock()
+class Server:
+    """One Minecraft server's runtime: its config, backend, and per-server
+    mutable state (online players, session xuids, pending UUID correlation, and
+    — added in later sub-steps — backup state). main() builds one of these
+    today and will loop over several once multi-server lands; the module-level
+    aliases below keep existing call sites working in the meantime.
+    """
 
-# Bedrock identity learning: xuids seen online since the last backup (kept even
-# after a player leaves, so a short session that only triggers a post-leave
-# backup is still attributable). Pruned to the still-online set after each
-# learn attempt. See _maybe_learn_player.
-_session_xuids: set = set()
-_session_lock = threading.Lock()
+    def __init__(self, config):
+        self.config = config
+        self.backend = None  # set in main() after make_backend
+
+        self.online_players: set = set()
+        self.online_lock = threading.Lock()
+
+        # Bedrock identity learning: xuids seen online since the last backup
+        # (kept even after a player leaves, so a short session that only triggers
+        # a post-leave backup is still attributable). Pruned to the still-online
+        # set after each learn attempt. See _maybe_learn_player.
+        self.session_xuids: set = set()
+        self.session_lock = threading.Lock()
+
+        # name -> uuid, populated by the UUID log line, consumed by the join line.
+        self.pending_uuids: dict = {}
+
+    def player_join(self, name: str) -> None:
+        with self.online_lock:
+            self.online_players.add(name)
+
+    def player_leave(self, name: str) -> None:
+        with self.online_lock:
+            self.online_players.discard(name)
+
+    def get_online_players(self) -> list:
+        with self.online_lock:
+            return sorted(self.online_players)
+
+    def note_active_xuid(self, xuid: str) -> None:
+        if xuid:
+            with self.session_lock:
+                self.session_xuids.add(xuid)
 
 
-def player_join(name: str) -> None:
-    with _online_lock:
-        _online_players.add(name)
+SERVER = Server(SERVER_CONFIG)
 
-
-def player_leave(name: str) -> None:
-    with _online_lock:
-        _online_players.discard(name)
-
-
-def get_online_players() -> list:
-    with _online_lock:
-        return sorted(_online_players)
-
-
-def _note_active_xuid(xuid: str) -> None:
-    if xuid:
-        with _session_lock:
-            _session_xuids.add(xuid)
+# Single-instance shim: existing module-level call sites use these aliases; the
+# multi-server steps thread the resolved Server object through instead.
+player_join = SERVER.player_join
+player_leave = SERVER.player_leave
+get_online_players = SERVER.get_online_players
+_note_active_xuid = SERVER.note_active_xuid
+_online_players = SERVER.online_players      # same set object
+_online_lock = SERVER.online_lock
+_session_xuids = SERVER.session_xuids        # same set object
+_session_lock = SERVER.session_lock
+_pending_uuids = SERVER.pending_uuids        # same dict object
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +371,7 @@ def _categorize_death(message: str) -> str:
     return "Other"
 
 
-_pending_uuids: dict = {}  # name -> uuid, populated by UUID line, consumed by join line
+# _pending_uuids now lives on the Server object (aliased above).
 
 
 def _parse_line_java(line: str, names: dict) -> tuple:
