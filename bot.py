@@ -589,11 +589,20 @@ class LogWatcher(FileSystemEventHandler):
         returns a LogLineWaiter. The waiter is signalled when a matching
         line appears in the log.
     """
-    def __init__(self, log_path: Path, names: dict, notify_cb):
+    # Lines that mean the server is (re)started and ready to answer queries.
+    # Java logs RCON readiness; Bedrock logs "Server started." (its console.log
+    # is appended via tee, so there's no inode rotation to key off).
+    _START_MARKERS = ("RCON running on", "Server started")
+    _START_DEBOUNCE = 15  # seconds; collapse a burst of start lines into one
+
+    def __init__(self, log_path: Path, names: dict, notify_cb,
+                 on_server_start=None):
         self._path = log_path
         self._filename = log_path.name  # "latest.log" (Java) or "console.log" (Bedrock)
         self._names = names
         self._notify = notify_cb
+        self._on_server_start = on_server_start  # called when the server (re)starts
+        self._last_start_trigger = 0.0
         self._pos = 0
         self._inode = None
         self._lock = threading.Lock()
@@ -654,6 +663,21 @@ class LogWatcher(FileSystemEventHandler):
             for waiter in triggered:
                 self._waiters.remove(waiter)
 
+    def _maybe_server_start(self, line: str) -> None:
+        """If a line signals the server (re)started, fire the on_server_start
+        callback in a background thread (debounced). Runs off-thread so the
+        reconcile's live query doesn't stall log reading."""
+        if self._on_server_start is None:
+            return
+        if not any(marker in line for marker in self._START_MARKERS):
+            return
+        now = time.time()
+        if now - self._last_start_trigger < self._START_DEBOUNCE:
+            return
+        self._last_start_trigger = now
+        logger.info("Server start detected in log; resyncing online status")
+        threading.Thread(target=self._on_server_start, daemon=True).start()
+
     def on_modified(self, event):
         if not str(event.src_path).endswith(self._filename):
             return
@@ -667,6 +691,8 @@ class LogWatcher(FileSystemEventHandler):
                 for line in new_data.splitlines():
                     # Check RCON confirmation waiters
                     self._check_waiters(line)
+                    # Server (re)start -> resync online status (debounced).
+                    self._maybe_server_start(line)
                     # Check player event notifications
                     event_type, payload = parse_line(line, self._names)
                     if event_type and payload:
@@ -1533,6 +1559,56 @@ def _stop_incremental_cycle(final: bool = False):
         threading.Thread(target=run_incremental_backup, daemon=True).start()
 
 
+_reconcile_lock = threading.Lock()
+
+
+def reconcile_online(names: dict, *, reason: str = "") -> list | None:
+    """Reconcile the in-memory online set with what the server actually reports.
+
+    The set is normally kept current from parsed join/leave lines, but it goes
+    stale when players leave without a clean disconnect line — e.g. a restore
+    stop/restart kicks everyone yet BDS emits no "Player disconnected" lines, so
+    the bot would keep believing they're online (and never stop the incremental
+    cycle). This queries the server, then adds players it missed and drops ones
+    that are gone, recording the matching session boundaries and starting or
+    stopping the incremental cycle to match the new count.
+
+    Returns the reconciled online list, or None if the server couldn't be
+    queried (in which case the in-memory set is left untouched — best-effort).
+    """
+    with _reconcile_lock:
+        try:
+            actual = BACKEND.query_online_players()
+        except Exception as e:
+            logger.warning("Reconcile online failed%s: %s",
+                           f" ({reason})" if reason else "", e)
+            return None
+        actual_set = set(actual)
+        before = set(get_online_players())
+        joined = actual_set - before
+        left = before - actual_set
+        if joined or left:
+            logger.info("Reconcile online%s: +%s -%s",
+                        f" ({reason})" if reason else "",
+                        sorted(joined) or "none", sorted(left) or "none")
+        for name in joined:
+            player_join(name)
+            pid = _uuid_by_name(name, names)
+            if pid:
+                BACKEND.record_player_session("join", pid)
+        for name in left:
+            player_leave(name)
+            pid = _uuid_by_name(name, names)
+            if pid:
+                BACKEND.record_player_session("leave", pid)
+        # Match the incremental cycle to reality: running iff someone is online.
+        if actual_set:
+            _start_incremental_cycle()
+        else:
+            _stop_incremental_cycle(final=bool(left))
+        return sorted(actual_set)
+
+
 # ---------------------------------------------------------------------------
 # 8. Authorization System
 # ---------------------------------------------------------------------------
@@ -1642,11 +1718,19 @@ def register_commands(router, auth: dict, names: dict,
     # --- /status ---
     def cmd_status(ctx):
         logger.info("Status: requested by %s", ctx.sender_label)
-        online = get_online_players()
+        # Query the server live (and reconcile the in-memory set) so the answer
+        # reflects reality, not just what the bot last parsed from the log.
+        online = reconcile_online(names, reason="/status")
+        suffix = ""
+        if online is None:  # server unreachable — fall back to last-known set
+            online = get_online_players()
+            suffix = " (server unreachable; last known)"
         if online:
-            ctx.reply(f"Players online: {len(online)} ({', '.join(online)})")
+            reply = f"Players online: {len(online)} ({', '.join(online)}){suffix}"
         else:
-            ctx.reply("No players currently online.")
+            reply = f"No players currently online.{suffix}"
+        ctx.reply(reply)
+        logger.info("Status: replied to %s — %s", ctx.sender_label, reply)
     router.register("status", cmd_status)
 
     # --- /stats ---
@@ -1691,8 +1775,11 @@ def register_commands(router, auth: dict, names: dict,
         entries = BACKEND.list_known_players(names)
         if not entries:
             ctx.reply("No players found.")
+            logger.info("List: replied to %s — no known players", ctx.sender_label)
             return
         ctx.reply("Known players:\n" + "\n".join(entries))
+        logger.info("List: replied to %s — %d known player(s)",
+                    ctx.sender_label, len(entries))
     router.register("list", cmd_list)
 
     # --- /achievements ---
@@ -1978,6 +2065,11 @@ def register_commands(router, auth: dict, names: dict,
                     return
                 try:
                     BACKEND.restore_player(canonical, uuid, version, say)
+                    # A Bedrock restore restarts the server (stop -> edit ->
+                    # start), kicking everyone with no "disconnect" lines, so the
+                    # in-memory online set would be left stale. Resync it against
+                    # the freshly-restarted server (no-op on Java — no restart).
+                    reconcile_online(names, reason="after restore")
                 finally:
                     _backup_lock.release()
 
@@ -2117,7 +2209,9 @@ def main():
     register_commands(router, auth, names, achievements, deaths)
 
     notify = make_notify_callback(names, achievements, deaths)
-    watcher = LogWatcher(LOG_PATH, names, notify)
+    watcher = LogWatcher(LOG_PATH, names, notify,
+                         on_server_start=lambda: reconcile_online(
+                             names, reason="server start"))
     _watcher_ref = watcher
     BACKEND.attach_watcher(watcher)
     observer = Observer()
