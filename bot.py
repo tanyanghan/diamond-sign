@@ -1559,6 +1559,47 @@ def _stop_incremental_cycle(final: bool = False):
         threading.Thread(target=run_incremental_backup, daemon=True).start()
 
 
+def _recover_online_identities(online_names: list, names: dict) -> None:
+    """Recover xuids for already-online Bedrock players whose connect line the
+    bot missed because it started mid-session.
+
+    The Bedrock registry is keyed by xuid, but ``list`` only returns usernames —
+    so a player already online at startup has no registry entry (absent from
+    ``/list``, stats, identity-learning) until they leave. Bedrock's console.log
+    is appended (never rotated), so their ``Player connected: <name>, xuid: <id>``
+    line is still on disk: scan it and register the ones we can resolve. No-op on
+    Java (its name registry is recovered from world data, not this log)."""
+    if CONFIG.edition != EDITION_BEDROCK:
+        return
+    missing = [n for n in online_names if _uuid_by_name(n, names) is None]
+    if not missing:
+        return
+    found: dict = {}
+    try:
+        with open(CONFIG.log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = (RE_BEDROCK_CONNECT.search(line)
+                     or RE_BEDROCK_DISCONNECT.search(line))
+                if m and m.group(1).strip() in missing:
+                    found[m.group(1).strip()] = m.group(2).strip()  # latest wins
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.exception("Failed to scan log for online-player identities")
+        return
+    for name in missing:
+        if name in found:
+            register_player(found[name], name, names)
+    recovered = [n for n in missing if n in found]
+    if recovered:
+        logger.info("Recovered identity from log for %d already-online "
+                    "player(s): %s", len(recovered), ", ".join(recovered))
+    unresolved = [n for n in missing if n not in found]
+    if unresolved:
+        logger.info("No identity in log yet for: %s (will resolve on leave)",
+                    ", ".join(unresolved))
+
+
 _reconcile_lock = threading.Lock()
 
 
@@ -2253,6 +2294,10 @@ def main():
             if current:
                 logger.info("%d player(s) already online: %s",
                             len(current), ", ".join(current))
+                # The bot missed these players' connect lines (started
+                # mid-session), so recover their xuids from the log to register
+                # them properly (Bedrock; no-op on Java).
+                _recover_online_identities(current, names)
                 for name in current:
                     pid = _uuid_by_name(name, names)
                     if pid:
