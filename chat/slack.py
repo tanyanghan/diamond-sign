@@ -20,6 +20,59 @@ logger = logging.getLogger("mcnotifier")
 # Slack hard limit is 40k chars; keep well under for readable, un-truncated posts.
 _MAX_LEN = 3500
 
+
+class _SlackNetworkErrorFilter(logging.Filter):
+    """Collapse slack_sdk's noisy transient network / reconnect errors into a
+    single one-line warning, mirroring the Telegram adapter's filter.
+
+    During a network or DNS outage slack_sdk logs multi-line ``error`` records
+    from several child loggers (``slack_sdk.web.base_client``,
+    ``slack_sdk.socket_mode.builtin.client``, …); by default these reach Python's
+    unformatted last-resort stderr handler and spam the log. ``install()`` routes
+    the ``slack_sdk`` / ``slack_bolt`` loggers through the bot's own handlers and
+    attaches this filter to them — a *handler* filter is consulted for records
+    from every descendant logger (a logger filter is not), so one blip becomes a
+    single ``Slack: network error, retrying...`` line. Non-transient and
+    non-Slack records pass through untouched (and now land in the log file with
+    the normal prefix).
+    """
+    _TRANSIENT = (
+        "Temporary failure in name resolution",
+        "Name or service not known",
+        "Network is unreachable",
+        "Failed to send a request to Slack API server",
+        "Failed to check the current session or reconnect",
+        "Connection to Slack failed",
+        "timed out",
+    )
+
+    def filter(self, record) -> bool:
+        if not record.name.startswith("slack"):
+            return True  # not ours — leave every other record untouched
+        msg = record.getMessage()
+        if any(p in msg for p in self._TRANSIENT):
+            logger.warning("Slack: network error, retrying...")
+            return False  # drop the raw multi-line SDK error
+        return True
+
+    @classmethod
+    def install(cls) -> None:
+        """Route the slack_sdk / slack_bolt loggers through the bot's handlers
+        with this filter attached. Idempotent; safe to call once per adapter."""
+        mc_handlers = logging.getLogger("mcnotifier").handlers
+        if not mc_handlers:
+            return  # logging not set up yet; nothing to attach to
+        filt = cls()
+        for h in mc_handlers:
+            if not any(isinstance(f, cls) for f in h.filters):
+                h.addFilter(filt)
+        for name in ("slack_sdk", "slack_bolt"):
+            lg = logging.getLogger(name)
+            for h in mc_handlers:
+                if h not in lg.handlers:
+                    lg.addHandler(h)
+            lg.propagate = False  # don't also hit the unformatted last-resort handler
+
 # Slack reserves some slash-command names (e.g. /status, /help) and rejects them
 # in an app manifest. Those commands are declared under alternate names in the
 # manifest (see README) and mapped back to the bot's canonical command here, so
@@ -36,6 +89,8 @@ class SlackAdapter(ChatAdapter):
 
     def __init__(self, config):
         super().__init__(config)
+        # Quieten slack_sdk's transient network/reconnect spam (mirrors Telegram).
+        _SlackNetworkErrorFilter.install()
         # token_verification_enabled=False so construction makes no network call
         # (make_adapters runs before start(); auth happens when the socket opens).
         self._app = App(token=config.slack_bot_token,
