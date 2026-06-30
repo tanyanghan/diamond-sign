@@ -509,7 +509,12 @@ def _parse_line_bedrock(line: str, names: dict) -> tuple:
         return "join", name
     m = RE_BEDROCK_DISCONNECT.search(line)
     if m:
-        name = m.group(1).strip()
+        name, xuid = m.group(1).strip(), m.group(2).strip()
+        # The disconnect line carries the xuid too, so register it even if we
+        # never saw this player's connect line (e.g. they were already online
+        # when the bot started). Otherwise their identity would go unrecorded.
+        if xuid:
+            register_player(xuid, name, names, _NAMES_PATH)
         player_leave(name)
         return "leave", name
 
