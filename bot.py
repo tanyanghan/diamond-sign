@@ -256,6 +256,17 @@ class Server:
         # name -> uuid, populated by the UUID log line, consumed by the join line.
         self.pending_uuids: dict = {}
 
+        # Backup state (per-server). The manifest lives under data/<key>/; the
+        # chain marker lives in the world dir (so an offline restore is
+        # detectable). incr_timer is the self-rescheduling incremental cycle.
+        self.backup_lock = threading.Lock()
+        self.incr_lock = threading.Lock()      # protects incr_timer
+        self.incr_timer: threading.Timer | None = None
+        self.manifest_path = _server_data_path("backup_manifest.json")
+        self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
+        self.chain_marker_path_legacy = (self.config.minecraft_dir
+                                         / CHAIN_MARKER_NAME_LEGACY)
+
     def player_join(self, name: str) -> None:
         with self.online_lock:
             self.online_players.add(name)
@@ -919,7 +930,7 @@ def _scan_logs(scan_fn, names: dict, store: dict) -> int:
 # ---------------------------------------------------------------------------
 # 7d. RCON & Backup
 # ---------------------------------------------------------------------------
-_backup_lock = threading.Lock()
+_backup_lock = SERVER.backup_lock  # alias to the single server's lock (see Server)
 _watcher_ref: LogWatcher | None = None
 
 # Active chat adapters (Telegram, Slack, …) and the per-platform auth object,
@@ -1225,11 +1236,13 @@ def run_backup(status_cb=None):
 #   - Stops when the last player leaves (with one final backup)
 # ---------------------------------------------------------------------------
 
-_MANIFEST_PATH = _server_data_path("backup_manifest.json")
-_CHAIN_MARKER_PATH = Path(MINECRAFT_DIR) / CHAIN_MARKER_NAME
-_CHAIN_MARKER_PATH_LEGACY = Path(MINECRAFT_DIR) / CHAIN_MARKER_NAME_LEGACY
-_incr_timer: threading.Timer | None = None
-_incr_lock = threading.Lock()  # protects _incr_timer
+# Aliases to the single server's backup state (see Server.__init__). The
+# incremental timer is reassigned, so it's accessed as SERVER.incr_timer in the
+# cycle functions rather than aliased here.
+_MANIFEST_PATH = SERVER.manifest_path
+_CHAIN_MARKER_PATH = SERVER.chain_marker_path
+_CHAIN_MARKER_PATH_LEGACY = SERVER.chain_marker_path_legacy
+_incr_lock = SERVER.incr_lock
 
 
 def _diff_manifest(old: dict, new: dict) -> tuple:
@@ -1507,16 +1520,15 @@ def run_incremental_backup() -> str | None:
 
 def _incremental_cycle():
     """Run one incremental backup, then reschedule if the cycle is still active."""
-    global _incr_timer
     try:
         run_incremental_backup()
     finally:
-        with _incr_lock:
-            if _incr_timer is not None:  # cycle still active (not stopped)
-                _incr_timer = threading.Timer(
+        with SERVER.incr_lock:
+            if SERVER.incr_timer is not None:  # cycle still active (not stopped)
+                SERVER.incr_timer = threading.Timer(
                     INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
-                _incr_timer.daemon = True
-                _incr_timer.start()
+                SERVER.incr_timer.daemon = True
+                SERVER.incr_timer.start()
 
 
 def _start_incremental_cycle():
@@ -1524,18 +1536,17 @@ def _start_incremental_cycle():
 
     Called when the first player joins the server.
     """
-    global _incr_timer
     if not INCREMENTAL_BACKUP_ENABLED:
         return
-    with _incr_lock:
-        if _incr_timer is not None:
+    with SERVER.incr_lock:
+        if SERVER.incr_timer is not None:
             return  # already running
         logger.info("Incremental backup cycle started (every %d min)",
                     INCREMENTAL_INTERVAL_MINUTES)
-        _incr_timer = threading.Timer(
+        SERVER.incr_timer = threading.Timer(
             INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
-        _incr_timer.daemon = True
-        _incr_timer.start()
+        SERVER.incr_timer.daemon = True
+        SERVER.incr_timer.start()
 
 
 def _stop_incremental_cycle(final: bool = False):
@@ -1545,14 +1556,13 @@ def _stop_incremental_cycle(final: bool = False):
     If final=True, runs one last incremental backup to capture any remaining
     changes from the play session.
     """
-    global _incr_timer
     if not INCREMENTAL_BACKUP_ENABLED:
         return
-    with _incr_lock:
-        if _incr_timer is None:
+    with SERVER.incr_lock:
+        if SERVER.incr_timer is None:
             return
-        _incr_timer.cancel()
-        _incr_timer = None
+        SERVER.incr_timer.cancel()
+        SERVER.incr_timer = None
     logger.info("Incremental backup cycle stopped")
     if final:
         logger.info("Running final incremental backup before stop")
@@ -2234,6 +2244,7 @@ def main():
         logger.error("Cannot start backend for edition '%s': %s", CONFIG.edition, e)
         _alert_admins(f"⚠️ Diamond Sign cannot start: {e}")
         return
+    SERVER.backend = BACKEND  # the single server owns its backend (same object)
     logger.info("Server edition: %s", CONFIG.edition)
 
     names = load_player_names()  # now backed by BACKEND.load_names()
