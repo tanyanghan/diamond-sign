@@ -1693,22 +1693,44 @@ def reconcile_online(names: dict, *, reason: str = "") -> list | None:
 _AUTH_PATH = Path(__file__).parent / "auth.json"
 _auth_lock = threading.Lock()
 
+# The whole bot-namespaced auth doc ({bot_name: {platform: ns}}), set in main().
+# `_AUTH` (below/aliased in main) is this bot's slice — the {platform: ns} value
+# for BOT_CONFIG.name, sharing the same dict objects — so mutating the slice and
+# persisting the doc stay consistent.
+_AUTH_DOC: dict = {}
+
 
 def _normalize_ns(ns: dict) -> dict:
-    """Normalize one platform's auth namespace: string IDs throughout."""
+    """Normalize one platform's auth namespace: string IDs throughout.
+
+    ``chat_servers`` binds an authorized chat to a specific server key (used
+    once a bot fronts several servers); single-server bots ignore it and
+    announce to every authorized chat.
+    """
     admin = ns.get("admin_user_id")
     return {
         "admin_user_id": str(admin) if admin is not None else None,
         "authorized_chat_ids": [str(c) for c in ns.get("authorized_chat_ids", [])],
+        "chat_servers": {str(c): str(s)
+                         for c, s in (ns.get("chat_servers") or {}).items()},
     }
 
 
-def load_auth(path: Path) -> dict:
-    """Load per-platform auth: {platform: {admin_user_id, authorized_chat_ids}}.
+def load_auth(path: Path, bot_name: str, default_server_key: str = None) -> dict:
+    """Load bot-namespaced auth:
+    ``{bot_name: {platform: {admin_user_id, authorized_chat_ids, chat_servers}}}``.
 
-    Migrates the pre-multi-platform flat shape ({admin_user_id,
-    authorized_chat_ids}) into the ``telegram`` namespace so existing installs
-    keep their admin and whitelist.
+    Chains three migrations so any older on-disk shape upgrades in place:
+      1. flat ``{admin_user_id, authorized_chat_ids}`` -> ``{telegram: …}``
+         (pre-multi-platform installs);
+      2. platform-level ``{platform: ns}`` -> ``{bot_name: {platform: ns}}``
+         (pre-multi-bot installs, folded under this bot's name);
+      3. per platform, existing authorized chats are bound to
+         ``default_server_key`` (when given) so a later multi-server config keeps
+         delivering to them.
+
+    Migration is in-memory only; the new shape is persisted on the next auth
+    mutation (admin claim / authorize / revoke).
     """
     data = {}
     if path.exists():
@@ -1717,9 +1739,26 @@ def load_auth(path: Path) -> dict:
                 data = json.load(f)
         except Exception:
             logger.exception("Failed to load auth.json")
+    # 1. flat -> telegram namespace
     if "admin_user_id" in data or "authorized_chat_ids" in data:
-        data = {"telegram": data}  # migrate flat -> telegram namespace
-    return {platform: _normalize_ns(ns) for platform, ns in data.items()}
+        data = {"telegram": data}
+    # 2. platform-level -> bot-namespaced. A platform-level doc has ns dicts
+    #    (with admin_user_id/authorized_chat_ids) as its top-level values; a
+    #    bot-namespaced doc has platform maps there instead.
+    if any(isinstance(v, dict)
+           and ("admin_user_id" in v or "authorized_chat_ids" in v)
+           for v in data.values()):
+        data = {bot_name: data}
+    # Ensure this bot has a namespace and normalize every bot/platform.
+    data.setdefault(bot_name, {})
+    out = {bname: {p: _normalize_ns(ns) for p, ns in bns.items()}
+           for bname, bns in data.items()}
+    # 3. bind pre-existing authorized chats to the sole server.
+    if default_server_key:
+        for ns in out[bot_name].values():
+            for cid in ns["authorized_chat_ids"]:
+                ns["chat_servers"].setdefault(cid, default_server_key)
+    return out
 
 
 def save_auth(auth: dict, path: Path) -> None:
@@ -1729,7 +1768,8 @@ def save_auth(auth: dict, path: Path) -> None:
 
 def _auth_ns(auth: dict, platform: str) -> dict:
     return auth.setdefault(
-        platform, {"admin_user_id": None, "authorized_chat_ids": []})
+        platform,
+        {"admin_user_id": None, "authorized_chat_ids": [], "chat_servers": {}})
 
 
 def is_admin(platform: str, user_id, auth: dict) -> bool:
@@ -2190,7 +2230,7 @@ def register_commands(router, auth: dict, names: dict,
             ns = _auth_ns(auth, ctx.platform)
             if target_id not in ns["authorized_chat_ids"]:
                 ns["authorized_chat_ids"].append(target_id)
-                save_auth(auth, _AUTH_PATH)
+                save_auth(_AUTH_DOC, _AUTH_PATH)
         logger.info("Authorize: chat %s added by %s on %s",
                     target_id, ctx.sender_label, ctx.platform)
         ctx.reply(f"Chat {target_id} is now authorized.")
@@ -2206,7 +2246,7 @@ def register_commands(router, auth: dict, names: dict,
             ns = _auth_ns(auth, ctx.platform)
             if target_id in ns["authorized_chat_ids"]:
                 ns["authorized_chat_ids"].remove(target_id)
-                save_auth(auth, _AUTH_PATH)
+                save_auth(_AUTH_DOC, _AUTH_PATH)
                 logger.info("Revoke: chat %s removed by %s on %s",
                             target_id, ctx.sender_label, ctx.platform)
                 ctx.reply(f"Chat {target_id} has been revoked.")
@@ -2236,7 +2276,7 @@ def _make_unclaimed_handler(auth: dict):
             if _auth_ns(auth, ctx.platform).get("admin_user_id") is not None:
                 return False
             _auth_ns(auth, ctx.platform)["admin_user_id"] = ctx.user_id
-            save_auth(auth, _AUTH_PATH)
+            save_auth(_AUTH_DOC, _AUTH_PATH)
         logger.info("Admin claimed on %s by %s (id=%s)",
                     ctx.platform, ctx.sender_label, ctx.user_id)
         ctx.reply("You are now the admin.")
@@ -2250,12 +2290,15 @@ def _make_unclaimed_handler(auth: dict):
 def main():
     setup_logging(Path(__file__).parent / "logs")
 
-    auth = load_auth(_AUTH_PATH)
+    global _watcher_ref, BACKEND, ADAPTERS, _AUTH, _AUTH_DOC
+    # Load the whole bot-namespaced auth doc; this bot operates on its own slice
+    # (the {platform: ns} value for its name), which shares dict objects with the
+    # doc so save_auth(_AUTH_DOC) persists in-place mutations.
+    _AUTH_DOC = load_auth(_AUTH_PATH, BOT_CONFIG.name, SERVER.config.key)
+    auth = _AUTH_DOC[BOT_CONFIG.name]
+    _AUTH = auth
     achievements = load_achievements(_ACHIEVEMENTS_PATH)
     deaths = load_deaths(_DEATHS_PATH)
-
-    global _watcher_ref, BACKEND, ADAPTERS, _AUTH
-    _AUTH = auth
 
     # Build the chat adapters (Telegram, Slack, …). They're constructed now but
     # only started later, after the backend and command router are ready.
