@@ -744,6 +744,74 @@ _session_lock = SERVER.session_lock
 _pending_uuids = SERVER.pending_uuids        # same dict object
 
 
+class Bot:
+    """One chat identity (its Telegram bot and/or Slack app) fronting a set of
+    servers. Owns the adapters, the command router, and this bot's slice of the
+    auth doc; delivers announcements only to its own authorized chats. main()
+    builds one today and will loop over several once multi-bot lands.
+
+    Announcements are per (bot, server): a single-server bot fans out to every
+    authorized chat (today's behavior), while a multi-server bot delivers only
+    to chats bound to that server via the ``chat_servers`` auth binding.
+    """
+
+    def __init__(self, config, servers):
+        self.config = config
+        self.servers = list(servers)
+        self.by_name = {s.config.name: s for s in self.servers}
+        # Set in main() once the adapters and auth doc are built.
+        self.adapters: list = []
+        self.router = None
+        self.auth_doc: dict = {}   # whole {bot: {platform: ns}} doc (for saves)
+        self.auth: dict = {}       # this bot's slice: {platform: ns}
+
+    def _server_chats(self, adapter, server):
+        """Yield the authorized chat IDs on ``adapter`` that should receive
+        ``server``'s announcements: all of them for a single-server bot, else
+        only those bound to the server's key."""
+        ns = self.auth.get(adapter.name) or {}
+        chat_ids = ns.get("authorized_chat_ids", [])
+        if len(self.servers) == 1:
+            yield from chat_ids
+            return
+        binding = ns.get("chat_servers", {})
+        key = server.config.key
+        for chat_id in chat_ids:
+            if binding.get(chat_id) == key:
+                yield chat_id
+
+    def announce(self, server, msg: str) -> int:
+        """Send an announcement about ``server`` to its authorized chats on every
+        platform. Returns how many chats it reached."""
+        sent = 0
+        for adapter in self.adapters:
+            for chat_id in self._server_chats(adapter, server):
+                try:
+                    adapter.send(chat_id, msg)
+                    sent += 1
+                except Exception as e:
+                    logger.warning("Announce to %s/%s failed: %s",
+                                   adapter.name, chat_id, e)
+        return sent
+
+    def announce_chat_count(self, server) -> int:
+        return sum(sum(1 for _ in self._server_chats(a, server))
+                   for a in self.adapters)
+
+    def alert_admins(self, msg: str) -> None:
+        """Send an operational alert to each platform's admin (if claimed)."""
+        for adapter in self.adapters:
+            admin = (self.auth.get(adapter.name) or {}).get("admin_user_id")
+            if admin:
+                try:
+                    adapter.send(admin, msg)
+                except Exception:
+                    logger.warning("Failed to alert %s admin", adapter.name)
+
+
+BOT = Bot(BOT_CONFIG, [SERVER])
+
+
 # ---------------------------------------------------------------------------
 # 4. Log Parsing
 # ---------------------------------------------------------------------------
@@ -1161,12 +1229,16 @@ class LogWatcher(FileSystemEventHandler):
 # ---------------------------------------------------------------------------
 # 6. Notification Callback
 # ---------------------------------------------------------------------------
-def make_notify_callback(names: dict, achievements: dict, deaths: dict):
+def make_notify_callback(bot, server, names: dict, achievements: dict,
+                         deaths: dict):
+    """Build the per-(bot, server) event->chat callback. Announcements go out
+    through ``bot`` to the chats bound to ``server``; player-session and
+    incremental-backup side effects operate on ``server``."""
     _last_event: dict = {}
     _cooldown = 3
 
     def _send_to_chats(msg: str) -> None:
-        _announce(msg)
+        bot.announce(server, msg)
 
     def notify(event_type: str, payload) -> None:
         if event_type == "achievement":
@@ -1189,7 +1261,7 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
             verb = _ACH_VERB_MAP[ach_type]
             msg = f"{player} has {verb} [{achievement}]"
             logger.info("Achievement: %s — %s — sending to %d chat(s)",
-                        player, achievement, _announce_chat_count())
+                        player, achievement, bot.announce_chat_count(server))
             _send_to_chats(msg)
             return
 
@@ -1204,7 +1276,7 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
 
             msg = f"{player} {death_msg}"
             logger.info("Death: %s %s — sending to %d chat(s)",
-                        player, death_msg, _announce_chat_count())
+                        player, death_msg, bot.announce_chat_count(server))
             _send_to_chats(msg)
             return
 
@@ -1215,7 +1287,7 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
             player = payload["player"]
             message = payload["message"]
             logger.info("Chat: %s: %s — sending to %d chat(s)",
-                        player, message, _announce_chat_count())
+                        player, message, bot.announce_chat_count(server))
             _send_to_chats(f"\U0001f4ac {player}: {message}")
             return
 
@@ -1224,12 +1296,12 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
         # cooldown gate so a quick rejoin still records the session boundary.
         pid = _uuid_by_name(name, names)
         if pid:
-            BACKEND.record_player_session(event_type, pid)
-            _note_active_xuid(pid)  # candidate for identity learning
+            server.backend.record_player_session(event_type, pid)
+            server.note_active_xuid(pid)  # candidate for identity learning
             if event_type == "leave":
                 # Refresh last_seen to the disconnect time (connect already set
                 # it on join). No-op on Java for an unchanged name.
-                BACKEND.register_name(pid, name)
+                server.backend.register_name(pid, name)
 
         key = f"{name}-{event_type}"
         now = time.time()
@@ -1237,7 +1309,7 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
             return
         _last_event[key] = now
 
-        online = get_online_players()
+        online = server.get_online_players()
         count = len(online)
         names_str = ", ".join(online) if online else "none"
 
@@ -1246,14 +1318,14 @@ def make_notify_callback(names: dict, achievements: dict, deaths: dict):
         msg = f"{name} {verb}\nPlayers online: {count} ({names_str})"
 
         logger.info("Notification: player %s %s — sending to %d chat(s)",
-                    name, status, _announce_chat_count())
+                    name, status, bot.announce_chat_count(server))
         _send_to_chats(msg)
 
         # Incremental backup triggers
         if event_type == "join" and count == 1:
-            _start_incremental_cycle()
+            server.start_incremental_cycle()
         elif event_type == "leave" and count == 0:
-            _stop_incremental_cycle(final=True)
+            server.stop_incremental_cycle(final=True)
 
     return notify
 
@@ -1377,43 +1449,11 @@ def _scan_logs(scan_fn, names: dict, store: dict) -> int:
 _backup_lock = SERVER.backup_lock  # alias to the single server's lock (see Server)
 _watcher_ref: LogWatcher | None = None
 
-# Active chat adapters (Telegram, Slack, …) and the per-platform auth object,
-# set in main(). Announcements fan out across all of them; command replies go
-# only to the originating adapter (Context.reply).
-ADAPTERS: list = []
-_AUTH: dict = {}
-
-
-def _announce(msg: str) -> int:
-    """Send an announcement to every authorized chat on every platform. Returns
-    how many chats it was sent to."""
-    sent = 0
-    for adapter in ADAPTERS:
-        ns = _AUTH.get(adapter.name) or {}
-        for chat_id in ns.get("authorized_chat_ids", []):
-            try:
-                adapter.send(chat_id, msg)
-                sent += 1
-            except Exception as e:
-                logger.warning("Announce to %s/%s failed: %s",
-                               adapter.name, chat_id, e)
-    return sent
-
-
-def _alert_admins(msg: str) -> None:
-    """Send an operational alert to each platform's admin (if claimed)."""
-    for adapter in ADAPTERS:
-        admin = (_AUTH.get(adapter.name) or {}).get("admin_user_id")
-        if admin:
-            try:
-                adapter.send(admin, msg)
-            except Exception:
-                logger.warning("Failed to alert %s admin", adapter.name)
-
-
-def _announce_chat_count() -> int:
-    return sum(len((_AUTH.get(a.name) or {}).get("authorized_chat_ids", []))
-               for a in ADAPTERS)
+# Chat adapters, the router, and the auth slice now live on the single Bot (see
+# the Bot class); announcements/alerts are Bot methods. This alias keeps the
+# operational-alert call sites (startup failures, scheduled-backup status)
+# unchanged.
+_alert_admins = BOT.alert_admins
 
 # /restore_player pending-state, keyed by admin user_id.
 # Forces the admin through the list -> select -> confirm sequence so a typo
@@ -1694,9 +1734,9 @@ _AUTH_PATH = Path(__file__).parent / "auth.json"
 _auth_lock = threading.Lock()
 
 # The whole bot-namespaced auth doc ({bot_name: {platform: ns}}), set in main().
-# `_AUTH` (below/aliased in main) is this bot's slice — the {platform: ns} value
-# for BOT_CONFIG.name, sharing the same dict objects — so mutating the slice and
-# persisting the doc stay consistent.
+# `BOT.auth` is this bot's slice — the {platform: ns} value for BOT_CONFIG.name,
+# sharing the same dict objects — so mutating the slice and persisting the doc
+# (save_auth(_AUTH_DOC)) stay consistent.
 _AUTH_DOC: dict = {}
 
 
@@ -2290,20 +2330,21 @@ def _make_unclaimed_handler(auth: dict):
 def main():
     setup_logging(Path(__file__).parent / "logs")
 
-    global _watcher_ref, BACKEND, ADAPTERS, _AUTH, _AUTH_DOC
+    global _watcher_ref, BACKEND, _AUTH_DOC
     # Load the whole bot-namespaced auth doc; this bot operates on its own slice
     # (the {platform: ns} value for its name), which shares dict objects with the
     # doc so save_auth(_AUTH_DOC) persists in-place mutations.
     _AUTH_DOC = load_auth(_AUTH_PATH, BOT_CONFIG.name, SERVER.config.key)
     auth = _AUTH_DOC[BOT_CONFIG.name]
-    _AUTH = auth
+    BOT.auth_doc = _AUTH_DOC
+    BOT.auth = auth
     achievements = load_achievements(_ACHIEVEMENTS_PATH)
     deaths = load_deaths(_DEATHS_PATH)
 
     # Build the chat adapters (Telegram, Slack, …). They're constructed now but
     # only started later, after the backend and command router are ready.
-    ADAPTERS = make_adapters(BOT_CONFIG)
-    logger.info("Chat platforms: %s", ", ".join(a.name for a in ADAPTERS))
+    BOT.adapters = make_adapters(BOT_CONFIG)
+    logger.info("Chat platforms: %s", ", ".join(a.name for a in BOT.adapters))
 
     # Construct the edition-specific backend — the name registry is sourced from
     # it. Bedrock raises BackendUnavailable if no tmux/screen session is hosting
@@ -2328,9 +2369,10 @@ def main():
         on_unclaimed=_make_unclaimed_handler(auth),
         logger=logger,
     )
+    BOT.router = router
     register_commands(router, auth, names, achievements, deaths)
 
-    notify = make_notify_callback(names, achievements, deaths)
+    notify = make_notify_callback(BOT, SERVER, names, achievements, deaths)
     watcher = LogWatcher(LOG_PATH, names, notify,
                          on_server_start=lambda: reconcile_online(
                              names, reason="server start"))
@@ -2473,7 +2515,7 @@ def main():
 
     # Start each chat adapter in its own daemon thread (each runs a blocking
     # poll/socket loop); the main thread waits for Ctrl-C.
-    for adapter in ADAPTERS:
+    for adapter in BOT.adapters:
         threading.Thread(target=adapter.start, args=(router.dispatch,),
                          name=f"chat-{adapter.name}", daemon=True).start()
         logger.info("Started %s adapter", adapter.name)
@@ -2484,7 +2526,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for adapter in ADAPTERS:
+        for adapter in BOT.adapters:
             try:
                 adapter.stop()
             except Exception:
