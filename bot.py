@@ -266,6 +266,11 @@ class Server:
         self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
         self.chain_marker_path_legacy = (self.config.minecraft_dir
                                          / CHAIN_MARKER_NAME_LEGACY)
+        # Bedrock per-player restore reads player data from a sidecar embedded in
+        # each backup zip (the live LevelDB is locked while the server runs).
+        # Dedup state of {player_server_key: sha256} so incrementals only carry
+        # players that changed.
+        self.player_state_path = _server_data_path("bedrock_player_state.json")
 
     def player_join(self, name: str) -> None:
         with self.online_lock:
@@ -338,6 +343,103 @@ class Server:
                 logger.exception("Failed to read chain marker")
                 return ""
         return ""
+
+    # --- Bedrock per-player sidecar / identity learning ---------------------
+
+    def load_player_state(self) -> dict:
+        try:
+            return json.loads(self.player_state_path.read_text())
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.exception("Failed to read bedrock_player_state.json")
+            return {}
+
+    def save_player_state(self, hashes: dict) -> None:
+        try:
+            self.player_state_path.write_text(json.dumps(hashes))
+        except Exception:
+            logger.exception("Failed to write bedrock_player_state.json")
+
+    def maybe_learn_player(self, sidecar: dict, log) -> None:
+        """Bind a player's xuid to their (account-stable) identity uuids by
+        process of elimination from a backup's changed-player sidecar.
+
+        The xuid->identity link isn't in the world db, so it's inferred: the
+        changed sidecar lists exactly the players whose data changed since the
+        last backup, grouped into server keys (each with its MsaId+SelfSignedId).
+        If exactly one of those keys is still unattributed AND exactly one xuid
+        that was online since the last backup still has no identities, they must
+        be the same player — bind them. Handles a lone player (even one who
+        already left) and "N online, N-1 already known". Ambiguous cases are
+        skipped and retried next backup.
+
+        Lives here (not the backend) because it needs the server's session/online
+        state and the name registry; the backend supplies the known-identity
+        facts.
+        """
+        # Changed server keys -> their identity uuids.
+        by_key: dict = {}
+        for ident, key in sidecar.get("mappings", {}).items():
+            by_key.setdefault(key, []).append(ident)
+        if not by_key:
+            return
+
+        known = self.backend.known_identities()
+        unattributed = [k for k, idents in by_key.items()
+                        if not any(i in known for i in idents)]
+
+        names = load_player_names()
+        with self.session_lock:
+            session = list(self.session_xuids)
+        unknown_active = [x for x in session if not self.backend.player_identities(x)]
+
+        if len(unattributed) == 1 and len(unknown_active) == 1:
+            key = unattributed[0]
+            xuid = unknown_active[0]
+            name = names.get(xuid, xuid)
+            if self.backend.learn_player(name, xuid, by_key[key]):
+                log(f"Learned Bedrock identity for {name}")
+
+        # Drop players who have left; keep still-online ones for the next backup.
+        online_xuids = {_uuid_by_name(n, names) for n in self.get_online_players()}
+        online_xuids.discard(None)
+        with self.session_lock:
+            self.session_xuids.intersection_update(online_xuids)
+
+    def write_player_sidecar(self, zf, ready, full_backup: bool, log) -> None:
+        """Embed the _players.json sidecar into an open Bedrock backup zip.
+
+        No-op for Java or when there's no snapshot file set. Generates the
+        sidecar from the snapshot db files, hash-dedups against the persisted
+        state (full backup = baseline/everyone + reset state; incremental =
+        changed-only), and never fails the backup — if the amulet libs are
+        missing it just logs and skips, so per-player restore is unavailable for
+        that zip but the backup is otherwise complete.
+        """
+        if self.config.edition != EDITION_BEDROCK or not ready:
+            return
+        try:
+            from utils import bedrock_player
+        except Exception as e:
+            log(f"Player sidecar skipped (amulet libs unavailable: {e})")
+            return
+        db_files = [(p, n) for (p, n) in ready
+                    if "/db/" in str(p).replace("\\", "/")]
+        if not db_files:
+            return
+        try:
+            sidecar = bedrock_player.build_sidecar_from_files(db_files)
+            prev = {} if full_backup else self.load_player_state()
+            filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
+            zf.writestr(bedrock_player.SIDECAR_NAME, json.dumps(filtered))
+            self.save_player_state(new_hashes)
+            log(f"Player sidecar: {len(filtered['players'])} player(s) "
+                f"({len(new_hashes)} total)")
+            self.maybe_learn_player(filtered, log)
+        except Exception as e:
+            logger.exception("Player sidecar generation failed")
+            log(f"Player sidecar generation failed: {e}")
 
 
 SERVER = Server(SERVER_CONFIG)
@@ -1061,107 +1163,13 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
     zf.write(fp, rel)
 
 
-# Bedrock per-player restore reads player data from a sidecar embedded in each
-# backup zip (the live LevelDB is locked while the server runs). Dedup state of
-# {player_server_key: sha256} so incrementals only carry players that changed.
-_PLAYER_STATE_PATH = _server_data_path("bedrock_player_state.json")
-
-
-def _load_player_state() -> dict:
-    try:
-        return json.loads(_PLAYER_STATE_PATH.read_text())
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        logger.exception("Failed to read bedrock_player_state.json")
-        return {}
-
-
-def _save_player_state(hashes: dict) -> None:
-    try:
-        _PLAYER_STATE_PATH.write_text(json.dumps(hashes))
-    except Exception:
-        logger.exception("Failed to write bedrock_player_state.json")
-
-
-def _maybe_learn_player(sidecar: dict, log) -> None:
-    """Bind a player's xuid to their (account-stable) identity uuids by process
-    of elimination from a backup's changed-player sidecar.
-
-    The xuid->identity link isn't in the world db, so it's inferred: the changed
-    sidecar lists exactly the players whose data changed since the last backup,
-    grouped into server keys (each with its MsaId+SelfSignedId). If exactly one
-    of those keys is still unattributed AND exactly one xuid that was online
-    since the last backup still has no identities, they must be the same player —
-    bind them. Handles a lone player (even one who already left) and "N online,
-    N-1 already known". Ambiguous cases are skipped and retried next backup.
-
-    Lives here (not the backend) because it needs the bot's session/online state
-    and the name registry; the backend supplies the known-identity facts.
-    """
-    # Changed server keys -> their identity uuids.
-    by_key: dict = {}
-    for ident, key in sidecar.get("mappings", {}).items():
-        by_key.setdefault(key, []).append(ident)
-    if not by_key:
-        return
-
-    known = BACKEND.known_identities()
-    unattributed = [k for k, idents in by_key.items()
-                    if not any(i in known for i in idents)]
-
-    names = load_player_names()
-    with _session_lock:
-        session = list(_session_xuids)
-    unknown_active = [x for x in session if not BACKEND.player_identities(x)]
-
-    if len(unattributed) == 1 and len(unknown_active) == 1:
-        key = unattributed[0]
-        xuid = unknown_active[0]
-        name = names.get(xuid, xuid)
-        if BACKEND.learn_player(name, xuid, by_key[key]):
-            log(f"Learned Bedrock identity for {name}")
-
-    # Drop players who have left; keep still-online ones for the next backup.
-    online_xuids = {_uuid_by_name(n, names) for n in get_online_players()}
-    online_xuids.discard(None)
-    with _session_lock:
-        _session_xuids.intersection_update(online_xuids)
-
-
-def _write_player_sidecar(zf, ready, full_backup: bool, log) -> None:
-    """Embed the _players.json sidecar into an open Bedrock backup zip.
-
-    No-op for Java or when there's no snapshot file set. Generates the sidecar
-    from the snapshot db files, hash-dedups against the persisted state (full
-    backup = baseline/everyone + reset state; incremental = changed-only), and
-    never fails the backup — if the amulet libs are missing it just logs and
-    skips, so per-player restore is unavailable for that zip but the backup is
-    otherwise complete.
-    """
-    if CONFIG.edition != EDITION_BEDROCK or not ready:
-        return
-    try:
-        from utils import bedrock_player
-    except Exception as e:
-        log(f"Player sidecar skipped (amulet libs unavailable: {e})")
-        return
-    db_files = [(p, n) for (p, n) in ready
-                if "/db/" in str(p).replace("\\", "/")]
-    if not db_files:
-        return
-    try:
-        sidecar = bedrock_player.build_sidecar_from_files(db_files)
-        prev = {} if full_backup else _load_player_state()
-        filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
-        zf.writestr(bedrock_player.SIDECAR_NAME, json.dumps(filtered))
-        _save_player_state(new_hashes)
-        log(f"Player sidecar: {len(filtered['players'])} player(s) "
-            f"({len(new_hashes)} total)")
-        _maybe_learn_player(filtered, log)
-    except Exception as e:
-        logger.exception("Player sidecar generation failed")
-        log(f"Player sidecar generation failed: {e}")
+# Bedrock per-player sidecar / identity-learning helpers now live on Server
+# (see the class body). The single-server call sites use these aliases; the
+# multi-server steps thread the resolved Server through instead.
+_load_player_state = SERVER.load_player_state
+_save_player_state = SERVER.save_player_state
+_maybe_learn_player = SERVER.maybe_learn_player
+_write_player_sidecar = SERVER.write_player_sidecar
 
 
 def run_backup(status_cb=None):
