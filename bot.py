@@ -95,27 +95,22 @@ def setup_logging(logs_dir: Path) -> None:
 # 2. Player Name Registry
 # ---------------------------------------------------------------------------
 # The {player_id: name} registry is owned by the backend (Java: player_names.json
-# keyed by UUID; Bedrock: projected from bedrock_players.json keyed by xuid). The
-# in-memory `names` dict and these helper signatures are kept so the rest of the
-# bot is unchanged; the `path` argument is vestigial (ignored).
-_NAMES_PATH = None  # retained only so existing call sites pass *something*
+# keyed by UUID; Bedrock: projected from bedrock_players.json keyed by xuid) and
+# mirrored in ``server.names``; these helpers operate on a given Server.
 _names_lock = threading.Lock()
 
 
-def load_player_names(path=None) -> dict:
-    return BACKEND.load_names()
-
-
-def refresh_player_names(names: dict, path=None) -> None:
+def refresh_player_names(server) -> None:
     with _names_lock:
-        names.clear()
-        names.update(BACKEND.load_names())
+        server.names.clear()
+        server.names.update(server.backend.load_names())
 
 
-def register_player(uuid: str, name: str, names: dict, path=None) -> None:
+def register_player(server, uuid: str, name: str) -> None:
+    names = server.names
     old = names.get(uuid)
     names[uuid] = name
-    changed = BACKEND.register_name(uuid, name)
+    changed = server.backend.register_name(uuid, name)
     if old and old != name:
         logger.info("Player registry: %s renamed %s -> %s", uuid, old, name)
     elif changed and not old:
@@ -402,7 +397,7 @@ class Server:
         unattributed = [k for k, idents in by_key.items()
                         if not any(i in known for i in idents)]
 
-        names = load_player_names()
+        names = self.backend.load_names()
         with self.session_lock:
             session = list(self.session_xuids)
         unknown_active = [x for x in session if not self.backend.player_identities(x)]
@@ -750,19 +745,11 @@ class Server:
 
 SERVER = Server(SERVER_CONFIG, migrate_legacy=True)
 
-# Single-instance shim: existing module-level call sites use these aliases; the
-# multi-server steps thread the resolved Server object through instead.
+# Single-instance shim: the remaining module-level call sites (in main() and
+# register_commands, retargeted to ctx.server in step 6d) use these aliases; the
+# event path now threads the resolved Server object through instead.
 player_join = SERVER.player_join
-player_leave = SERVER.player_leave
 get_online_players = SERVER.get_online_players
-_note_active_xuid = SERVER.note_active_xuid
-_online_players = SERVER.online_players      # same set object
-_online_lock = SERVER.online_lock
-_session_xuids = SERVER.session_xuids        # same set object
-_session_lock = SERVER.session_lock
-_pending_uuids = SERVER.pending_uuids        # same dict object
-_ACHIEVEMENTS_PATH = SERVER.achievements_path
-_DEATHS_PATH = SERVER.deaths_path
 
 
 class Bot:
@@ -915,10 +902,10 @@ def _categorize_death(message: str) -> str:
     return "Other"
 
 
-# _pending_uuids now lives on the Server object (aliased above).
+# The name->uuid pending map lives on the Server (server.pending_uuids).
 
 
-def _parse_line_java(line: str, names: dict) -> tuple:
+def _parse_line_java(line: str, server) -> tuple:
     """Return (event_type, payload) or (None, None).
 
     For join/leave, payload is the player name string.
@@ -929,23 +916,23 @@ def _parse_line_java(line: str, names: dict) -> tuple:
     m = RE_UUID.match(line)
     if m:
         name, uuid = m.group(1), m.group(2)
-        _pending_uuids[name] = uuid
-        register_player(uuid, name, names, _NAMES_PATH)
+        server.pending_uuids[name] = uuid
+        register_player(server, uuid, name)
         return None, None
 
     m = RE_JOIN.match(line)
     if m:
         name = m.group(1)
-        uuid = _pending_uuids.pop(name, None)
+        uuid = server.pending_uuids.pop(name, None)
         if uuid:
-            register_player(uuid, name, names, _NAMES_PATH)
-        player_join(name)
+            register_player(server, uuid, name)
+        server.player_join(name)
         return "join", name
 
     m = RE_LEAVE.match(line)
     if m:
         name = m.group(1)
-        player_leave(name)
+        server.player_leave(name)
         return "leave", name
 
     m = RE_ACHIEVEMENT.match(line)
@@ -968,7 +955,7 @@ def _parse_line_java(line: str, names: dict) -> tuple:
                 "time": time_str,
             }
 
-    if CONFIG.chat_relay:
+    if server.config.chat_relay:
         m = RE_CHAT.match(line)
         if m:
             return "chat", {"player": m.group(1), "message": m.group(2)}
@@ -1036,7 +1023,7 @@ def _bedrock_death_message(cause: str, by) -> str:
     return phrase
 
 
-def _parse_line_bedrock(line: str, names: dict) -> tuple:
+def _parse_line_bedrock(line: str, server) -> tuple:
     """Return (event_type, payload) or (None, None) for a Bedrock console line.
 
     Join/leave come from BDS itself; death/chat come from the bedrock_pack
@@ -1048,8 +1035,8 @@ def _parse_line_bedrock(line: str, names: dict) -> tuple:
     if m:
         name, xuid = m.group(1).strip(), m.group(2).strip()
         if xuid:
-            register_player(xuid, name, names, _NAMES_PATH)
-        player_join(name)
+            register_player(server, xuid, name)
+        server.player_join(name)
         return "join", name
     m = RE_BEDROCK_DISCONNECT.search(line)
     if m:
@@ -1058,8 +1045,8 @@ def _parse_line_bedrock(line: str, names: dict) -> tuple:
         # never saw this player's connect line (e.g. they were already online
         # when the bot started). Otherwise their identity would go unrecorded.
         if xuid:
-            register_player(xuid, name, names, _NAMES_PATH)
-        player_leave(name)
+            register_player(server, xuid, name)
+        server.player_leave(name)
         return "leave", name
 
     # Behavior-pack markers (anywhere after the log/[Scripting] prefixes).
@@ -1070,23 +1057,23 @@ def _parse_line_bedrock(line: str, names: dict) -> tuple:
         except (ValueError, TypeError):
             return None, None
         t = ev.get("t")
-        if t == "death" and CONFIG.bedrock_script_events:
+        if t == "death" and server.config.bedrock_script_events:
             return "death", {
                 "player": ev.get("player", "?"),
                 "message": _bedrock_death_message(ev.get("cause"), ev.get("by")),
                 "time": datetime.now().strftime("%H:%M:%S"),
             }
-        if t == "chat" and CONFIG.chat_relay:
+        if t == "chat" and server.config.chat_relay:
             return "chat", {"player": ev.get("player", "?"),
                             "message": ev.get("msg", "")}
     return None, None
 
 
-def parse_line(line: str, names: dict) -> tuple:
+def parse_line(line: str, server) -> tuple:
     """Dispatch line parsing to the edition-specific parser."""
-    if CONFIG.edition == EDITION_BEDROCK:
-        return _parse_line_bedrock(line, names)
-    return _parse_line_java(line, names)
+    if server.config.edition == EDITION_BEDROCK:
+        return _parse_line_bedrock(line, server)
+    return _parse_line_java(line, server)
 
 
 # ---------------------------------------------------------------------------
@@ -1139,11 +1126,11 @@ class LogWatcher(FileSystemEventHandler):
     _START_MARKERS = ("RCON running on", "Server started")
     _START_DEBOUNCE = 15  # seconds; collapse a burst of start lines into one
 
-    def __init__(self, log_path: Path, names: dict, notify_cb,
+    def __init__(self, log_path: Path, server, notify_cb,
                  on_server_start=None):
         self._path = log_path
         self._filename = log_path.name  # "latest.log" (Java) or "console.log" (Bedrock)
-        self._names = names
+        self._server = server  # the Server whose log this tails; parse into it
         self._notify = notify_cb
         self._on_server_start = on_server_start  # called when the server (re)starts
         self._last_start_trigger = 0.0
@@ -1238,7 +1225,7 @@ class LogWatcher(FileSystemEventHandler):
                     # Server (re)start -> resync online status (debounced).
                     self._maybe_server_start(line)
                     # Check player event notifications
-                    event_type, payload = parse_line(line, self._names)
+                    event_type, payload = parse_line(line, self._server)
                     if event_type and payload:
                         self._notify(event_type, payload)
             except FileNotFoundError:
@@ -1250,11 +1237,11 @@ class LogWatcher(FileSystemEventHandler):
 # ---------------------------------------------------------------------------
 # 6. Notification Callback
 # ---------------------------------------------------------------------------
-def make_notify_callback(bot, server, names: dict, achievements: dict,
-                         deaths: dict):
+def make_notify_callback(bot, server):
     """Build the per-(bot, server) event->chat callback. Announcements go out
-    through ``bot`` to the chats bound to ``server``; player-session and
-    incremental-backup side effects operate on ``server``."""
+    through ``bot`` to the chats bound to ``server``; player-session, name
+    registry, achievements/deaths, and incremental-backup side effects all
+    operate on ``server``."""
     _last_event: dict = {}
     _cooldown = 3
 
@@ -1274,10 +1261,10 @@ def make_notify_callback(bot, server, names: dict, achievements: dict,
             _last_event[key] = now
 
             timestamp = f"{datetime.now().strftime('%Y-%m-%d')} {time_str}"
-            uuid = _uuid_by_name(player, names)
+            uuid = _uuid_by_name(player, server.names)
             if uuid:
                 record_achievement(uuid, achievement, ach_type, timestamp,
-                                   achievements, _ACHIEVEMENTS_PATH)
+                                   server.achievements, server.achievements_path)
 
             verb = _ACH_VERB_MAP[ach_type]
             msg = f"{player} has {verb} [{achievement}]"
@@ -1291,9 +1278,10 @@ def make_notify_callback(bot, server, names: dict, achievements: dict,
             death_msg = payload["message"]
             time_str = payload["time"]
             timestamp = f"{datetime.now().strftime('%Y-%m-%d')} {time_str}"
-            uuid = _uuid_by_name(player, names)
+            uuid = _uuid_by_name(player, server.names)
             if uuid:
-                record_death(uuid, death_msg, timestamp, deaths, _DEATHS_PATH)
+                record_death(uuid, death_msg, timestamp, server.deaths,
+                             server.deaths_path)
 
             msg = f"{player} {death_msg}"
             logger.info("Death: %s %s — sending to %d chat(s)",
@@ -1315,7 +1303,7 @@ def make_notify_callback(bot, server, names: dict, achievements: dict,
         name = payload
         # Online-time accumulation (Bedrock; no-op on Java). Done before the
         # cooldown gate so a quick rejoin still records the session boundary.
-        pid = _uuid_by_name(name, names)
+        pid = _uuid_by_name(name, server.names)
         if pid:
             server.backend.record_player_session(event_type, pid)
             server.note_active_xuid(pid)  # candidate for identity learning
@@ -1384,8 +1372,7 @@ def _format_stats(p: dict) -> str:
 RE_GZ_DATE = re.compile(r'(\d{4}-\d{2}-\d{2})-\d+\.log\.gz')
 
 
-def _scan_log_for_achievements(file_path: Path, date_str: str,
-                               names: dict, achievements: dict) -> int:
+def _scan_log_for_achievements(file_path: Path, date_str: str, server) -> int:
     count = 0
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -1393,26 +1380,25 @@ def _scan_log_for_achievements(file_path: Path, date_str: str,
             m = RE_UUID.match(line)
             if m:
                 name, uuid = m.group(1), m.group(2)
-                register_player(uuid, name, names, _NAMES_PATH)
+                register_player(server, uuid, name)
                 continue
             m = RE_ACHIEVEMENT.match(line)
             if m:
                 time_str, player, ach_type_full, achievement = m.groups()
                 ach_type = _ACH_TYPE_MAP[ach_type_full]
                 timestamp = f"{date_str} {time_str}"
-                uuid = _uuid_by_name(player, names)
+                uuid = _uuid_by_name(player, server.names)
                 if uuid:
                     if record_achievement(uuid, achievement, ach_type,
-                                          timestamp, achievements,
-                                          _ACHIEVEMENTS_PATH):
+                                          timestamp, server.achievements,
+                                          server.achievements_path):
                         count += 1
                 else:
                     logger.warning("Scan: no UUID for player %s, skipping achievement", player)
     return count
 
 
-def _scan_log_for_deaths(file_path: Path, date_str: str,
-                         names: dict, deaths: dict) -> int:
+def _scan_log_for_deaths(file_path: Path, date_str: str, server) -> int:
     count = 0
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -1420,28 +1406,29 @@ def _scan_log_for_deaths(file_path: Path, date_str: str,
             m = RE_UUID.match(line)
             if m:
                 name, uuid = m.group(1), m.group(2)
-                register_player(uuid, name, names, _NAMES_PATH)
+                register_player(server, uuid, name)
                 continue
             m = RE_SERVER_MSG.match(line)
             if m:
                 time_str, player, msg = m.groups()
                 if any(msg.startswith(p) for p in _DEATH_PHRASES):
                     timestamp = f"{date_str} {time_str}"
-                    uuid = _uuid_by_name(player, names)
+                    uuid = _uuid_by_name(player, server.names)
                     if uuid:
-                        if record_death(uuid, msg, timestamp, deaths,
-                                        _DEATHS_PATH):
+                        if record_death(uuid, msg, timestamp, server.deaths,
+                                        server.deaths_path):
                             count += 1
                     else:
                         logger.warning("Scan: no UUID for player %s, skipping death", player)
     return count
 
 
-def _scan_logs(scan_fn, names: dict, store: dict) -> int:
+def _scan_logs(scan_fn, server) -> int:
     """Run ``scan_fn`` over every rotated ``*.log.gz`` (by embedded date) plus the
     live log, returning the total newly-recorded count. Shared by /scan_deaths
     and /scan_achievements."""
-    logs_dir = LOG_PATH.parent
+    log_path = server.config.log_path
+    logs_dir = log_path.parent
     total = 0
     for gz_path in sorted(logs_dir.glob("*.log.gz")):
         m = RE_GZ_DATE.match(gz_path.name)
@@ -1453,14 +1440,14 @@ def _scan_logs(scan_fn, names: dict, store: dict) -> int:
             with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
                 with open(extracted, "w", encoding="utf-8") as out_f:
                     out_f.write(gz_f.read())
-            total += scan_fn(extracted, date_str, names, store)
+            total += scan_fn(extracted, date_str, server)
         except Exception as e:
             logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
         finally:
             if extracted.exists():
                 extracted.unlink()
-    if LOG_PATH.exists():
-        total += scan_fn(LOG_PATH, datetime.now().strftime("%Y-%m-%d"), names, store)
+    if log_path.exists():
+        total += scan_fn(log_path, datetime.now().strftime("%Y-%m-%d"), server)
     return total
 
 
@@ -1657,7 +1644,7 @@ _start_incremental_cycle = SERVER.start_incremental_cycle
 _stop_incremental_cycle = SERVER.stop_incremental_cycle
 
 
-def _recover_online_identities(online_names: list, names: dict) -> None:
+def _recover_online_identities(server, online_names: list) -> None:
     """Recover xuids for already-online Bedrock players whose connect line the
     bot missed because it started mid-session.
 
@@ -1667,14 +1654,15 @@ def _recover_online_identities(online_names: list, names: dict) -> None:
     is appended (never rotated), so their ``Player connected: <name>, xuid: <id>``
     line is still on disk: scan it and register the ones we can resolve. No-op on
     Java (its name registry is recovered from world data, not this log)."""
-    if CONFIG.edition != EDITION_BEDROCK:
+    if server.config.edition != EDITION_BEDROCK:
         return
-    missing = [n for n in online_names if _uuid_by_name(n, names) is None]
+    missing = [n for n in online_names if _uuid_by_name(n, server.names) is None]
     if not missing:
         return
     found: dict = {}
     try:
-        with open(CONFIG.log_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(server.config.log_path, "r", encoding="utf-8",
+                  errors="replace") as f:
             for line in f:
                 m = (RE_BEDROCK_CONNECT.search(line)
                      or RE_BEDROCK_DISCONNECT.search(line))
@@ -1687,7 +1675,7 @@ def _recover_online_identities(online_names: list, names: dict) -> None:
         return
     for name in missing:
         if name in found:
-            register_player(found[name], name, names)
+            register_player(server, found[name], name)
     recovered = [n for n in missing if n in found]
     if recovered:
         logger.info("Recovered identity from log for %d already-online "
@@ -1701,8 +1689,8 @@ def _recover_online_identities(online_names: list, names: dict) -> None:
 _reconcile_lock = threading.Lock()
 
 
-def reconcile_online(names: dict, *, reason: str = "") -> list | None:
-    """Reconcile the in-memory online set with what the server actually reports.
+def reconcile_online(server, *, reason: str = "") -> list | None:
+    """Reconcile ``server``'s in-memory online set with what it actually reports.
 
     The set is normally kept current from parsed join/leave lines, but it goes
     stale when players leave without a clean disconnect line — e.g. a restore
@@ -1717,13 +1705,13 @@ def reconcile_online(names: dict, *, reason: str = "") -> list | None:
     """
     with _reconcile_lock:
         try:
-            actual = BACKEND.query_online_players()
+            actual = server.backend.query_online_players()
         except Exception as e:
             logger.warning("Reconcile online failed%s: %s",
                            f" ({reason})" if reason else "", e)
             return None
         actual_set = set(actual)
-        before = set(get_online_players())
+        before = set(server.get_online_players())
         joined = actual_set - before
         left = before - actual_set
         if joined or left:
@@ -1731,20 +1719,20 @@ def reconcile_online(names: dict, *, reason: str = "") -> list | None:
                         f" ({reason})" if reason else "",
                         sorted(joined) or "none", sorted(left) or "none")
         for name in joined:
-            player_join(name)
-            pid = _uuid_by_name(name, names)
+            server.player_join(name)
+            pid = _uuid_by_name(name, server.names)
             if pid:
-                BACKEND.record_player_session("join", pid)
+                server.backend.record_player_session("join", pid)
         for name in left:
-            player_leave(name)
-            pid = _uuid_by_name(name, names)
+            server.player_leave(name)
+            pid = _uuid_by_name(name, server.names)
             if pid:
-                BACKEND.record_player_session("leave", pid)
+                server.backend.record_player_session("leave", pid)
         # Match the incremental cycle to reality: running iff someone is online.
         if actual_set:
-            _start_incremental_cycle()
+            server.start_incremental_cycle()
         else:
-            _stop_incremental_cycle(final=bool(left))
+            server.stop_incremental_cycle(final=bool(left))
         return sorted(actual_set)
 
 
@@ -1899,7 +1887,7 @@ def register_commands(router, auth: dict, names: dict,
         logger.info("Status: requested by %s", ctx.sender_label)
         # Query the server live (and reconcile the in-memory set) so the answer
         # reflects reality, not just what the bot last parsed from the log.
-        online = reconcile_online(names, reason="/status")
+        online = reconcile_online(SERVER, reason="/status")
         suffix = ""
         if online is None:  # server unreachable — fall back to last-known set
             online = get_online_players()
@@ -1914,7 +1902,7 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /stats ---
     def cmd_stats(ctx):
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         target = ctx.args[0].lower() if ctx.args else None
         logger.info("Stats: requested by %s (player=%s)", ctx.sender_label, target or "all")
         all_stats = BACKEND.player_stats(names)
@@ -1935,7 +1923,7 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /playtime ---
     def cmd_playtime(ctx):
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         logger.info("Playtime: requested by %s", ctx.sender_label)
         all_stats = BACKEND.player_stats(names)
         if not all_stats:
@@ -1949,7 +1937,7 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /list ---
     def cmd_list(ctx):
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         logger.info("List: requested by %s", ctx.sender_label)
         entries = BACKEND.list_known_players(names)
         if not entries:
@@ -1963,7 +1951,7 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /achievements ---
     def cmd_achievements(ctx):
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         target = ctx.args[0].lower() if ctx.args else None
         logger.info("Achievements: requested by %s (player=%s)", ctx.sender_label, target or "all")
         if not achievements:
@@ -2001,9 +1989,9 @@ def register_commands(router, auth: dict, names: dict,
     # --- /scan_achievements ---
     def cmd_scan_achievements(ctx):
         logger.info("ScanAchievements: requested by %s", ctx.sender_label)
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         ctx.reply("Scanning log files for achievements...")
-        total = _scan_logs(_scan_log_for_achievements, names, achievements)
+        total = _scan_logs(_scan_log_for_achievements, SERVER)
         ctx.reply(f"Scan complete. {total} new achievement(s) recorded.")
         logger.info("ScanAchievements: %d new achievement(s) found", total)
     router.register("scan_achievements", cmd_scan_achievements,
@@ -2013,7 +2001,7 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /deaths ---
     def cmd_deaths(ctx):
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         target = ctx.args[0].lower() if ctx.args else None
         logger.info("Deaths: requested by %s (player=%s)", ctx.sender_label, target or "all")
         if not deaths:
@@ -2051,7 +2039,7 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /death_summary ---
     def cmd_death_summary(ctx):
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         logger.info("DeathSummary: requested by %s", ctx.sender_label)
         if not deaths:
             ctx.reply("No deaths recorded yet.")
@@ -2089,9 +2077,9 @@ def register_commands(router, auth: dict, names: dict,
     # --- /scan_deaths ---
     def cmd_scan_deaths(ctx):
         logger.info("ScanDeaths: requested by %s", ctx.sender_label)
-        refresh_player_names(names)
+        refresh_player_names(SERVER)
         ctx.reply("Scanning log files for deaths...")
-        total = _scan_logs(_scan_log_for_deaths, names, deaths)
+        total = _scan_logs(_scan_log_for_deaths, SERVER)
         ctx.reply(f"Scan complete. {total} new death(s) recorded.")
         logger.info("ScanDeaths: %d new death(s) found", total)
     router.register("scan_deaths", cmd_scan_deaths,
@@ -2248,7 +2236,7 @@ def register_commands(router, auth: dict, names: dict,
                     # start), kicking everyone with no "disconnect" lines, so the
                     # in-memory online set would be left stale. Resync it against
                     # the freshly-restarted server (no-op on Java — no restart).
-                    reconcile_online(names, reason="after restore")
+                    reconcile_online(SERVER, reason="after restore")
                 finally:
                     _backup_lock.release()
 
@@ -2396,10 +2384,10 @@ def main():
     BOT.router = router
     register_commands(router, auth, names, achievements, deaths)
 
-    notify = make_notify_callback(BOT, SERVER, names, achievements, deaths)
-    watcher = LogWatcher(LOG_PATH, names, notify,
+    notify = make_notify_callback(BOT, SERVER)
+    watcher = LogWatcher(LOG_PATH, SERVER, notify,
                          on_server_start=lambda: reconcile_online(
-                             names, reason="server start"))
+                             SERVER, reason="server start"))
     _watcher_ref = watcher
     BACKEND.attach_watcher(watcher)
     observer = Observer()
@@ -2444,7 +2432,7 @@ def main():
                 # The bot missed these players' connect lines (started
                 # mid-session), so recover their xuids from the log to register
                 # them properly (Bedrock; no-op on Java).
-                _recover_online_identities(current, names)
+                _recover_online_identities(SERVER, current)
                 for name in current:
                     pid = _uuid_by_name(name, names)
                     if pid:
