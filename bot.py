@@ -56,24 +56,8 @@ BACKEND = None
 
 # Per-server state lives under data/<server-name>/ so multiple servers in one
 # process never collide. (auth.json stays at the repo root — it's per-bot, not
-# per-server.) The single server's data dir is created here; later steps make
-# this per-Server instance state.
-_DATA_DIR = SERVER_CONFIG.data_dir
-_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _server_data_path(filename: str) -> Path:
-    """Resolve a per-server state file under data/<key>/, migrating a legacy
-    repo-root copy into place once (so existing single-server installs keep
-    their data after the move)."""
-    target = _DATA_DIR / filename
-    legacy = Path(__file__).parent / filename
-    if not target.exists() and legacy.exists():
-        try:
-            shutil.move(str(legacy), str(target))
-        except OSError:
-            logger.warning("Could not migrate %s into %s", filename, _DATA_DIR)
-    return target
+# per-server.) Each Server resolves its own paths under config.data_dir; see
+# Server._data_path.
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +132,6 @@ def _uuid_by_name(player_name: str, names: dict) -> str | None:
 # ---------------------------------------------------------------------------
 # 2b. Achievements Storage
 # ---------------------------------------------------------------------------
-_ACHIEVEMENTS_PATH = _server_data_path("player_achievements.json")
 _achievements_lock = threading.Lock()
 
 
@@ -186,7 +169,6 @@ def record_achievement(uuid: str, achievement: str, ach_type: str,
 # ---------------------------------------------------------------------------
 # 2c. Deaths Storage
 # ---------------------------------------------------------------------------
-_DEATHS_PATH = _server_data_path("player_deaths.json")
 _deaths_lock = threading.Lock()
 
 
@@ -228,9 +210,15 @@ class Server:
     aliases below keep existing call sites working in the meantime.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, migrate_legacy=False):
         self.config = config
         self.backend = None  # set in main() after make_backend
+        # Only the historical single-server install has state at the repo root;
+        # that server migrates it into data/<key>/ once. Additional servers in a
+        # multi-server config start clean and never pull from the root.
+        self._migrate_legacy = migrate_legacy
+        self.data_dir = config.data_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.online_players: set = set()
         self.online_lock = threading.Lock()
@@ -256,7 +244,7 @@ class Server:
         # isn't server data (e.g. the captured-stdout console.log the bot tails
         # on Bedrock). Matched by basename anywhere in the tree.
         self.backup_exclude_names = frozenset(backup_exclude_names(config))
-        self.manifest_path = _server_data_path("backup_manifest.json")
+        self.manifest_path = self._data_path("backup_manifest.json")
         self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
         self.chain_marker_path_legacy = (self.config.minecraft_dir
                                          / CHAIN_MARKER_NAME_LEGACY)
@@ -264,7 +252,38 @@ class Server:
         # each backup zip (the live LevelDB is locked while the server runs).
         # Dedup state of {player_server_key: sha256} so incrementals only carry
         # players that changed.
-        self.player_state_path = _server_data_path("bedrock_player_state.json")
+        self.player_state_path = self._data_path("bedrock_player_state.json")
+
+        # Player-facing state (populated by load_state() once the backend is set):
+        # the {player_id: name} registry (backend-sourced), plus recorded
+        # achievements and deaths keyed by player id.
+        self.achievements_path = self._data_path("player_achievements.json")
+        self.deaths_path = self._data_path("player_deaths.json")
+        self.names: dict = {}
+        self.achievements: dict = {}
+        self.deaths: dict = {}
+
+    def _data_path(self, filename: str) -> Path:
+        """Resolve a per-server state file under data/<key>/. For the migrated
+        single-server install (migrate_legacy=True), a legacy repo-root copy is
+        moved into place once so its data survives the relocation."""
+        target = self.data_dir / filename
+        if self._migrate_legacy:
+            legacy = Path(__file__).parent / filename
+            if not target.exists() and legacy.exists():
+                try:
+                    shutil.move(str(legacy), str(target))
+                except OSError:
+                    logger.warning("Could not migrate %s into %s",
+                                   filename, self.data_dir)
+        return target
+
+    def load_state(self) -> None:
+        """Load this server's player registry, achievements, and deaths. Called
+        in main() once the backend exists (the name registry is backend-sourced)."""
+        self.names = self.backend.load_names()
+        self.achievements = load_achievements(self.achievements_path)
+        self.deaths = load_deaths(self.deaths_path)
 
     def player_join(self, name: str) -> None:
         with self.online_lock:
@@ -729,7 +748,7 @@ class Server:
             threading.Thread(target=self.run_incremental_backup, daemon=True).start()
 
 
-SERVER = Server(SERVER_CONFIG)
+SERVER = Server(SERVER_CONFIG, migrate_legacy=True)
 
 # Single-instance shim: existing module-level call sites use these aliases; the
 # multi-server steps thread the resolved Server object through instead.
@@ -742,6 +761,8 @@ _online_lock = SERVER.online_lock
 _session_xuids = SERVER.session_xuids        # same set object
 _session_lock = SERVER.session_lock
 _pending_uuids = SERVER.pending_uuids        # same dict object
+_ACHIEVEMENTS_PATH = SERVER.achievements_path
+_DEATHS_PATH = SERVER.deaths_path
 
 
 class Bot:
@@ -2338,8 +2359,6 @@ def main():
     auth = _AUTH_DOC[BOT_CONFIG.name]
     BOT.auth_doc = _AUTH_DOC
     BOT.auth = auth
-    achievements = load_achievements(_ACHIEVEMENTS_PATH)
-    deaths = load_deaths(_DEATHS_PATH)
 
     # Build the chat adapters (Telegram, Slack, …). They're constructed now but
     # only started later, after the backend and command router are ready.
@@ -2358,7 +2377,12 @@ def main():
     SERVER.backend = BACKEND  # the single server owns its backend (same object)
     logger.info("Server edition: %s", CONFIG.edition)
 
-    names = load_player_names()  # now backed by BACKEND.load_names()
+    # Load this server's player registry, achievements, and deaths (registry is
+    # backend-sourced, so this follows backend construction).
+    SERVER.load_state()
+    names = SERVER.names
+    achievements = SERVER.achievements
+    deaths = SERVER.deaths
 
     # Command router shared by all adapters; replies go to the originating chat.
     router = CommandRouter(
