@@ -262,6 +262,11 @@ class Server:
         self.backup_lock = threading.Lock()
         self.incr_lock = threading.Lock()      # protects incr_timer
         self.incr_timer: threading.Timer | None = None
+        # Files excluded from backups and the change manifest in addition to the
+        # chain marker: bot infrastructure that lives in the server directory but
+        # isn't server data (e.g. the captured-stdout console.log the bot tails
+        # on Bedrock). Matched by basename anywhere in the tree.
+        self.backup_exclude_names = frozenset(backup_exclude_names(config))
         self.manifest_path = _server_data_path("backup_manifest.json")
         self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
         self.chain_marker_path_legacy = (self.config.minecraft_dir
@@ -440,6 +445,113 @@ class Server:
         except Exception as e:
             logger.exception("Player sidecar generation failed")
             log(f"Player sidecar generation failed: {e}")
+
+    # --- Full backup --------------------------------------------------------
+
+    def run_backup(self, status_cb=None):
+        """Run a full server backup.
+
+        Full backup process:
+          1. begin_save: freeze the world and flush pending writes
+             (Java: save-off + save-all; Bedrock: save hold).
+          2. Determine the consistent file set (files_ready):
+             - Java returns None -> wait for the filesystem to settle, then zip
+               the whole server directory.
+             - Bedrock returns [(path, max_bytes), ...] -> zip each file
+               truncated to its snapshot length.
+          3. end_save: resume normal saving (always, even if zip fails).
+          4. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
+          5. Start a new incremental chain: generate a fresh chain ID, rebuild
+             the file manifest (mtime baseline), and write the chain marker.
+        """
+        backup_dir = self.config.backup_dir
+
+        def status(msg):
+            logger.info("Backup: %s", msg)
+            if status_cb:
+                status_cb(msg)
+
+        if not self.backend.is_available():
+            raise RuntimeError("Server backend not available")
+
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: Freeze the world and flush pending writes (edition-specific).
+        self.backend.begin_save(status)
+
+        mc_dir = self.config.minecraft_dir
+        # Uses relative paths inside the zip so the restore tool can extract
+        # directly into any target directory.
+        dir_name = mc_dir.name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_path = backup_dir / f"{dir_name}_{timestamp}.zip"
+        backup_dir_resolved = backup_dir.resolve()
+
+        try:
+            # Step 2: Get the consistent file set to copy. Java returns None (copy
+            # the whole settled directory); Bedrock returns snapshot byte-lengths
+            # so the walk truncates listed files and skips stale, unlisted db/
+            # files.
+            ready = self.backend.files_ready(status)
+            ready_map = None
+            if ready is None:
+                # Java: the server may still be flushing to disk after save-all,
+                # so wait for the filesystem to settle before zipping.
+                wait_for_settle(mc_dir, backup_dir, log_fn=status,
+                                exclude_names=self.backup_exclude_names)
+            else:
+                ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
+                             for p, n in ready}
+
+            status(f"Zipping {mc_dir} ...")
+            with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for dirpath, _dirnames, filenames in os.walk(mc_dir):
+                    dp = Path(dirpath)
+                    # Skip the backup directory if it's inside the server dir
+                    try:
+                        dp.resolve().relative_to(backup_dir_resolved)
+                        continue
+                    except ValueError:
+                        pass
+                    for fn in filenames:
+                        # Chain marker (new + legacy) and bot infrastructure are
+                        # not server data
+                        if fn in (CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY) \
+                                or fn in self.backup_exclude_names:
+                            continue
+                        fp = dp / fn
+                        rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
+                        _add_world_file_to_zip(zf, fp, rel, ready_map)
+                # Bedrock: embed the full player-data sidecar (baseline).
+                self.write_player_sidecar(zf, ready, full_backup=True, log=status)
+            size_mb = final_path.stat().st_size / (1024 * 1024)
+            status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
+        finally:
+            # Step 3: Always resume normal saving, even if zip fails
+            self.backend.end_save(status)
+
+        # Step 4: Copy off-server if configured (e.g., rsync to NAS/cloud)
+        run_copy_command(final_path, log_fn=status)
+
+        # Step 5: Start a new incremental chain
+        # Every full backup starts a fresh chain. The manifest records the mtime
+        # of every file, which becomes the baseline for detecting changes in
+        # subsequent incremental backups. The chain marker is written to the
+        # server directory so the bot can detect if the server state is replaced
+        # while it's offline.
+        try:
+            chain_id = new_chain_id(backup_dir)
+            fresh_files = build_file_manifest(mc_dir, backup_dir,
+                                              self.backup_exclude_names)
+            self.save_manifest(fresh_files, chain_id=chain_id,
+                               base_full=final_path.name)
+            self.write_chain_marker(chain_id)
+            logger.info("Backup: new chain %s established (base: %s)",
+                        chain_id, final_path.name)
+        except Exception:
+            logger.exception("Failed to reset incremental manifest after full backup")
+
+        return str(final_path)
 
 
 SERVER = Server(SERVER_CONFIG)
@@ -1172,106 +1284,9 @@ _maybe_learn_player = SERVER.maybe_learn_player
 _write_player_sidecar = SERVER.write_player_sidecar
 
 
-def run_backup(status_cb=None):
-    """Run a full server backup.
-
-    Full backup process:
-      1. begin_save: freeze the world and flush pending writes
-         (Java: save-off + save-all; Bedrock: save hold).
-      2. Determine the consistent file set (files_ready):
-         - Java returns None -> wait for the filesystem to settle, then zip the
-           whole server directory.
-         - Bedrock returns [(path, max_bytes), ...] -> zip each file truncated
-           to its snapshot length.
-      3. end_save: resume normal saving (always, even if zip fails).
-      4. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
-      5. Start a new incremental chain: generate a fresh chain ID, rebuild
-         the file manifest (mtime baseline), and write the chain marker.
-    """
-    def status(msg):
-        logger.info("Backup: %s", msg)
-        if status_cb:
-            status_cb(msg)
-
-    if not BACKEND.is_available():
-        raise RuntimeError("Server backend not available")
-
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Step 1: Freeze the world and flush pending writes (edition-specific).
-    BACKEND.begin_save(status)
-
-    mc_dir = Path(MINECRAFT_DIR)
-    # Uses relative paths inside the zip so the restore tool can extract
-    # directly into any target directory.
-    dir_name = mc_dir.name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    final_path = BACKUP_DIR / f"{dir_name}_{timestamp}.zip"
-    backup_dir_resolved = BACKUP_DIR.resolve()
-
-    try:
-        # Step 2: Get the consistent file set to copy. Java returns None (copy
-        # the whole settled directory); Bedrock returns snapshot byte-lengths so
-        # the walk truncates listed files and skips stale, unlisted db/ files.
-        ready = BACKEND.files_ready(status)
-        ready_map = None
-        if ready is None:
-            # Java: the server may still be flushing to disk after save-all,
-            # so wait for the filesystem to settle before zipping.
-            wait_for_settle(mc_dir, BACKUP_DIR, log_fn=status,
-                            exclude_names=_BACKUP_EXCLUDE_NAMES)
-        else:
-            ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
-                         for p, n in ready}
-
-        status(f"Zipping {mc_dir} ...")
-        with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for dirpath, _dirnames, filenames in os.walk(mc_dir):
-                dp = Path(dirpath)
-                # Skip the backup directory if it's inside the server directory
-                try:
-                    dp.resolve().relative_to(backup_dir_resolved)
-                    continue
-                except ValueError:
-                    pass
-                for fn in filenames:
-                    # Chain marker (new + legacy) and bot infrastructure are not
-                    # server data
-                    if fn in (CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY) \
-                            or fn in _BACKUP_EXCLUDE_NAMES:
-                        continue
-                    fp = dp / fn
-                    rel = str(fp.relative_to(mc_dir)).replace("\\", "/")
-                    _add_world_file_to_zip(zf, fp, rel, ready_map)
-            # Bedrock: embed the full player-data sidecar (baseline).
-            _write_player_sidecar(zf, ready, full_backup=True, log=status)
-        size_mb = final_path.stat().st_size / (1024 * 1024)
-        status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
-    finally:
-        # Step 3: Always resume normal saving, even if zip fails
-        BACKEND.end_save(status)
-
-    # Step 4: Copy off-server if configured (e.g., rsync to NAS/cloud)
-    run_copy_command(final_path, log_fn=status)
-
-    # Step 5: Start a new incremental chain
-    # Every full backup starts a fresh chain. The manifest records the mtime
-    # of every file, which becomes the baseline for detecting changes in
-    # subsequent incremental backups. The chain marker is written to the
-    # server directory so the bot can detect if the server state is replaced
-    # while it's offline.
-    try:
-        chain_id = new_chain_id(BACKUP_DIR)
-        fresh_files = build_file_manifest(Path(MINECRAFT_DIR), BACKUP_DIR,
-                                          _BACKUP_EXCLUDE_NAMES)
-        _save_manifest(fresh_files, chain_id=chain_id, base_full=final_path.name)
-        _write_chain_marker(chain_id)
-        logger.info("Backup: new chain %s established (base: %s)",
-                    chain_id, final_path.name)
-    except Exception:
-        logger.exception("Failed to reset incremental manifest after full backup")
-
-    return str(final_path)
+# run_backup now lives on Server (see the class body); this alias keeps the
+# single-server call sites unchanged.
+run_backup = SERVER.run_backup
 
 
 # ---------------------------------------------------------------------------
