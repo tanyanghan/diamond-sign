@@ -284,6 +284,61 @@ class Server:
             with self.session_lock:
                 self.session_xuids.add(xuid)
 
+    # --- Backup manifest + chain marker -------------------------------------
+
+    def load_manifest(self) -> tuple:
+        """Load backup_manifest.json. Returns (chain_id, base_full, files_dict).
+
+        Returns ("", "", {}) if the manifest is missing or corrupt, which
+        effectively means "no chain established — skip incremental backups".
+        """
+        if self.manifest_path.exists():
+            try:
+                with open(self.manifest_path) as f:
+                    data = json.load(f)
+                return (data.get("chain_id", ""),
+                        data.get("base_full", ""),
+                        data.get("files", {}))
+            except Exception:
+                logger.exception("Failed to load backup_manifest.json")
+        return "", "", {}
+
+    def save_manifest(self, files: dict, chain_id: str, base_full: str) -> None:
+        """Write the manifest with the current chain state and file mtimes."""
+        with open(self.manifest_path, "w") as f:
+            json.dump({"chain_id": chain_id, "base_full": base_full,
+                       "files": files}, f)
+
+    def write_chain_marker(self, chain_id: str) -> None:
+        """Write chain ID to the chain marker (CHAIN_MARKER_NAME) in the world dir.
+
+        This marker file lets the bot detect on startup if the server state
+        was replaced while it was offline (e.g., manual restore). If the marker
+        doesn't match the manifest's chain_id, the chain is considered invalid.
+        A leftover legacy marker is removed so only one marker remains.
+        """
+        try:
+            with open(self.chain_marker_path, "w") as f:
+                f.write(chain_id)
+            if self.chain_marker_path_legacy.exists():
+                self.chain_marker_path_legacy.unlink()
+        except Exception:
+            logger.exception("Failed to write chain marker")
+
+    def read_chain_marker(self) -> str:
+        """Read the chain ID from the chain marker, falling back to the legacy
+        (.mcnotifier_chain) name so pre-rename installs keep their chain. '' if
+        neither exists."""
+        for path in (self.chain_marker_path, self.chain_marker_path_legacy):
+            try:
+                return path.read_text().strip()
+            except FileNotFoundError:
+                continue
+            except Exception:
+                logger.exception("Failed to read chain marker")
+                return ""
+        return ""
+
 
 SERVER = Server(SERVER_CONFIG)
 
@@ -1239,9 +1294,6 @@ def run_backup(status_cb=None):
 # Aliases to the single server's backup state (see Server.__init__). The
 # incremental timer is reassigned, so it's accessed as SERVER.incr_timer in the
 # cycle functions rather than aliased here.
-_MANIFEST_PATH = SERVER.manifest_path
-_CHAIN_MARKER_PATH = SERVER.chain_marker_path
-_CHAIN_MARKER_PATH_LEGACY = SERVER.chain_marker_path_legacy
 _incr_lock = SERVER.incr_lock
 
 
@@ -1259,61 +1311,13 @@ def _diff_manifest(old: dict, new: dict) -> tuple:
     return changed, deleted
 
 
-def _load_manifest() -> tuple:
-    """Load backup_manifest.json. Returns (chain_id, base_full, files_dict).
-
-    Returns ("", "", {}) if the manifest is missing or corrupt, which
-    effectively means "no chain established — skip incremental backups".
-    """
-    if _MANIFEST_PATH.exists():
-        try:
-            with open(_MANIFEST_PATH) as f:
-                data = json.load(f)
-            return (data.get("chain_id", ""),
-                    data.get("base_full", ""),
-                    data.get("files", {}))
-        except Exception:
-            logger.exception("Failed to load backup_manifest.json")
-    return "", "", {}
-
-
-def _save_manifest(files: dict, chain_id: str, base_full: str) -> None:
-    """Write the manifest with the current chain state and file mtimes."""
-    with open(_MANIFEST_PATH, "w") as f:
-        json.dump({"chain_id": chain_id, "base_full": base_full,
-                    "files": files}, f)
-
-
-def _write_chain_marker(chain_id: str) -> None:
-    """Write chain ID to the chain marker (CHAIN_MARKER_NAME) in MINECRAFT_DIR.
-
-    This marker file lets the bot detect on startup if the server state
-    was replaced while it was offline (e.g., manual restore). If the marker
-    doesn't match the manifest's chain_id, the chain is considered invalid.
-    A leftover legacy marker is removed so only one marker remains.
-    """
-    try:
-        with open(_CHAIN_MARKER_PATH, "w") as f:
-            f.write(chain_id)
-        if _CHAIN_MARKER_PATH_LEGACY.exists():
-            _CHAIN_MARKER_PATH_LEGACY.unlink()
-    except Exception:
-        logger.exception("Failed to write chain marker")
-
-
-def _read_chain_marker() -> str:
-    """Read the chain ID from the chain marker, falling back to the legacy
-    (.mcnotifier_chain) name so pre-rename installs keep their chain. '' if
-    neither exists."""
-    for path in (_CHAIN_MARKER_PATH, _CHAIN_MARKER_PATH_LEGACY):
-        try:
-            return path.read_text().strip()
-        except FileNotFoundError:
-            continue
-        except Exception:
-            logger.exception("Failed to read chain marker")
-            return ""
-    return ""
+# Manifest + chain-marker helpers now live on Server (see the class body). The
+# single-server call sites use these aliases; multi-server steps thread the
+# resolved Server through instead.
+_load_manifest = SERVER.load_manifest
+_save_manifest = SERVER.save_manifest
+_write_chain_marker = SERVER.write_chain_marker
+_read_chain_marker = SERVER.read_chain_marker
 
 
 # ---------------------------------------------------------------------------
