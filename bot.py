@@ -767,11 +767,72 @@ class Bot:
         self.config = config
         self.servers = list(servers)
         self.by_name = {s.config.name: s for s in self.servers}
+        self.by_key = {s.config.key: s for s in self.servers}
+        # Per-admin /use selection, in-memory only: {platform: {user_id: key}}.
+        self._admin_session: dict = {}
         # Set in main() once the adapters and auth doc are built.
         self.adapters: list = []
         self.router = None
         self.auth_doc: dict = {}   # whole {bot: {platform: ns}} doc (for saves)
         self.auth: dict = {}       # this bot's slice: {platform: ns}
+
+    def find_server(self, token: str):
+        """Resolve a user-typed server token (its name or data key) to a Server,
+        or None if it matches neither."""
+        if not token:
+            return None
+        return self.by_name.get(token) or self.by_key.get(token)
+
+    def resolve_target_server(self, ctx):
+        """Pick the Server a server-scoped command should act on, or None if it's
+        ambiguous (a multi-server bot with no channel binding and no /use
+        selection). Resolution order:
+          1. single-server bot -> its only server (implicit);
+          2. a bound group/channel -> the server in its chat_servers binding;
+          3. an admin DM -> the /use session selection.
+        """
+        if len(self.servers) == 1:
+            return self.servers[0]
+        ns = self.auth.get(ctx.platform) or {}
+        if not ctx.is_private:
+            key = (ns.get("chat_servers") or {}).get(ctx.chat_id)
+            return self.by_key.get(key)
+        sel = (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id)
+        return self.by_key.get(sel)
+
+    def resolve_command(self, ctx) -> bool:
+        """CommandRouter resolve hook: set ctx.server, or reply with a
+        disambiguation message and return False."""
+        server = self.resolve_target_server(ctx)
+        if server is None:
+            names = ", ".join(sorted(self.by_name)) or "(none)"
+            ctx.reply("This bot serves multiple servers. Pick one with "
+                      f"/use <server> first.\nServers: {names}")
+            return False
+        ctx.server = server
+        return True
+
+    def set_use(self, ctx) -> None:
+        """Handle /use: bare form lists servers + current selection; /use
+        <server> sets this admin's session target for subsequent commands."""
+        current = (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id)
+        if not ctx.args:
+            cur = self.by_key.get(current)
+            lines = ["Servers:"]
+            for s in self.servers:
+                mark = "  * " if s is cur else "    "
+                lines.append(f"{mark}{s.config.name}")
+            lines.append("")
+            lines.append(f"Current: {cur.config.name if cur else '(none — /use <server>)'}")
+            ctx.reply("\n".join(lines))
+            return
+        target = self.find_server(ctx.args[0])
+        if target is None:
+            names = ", ".join(sorted(self.by_name)) or "(none)"
+            ctx.reply(f"Unknown server '{ctx.args[0]}'.\nServers: {names}")
+            return
+        self._admin_session.setdefault(ctx.platform, {})[ctx.user_id] = target.config.key
+        ctx.reply(f"Now using {target.config.name} for your commands.")
 
     def _server_chats(self, adapter, server):
         """Yield the authorized chat IDs on ``adapter`` that should receive
@@ -2267,7 +2328,14 @@ def register_commands(router, auth: dict, names: dict,
     def cmd_chat_id(ctx):
         logger.info("ChatID: requested by %s (chat=%s)", ctx.sender_label, ctx.chat_id)
         ctx.reply(f"Chat ID: {ctx.chat_id}")
-    router.register("chat_id", cmd_chat_id, public=True)
+    router.register("chat_id", cmd_chat_id, public=True, needs_server=False)
+
+    # --- /use (multi-server: pick this admin's target server) ---
+    def cmd_use(ctx):
+        logger.info("Use: requested by %s (args=%s)", ctx.sender_label, ctx.args)
+        ctx.bot.set_use(ctx)
+    router.register("use", cmd_use, private_only=True, admin_only=True,
+                    needs_server=False)
 
     # --- /authorize ---
     def cmd_authorize(ctx):
@@ -2283,7 +2351,8 @@ def register_commands(router, auth: dict, names: dict,
         logger.info("Authorize: chat %s added by %s on %s",
                     target_id, ctx.sender_label, ctx.platform)
         ctx.reply(f"Chat {target_id} is now authorized.")
-    router.register("authorize", cmd_authorize, private_only=True, admin_only=True)
+    router.register("authorize", cmd_authorize, private_only=True,
+                    admin_only=True, needs_server=False)
 
     # --- /revoke ---
     def cmd_revoke(ctx):
@@ -2301,7 +2370,8 @@ def register_commands(router, auth: dict, names: dict,
                 ctx.reply(f"Chat {target_id} has been revoked.")
             else:
                 ctx.reply(f"Chat {target_id} was not authorized.")
-    router.register("revoke", cmd_revoke, private_only=True, admin_only=True)
+    router.register("revoke", cmd_revoke, private_only=True,
+                    admin_only=True, needs_server=False)
 
     # --- /listchats ---
     def cmd_listchats(ctx):
@@ -2311,7 +2381,8 @@ def register_commands(router, auth: dict, names: dict,
             ctx.reply("Authorized chats:\n" + "\n".join(str(i) for i in ids))
         else:
             ctx.reply("No authorized chats.")
-    router.register("listchats", cmd_listchats, private_only=True, admin_only=True)
+    router.register("listchats", cmd_listchats, private_only=True,
+                    admin_only=True, needs_server=False)
 
 
 def _make_unclaimed_handler(auth: dict):
@@ -2373,6 +2444,8 @@ def main():
     deaths = SERVER.deaths
 
     # Command router shared by all adapters; replies go to the originating chat.
+    # bot + resolve give handlers ctx.bot and (for server-scoped commands) the
+    # resolved ctx.server.
     router = CommandRouter(
         auth,
         is_admin=lambda platform, uid: is_admin(platform, uid, auth),
@@ -2380,6 +2453,8 @@ def main():
             is_authorized(platform, cid, uid, priv, auth),
         on_unclaimed=_make_unclaimed_handler(auth),
         logger=logger,
+        bot=BOT,
+        resolve=BOT.resolve_command,
     )
     BOT.router = router
     register_commands(router, auth, names, achievements, deaths)
