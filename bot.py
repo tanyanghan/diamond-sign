@@ -49,21 +49,10 @@ BOT_CONFIG = APP_CONFIG.bots[0]
 SERVER_CONFIG = BOT_CONFIG.servers[0]
 CONFIG = SERVER_CONFIG
 
-MINECRAFT_DIR = SERVER_CONFIG.minecraft_dir    # Path
 LOG_PATH = SERVER_CONFIG.log_path              # Java: logs/latest.log; Bedrock: console.log
-BACKUP_DIR = SERVER_CONFIG.backup_dir
-INCREMENTAL_BACKUP_ENABLED = SERVER_CONFIG.incremental_enabled
-INCREMENTAL_INTERVAL_MINUTES = SERVER_CONFIG.incremental_interval_minutes
 
 # Server backend (Java RCON / Bedrock mux). Constructed in main().
 BACKEND = None
-
-# Files excluded from backups and the change manifest in addition to the chain
-# marker: bot infrastructure that lives in the server directory but isn't server
-# data. On Bedrock this is the captured-stdout console.log the bot tails, which
-# tee appends to constantly (it would otherwise appear changed in every
-# incremental). Matched by basename anywhere in the tree.
-_BACKUP_EXCLUDE_NAMES = frozenset(backup_exclude_names(SERVER_CONFIG))
 
 # Per-server state lives under data/<server-name>/ so multiple servers in one
 # process never collide. (auth.json stays at the repo root — it's per-bot, not
@@ -552,6 +541,192 @@ class Server:
             logger.exception("Failed to reset incremental manifest after full backup")
 
         return str(final_path)
+
+    # --- Incremental backup -------------------------------------------------
+
+    def run_incremental_backup(self) -> str | None:
+        """Run an incremental backup of changed files. Returns zip path or None.
+
+        Incremental backup process:
+          1. Load the manifest to get the current chain_id and file mtime
+             baseline.
+          2. Walk the server directory and compare mtimes to detect changes.
+          3. If changes found: RCON save-off/save-all to flush world data, then
+             re-scan to capture any newly flushed changes.
+          4. Zip only the changed/added files, plus _deletions.json and
+             _meta.json.
+          5. Update the manifest with the new file mtimes (same chain_id).
+          6. RCON save-on to re-enable auto-save.
+          7. Run BACKUP_COPY_CMD if configured.
+
+        Returns None if: no chain established, no changes detected, another
+        backup is in progress, or the backup fails.
+        """
+        backup_dir = self.config.backup_dir
+
+        if not self.backup_lock.acquire(blocking=False):
+            logger.info("Incremental backup skipped: another backup is in progress")
+            return None
+
+        try:
+            mc_dir = self.config.minecraft_dir
+            chain_id, base_full, old_files = self.load_manifest()
+
+            # A chain must be established (by a full backup or restore) before
+            # incremental backups can run. Without a chain, we don't know which
+            # full backup these incrementals belong to.
+            if not chain_id:
+                logger.warning("Incremental backup skipped: no chain established. "
+                               "Run a full backup first.")
+                return None
+
+            # First pass: quick scan to see if anything changed at all
+            new_manifest = build_file_manifest(mc_dir, backup_dir,
+                                               self.backup_exclude_names)
+
+            changed, deleted = _diff_manifest(old_files, new_manifest)
+            if not changed and not deleted:
+                logger.info("Incremental backup: no changes detected, skipping")
+                return None
+
+            logger.info("Incremental backup: %d changed/added, %d deleted",
+                         len(changed), len(deleted))
+
+            if not self.backend.is_available():
+                logger.warning("Incremental backup skipped: server backend not available")
+                return None
+
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            inc_log = lambda msg: logger.info("Incremental backup: %s", msg)
+
+            # Freeze the world state and flush pending writes (edition-specific)
+            # — ensures we zip consistent file state, not partially-written files.
+            self.backend.begin_save(inc_log)
+
+            try:
+                # Determine the consistent file set, then re-scan to capture any
+                # changes flushed by the save before computing the final diff.
+                ready = self.backend.files_ready(inc_log)
+                if ready is None:
+                    # Java: the server may still be flushing after the save, so
+                    # wait for the filesystem to settle before diffing.
+                    new_manifest = wait_for_settle(mc_dir, backup_dir, log_fn=inc_log,
+                                                   exclude_names=self.backup_exclude_names)
+                    ready_map = None
+                else:
+                    # Bedrock: snapshot lengths are authoritative; no settle needed.
+                    new_manifest = build_file_manifest(mc_dir, backup_dir,
+                                                       self.backup_exclude_names)
+                    ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
+                                 for p, n in ready}
+                changed, deleted = _diff_manifest(old_files, new_manifest)
+
+                # Build the incremental zip with chain ID in the filename
+                dir_name = mc_dir.name
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                zip_name = f"{dir_name}_incr_{chain_id}_{timestamp}"
+                zip_path = backup_dir / f"{zip_name}.zip"
+
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    # Add changed/added files. On Bedrock, listed files are
+                    # truncated to their snapshot length and stale unlisted db/
+                    # files skipped.
+                    for rel_path in changed:
+                        full_path = mc_dir / rel_path
+                        if not full_path.exists():
+                            continue
+                        _add_world_file_to_zip(zf, full_path, rel_path, ready_map)
+                    # Record deleted files so restore can remove them too
+                    if deleted:
+                        zf.writestr("_deletions.json", json.dumps(deleted, indent=2))
+                    # Embed chain metadata so restore.py can discover this
+                    # incremental's chain membership without external state
+                    zf.writestr("_meta.json", json.dumps({
+                        "chain_id": chain_id, "base_full": base_full}))
+                    # Bedrock: embed the changed-only player-data sidecar.
+                    self.write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
+
+                size_mb = zip_path.stat().st_size / (1024 * 1024)
+                logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
+                            zip_path.name, size_mb, len(changed))
+
+                # Update the manifest: same chain, but new mtime baseline
+                self.save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
+
+            finally:
+                # Always resume normal saving
+                self.backend.end_save(inc_log)
+
+            # Checkpoint online-time stats so a crash loses at most one interval
+            # of in-progress playtime (no-op on Java).
+            self.backend.checkpoint_open_sessions()
+
+            # Copy off-server if configured
+            run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
+
+            return str(zip_path)
+
+        except Exception:
+            logger.exception("Incremental backup failed")
+            return None
+        finally:
+            self.backup_lock.release()
+
+    # --- Incremental backup cycle (player-activity-driven) ------------------
+    # Uses a threading.Timer to run incremental backups at regular intervals
+    # while players are online. The cycle starts when the first player joins
+    # and stops when the last player leaves.
+
+    def _incremental_cycle(self):
+        """Run one incremental backup, then reschedule if the cycle is still
+        active."""
+        try:
+            self.run_incremental_backup()
+        finally:
+            with self.incr_lock:
+                if self.incr_timer is not None:  # cycle still active (not stopped)
+                    self.incr_timer = threading.Timer(
+                        self.config.incremental_interval_minutes * 60,
+                        self._incremental_cycle)
+                    self.incr_timer.daemon = True
+                    self.incr_timer.start()
+
+    def start_incremental_cycle(self):
+        """Start the incremental backup cycle if not already running.
+
+        Called when the first player joins the server.
+        """
+        if not self.config.incremental_enabled:
+            return
+        with self.incr_lock:
+            if self.incr_timer is not None:
+                return  # already running
+            logger.info("Incremental backup cycle started (every %d min)",
+                        self.config.incremental_interval_minutes)
+            self.incr_timer = threading.Timer(
+                self.config.incremental_interval_minutes * 60,
+                self._incremental_cycle)
+            self.incr_timer.daemon = True
+            self.incr_timer.start()
+
+    def stop_incremental_cycle(self, final: bool = False):
+        """Stop the incremental backup cycle.
+
+        Called when the last player leaves the server.
+        If final=True, runs one last incremental backup to capture any remaining
+        changes from the play session.
+        """
+        if not self.config.incremental_enabled:
+            return
+        with self.incr_lock:
+            if self.incr_timer is None:
+                return
+            self.incr_timer.cancel()
+            self.incr_timer = None
+        logger.info("Incremental backup cycle stopped")
+        if final:
+            logger.info("Running final incremental backup before stop")
+            threading.Thread(target=self.run_incremental_backup, daemon=True).start()
 
 
 SERVER = Server(SERVER_CONFIG)
@@ -1294,7 +1469,7 @@ run_backup = SERVER.run_backup
 # ---------------------------------------------------------------------------
 # Incremental backups capture only files that changed since the last backup
 # (full or incremental). They are triggered automatically while players are
-# online, on a configurable interval (INCREMENTAL_INTERVAL_MINUTES).
+# online, on a configurable interval (config.incremental_interval_minutes).
 #
 # How change detection works:
 #   - The manifest (backup_manifest.json) stores {relative_path: mtime} for
@@ -1310,15 +1485,9 @@ run_backup = SERVER.run_backup
 #
 # The incremental cycle is player-activity-driven:
 #   - Starts when the first player joins the server
-#   - Runs every INCREMENTAL_INTERVAL_MINUTES while players are online
+#   - Runs every config.incremental_interval_minutes while players are online
 #   - Stops when the last player leaves (with one final backup)
 # ---------------------------------------------------------------------------
-
-# Aliases to the single server's backup state (see Server.__init__). The
-# incremental timer is reassigned, so it's accessed as SERVER.incr_timer in the
-# cycle functions rather than aliased here.
-_incr_lock = SERVER.incr_lock
-
 
 def _diff_manifest(old: dict, new: dict) -> tuple:
     """Compare two file manifests and return (changed_or_added, deleted).
@@ -1418,182 +1587,13 @@ def _clear_pending_player_restore(user_id: int) -> None:
         _pending_player_restore.pop(user_id, None)
 
 
-def run_incremental_backup() -> str | None:
-    """Run an incremental backup of changed files. Returns zip path or None.
-
-    Incremental backup process:
-      1. Load the manifest to get the current chain_id and file mtime baseline.
-      2. Walk the server directory and compare mtimes to detect changes.
-      3. If changes found: RCON save-off/save-all to flush world data, then
-         re-scan to capture any newly flushed changes.
-      4. Zip only the changed/added files, plus _deletions.json and _meta.json.
-      5. Update the manifest with the new file mtimes (same chain_id).
-      6. RCON save-on to re-enable auto-save.
-      7. Run BACKUP_COPY_CMD if configured.
-
-    Returns None if: no chain established, no changes detected, another backup
-    is in progress, or the backup fails.
-    """
-    if not _backup_lock.acquire(blocking=False):
-        logger.info("Incremental backup skipped: another backup is in progress")
-        return None
-
-    try:
-        mc_dir = Path(MINECRAFT_DIR)
-        chain_id, base_full, old_files = _load_manifest()
-
-        # A chain must be established (by a full backup or restore) before
-        # incremental backups can run. Without a chain, we don't know which
-        # full backup these incrementals belong to.
-        if not chain_id:
-            logger.warning("Incremental backup skipped: no chain established. "
-                           "Run a full backup first.")
-            return None
-
-        # First pass: quick scan to see if anything changed at all
-        new_manifest = build_file_manifest(mc_dir, BACKUP_DIR, _BACKUP_EXCLUDE_NAMES)
-
-        changed, deleted = _diff_manifest(old_files, new_manifest)
-        if not changed and not deleted:
-            logger.info("Incremental backup: no changes detected, skipping")
-            return None
-
-        logger.info("Incremental backup: %d changed/added, %d deleted",
-                     len(changed), len(deleted))
-
-        if not BACKEND.is_available():
-            logger.warning("Incremental backup skipped: server backend not available")
-            return None
-
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        inc_log = lambda msg: logger.info("Incremental backup: %s", msg)
-
-        # Freeze the world state and flush pending writes (edition-specific) —
-        # ensures we zip consistent file state, not partially-written files.
-        BACKEND.begin_save(inc_log)
-
-        try:
-            # Determine the consistent file set, then re-scan to capture any
-            # changes flushed by the save before computing the final diff.
-            ready = BACKEND.files_ready(inc_log)
-            if ready is None:
-                # Java: the server may still be flushing after the save, so wait
-                # for the filesystem to settle before diffing.
-                new_manifest = wait_for_settle(mc_dir, BACKUP_DIR, log_fn=inc_log,
-                                               exclude_names=_BACKUP_EXCLUDE_NAMES)
-                ready_map = None
-            else:
-                # Bedrock: snapshot lengths are authoritative; no settle needed.
-                new_manifest = build_file_manifest(mc_dir, BACKUP_DIR, _BACKUP_EXCLUDE_NAMES)
-                ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
-                             for p, n in ready}
-            changed, deleted = _diff_manifest(old_files, new_manifest)
-
-            # Build the incremental zip with chain ID in the filename
-            dir_name = mc_dir.name
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            zip_name = f"{dir_name}_incr_{chain_id}_{timestamp}"
-            zip_path = BACKUP_DIR / f"{zip_name}.zip"
-
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Add changed/added files. On Bedrock, listed files are truncated
-                # to their snapshot length and stale unlisted db/ files skipped.
-                for rel_path in changed:
-                    full_path = mc_dir / rel_path
-                    if not full_path.exists():
-                        continue
-                    _add_world_file_to_zip(zf, full_path, rel_path, ready_map)
-                # Record deleted files so restore can remove them too
-                if deleted:
-                    zf.writestr("_deletions.json", json.dumps(deleted, indent=2))
-                # Embed chain metadata so restore.py can discover this
-                # incremental's chain membership without external state
-                zf.writestr("_meta.json", json.dumps({
-                    "chain_id": chain_id, "base_full": base_full}))
-                # Bedrock: embed the changed-only player-data sidecar.
-                _write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
-
-            size_mb = zip_path.stat().st_size / (1024 * 1024)
-            logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
-                        zip_path.name, size_mb, len(changed))
-
-            # Update the manifest: same chain, but new mtime baseline
-            _save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
-
-        finally:
-            # Always resume normal saving
-            BACKEND.end_save(inc_log)
-
-        # Checkpoint online-time stats so a crash loses at most one interval of
-        # in-progress playtime (no-op on Java).
-        BACKEND.checkpoint_open_sessions()
-
-        # Copy off-server if configured
-        run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
-
-        return str(zip_path)
-
-    except Exception:
-        logger.exception("Incremental backup failed")
-        return None
-    finally:
-        _backup_lock.release()
-
-
-# --- Incremental backup cycle (player-activity-driven) ---
-# Uses a threading.Timer to run incremental backups at regular intervals
-# while players are online. The cycle starts when the first player joins
-# and stops when the last player leaves.
-
-def _incremental_cycle():
-    """Run one incremental backup, then reschedule if the cycle is still active."""
-    try:
-        run_incremental_backup()
-    finally:
-        with SERVER.incr_lock:
-            if SERVER.incr_timer is not None:  # cycle still active (not stopped)
-                SERVER.incr_timer = threading.Timer(
-                    INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
-                SERVER.incr_timer.daemon = True
-                SERVER.incr_timer.start()
-
-
-def _start_incremental_cycle():
-    """Start the incremental backup cycle if not already running.
-
-    Called when the first player joins the server.
-    """
-    if not INCREMENTAL_BACKUP_ENABLED:
-        return
-    with SERVER.incr_lock:
-        if SERVER.incr_timer is not None:
-            return  # already running
-        logger.info("Incremental backup cycle started (every %d min)",
-                    INCREMENTAL_INTERVAL_MINUTES)
-        SERVER.incr_timer = threading.Timer(
-            INCREMENTAL_INTERVAL_MINUTES * 60, _incremental_cycle)
-        SERVER.incr_timer.daemon = True
-        SERVER.incr_timer.start()
-
-
-def _stop_incremental_cycle(final: bool = False):
-    """Stop the incremental backup cycle.
-
-    Called when the last player leaves the server.
-    If final=True, runs one last incremental backup to capture any remaining
-    changes from the play session.
-    """
-    if not INCREMENTAL_BACKUP_ENABLED:
-        return
-    with SERVER.incr_lock:
-        if SERVER.incr_timer is None:
-            return
-        SERVER.incr_timer.cancel()
-        SERVER.incr_timer = None
-    logger.info("Incremental backup cycle stopped")
-    if final:
-        logger.info("Running final incremental backup before stop")
-        threading.Thread(target=run_incremental_backup, daemon=True).start()
+# run_incremental_backup and the incremental cycle now live on Server (see the
+# class body). These aliases keep the single-server call sites unchanged; the
+# multi-server steps thread the resolved Server through instead.
+run_incremental_backup = SERVER.run_incremental_backup
+_incremental_cycle = SERVER._incremental_cycle
+_start_incremental_cycle = SERVER.start_incremental_cycle
+_stop_incremental_cycle = SERVER.stop_incremental_cycle
 
 
 def _recover_online_identities(online_names: list, names: dict) -> None:
