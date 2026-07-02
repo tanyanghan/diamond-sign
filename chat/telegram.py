@@ -73,6 +73,12 @@ class _NetworkErrorFilter(logging.Filter):
     Network errors and the transient getUpdates 409 conflict (see
     ``_PollingHealth``) are folded into a single ``retrying...`` warning; a
     sustained 409 streak escalates to an explicit "second instance?" warning.
+
+    Installed once on the (telebot-global) "TeleBot" logger via ``install()``:
+    its records carry no token, so per-adapter attribution is impossible — all
+    adapters share one process-wide ``_PollingHealth``. Stacking one filter per
+    adapter would also break counting (the first filter returning False drops
+    the record before later filters run).
     """
     _TRANSIENT = (
         ("Network is unreachable", "network unreachable"),
@@ -115,6 +121,19 @@ class _NetworkErrorFilter(logging.Filter):
                 return False
         return True
 
+    @classmethod
+    def install(cls, health: _PollingHealth) -> None:
+        """Attach one instance to the shared "TeleBot" logger. Idempotent, so N
+        adapters (N bots) end up with exactly one filter and one health."""
+        lg = logging.getLogger("TeleBot")
+        if not any(isinstance(f, cls) for f in lg.filters):
+            lg.addFilter(cls(health))
+
+
+# Process-wide polling health: telebot logs through one global "TeleBot" logger
+# with no token on the records, so 409s can't be attributed to a specific bot.
+_HEALTH = _PollingHealth()
+
 
 def _sender_label(message) -> str:
     u = message.from_user
@@ -129,14 +148,13 @@ class TelegramAdapter(ChatAdapter):
     def __init__(self, config):
         super().__init__(config)
         self._bot = telebot.TeleBot(config.bot_token)
-        self._health = _PollingHealth()
-        logging.getLogger("TeleBot").addFilter(_NetworkErrorFilter(self._health))
+        _NetworkErrorFilter.install(_HEALTH)
 
     def start(self, dispatch) -> None:
         @self._bot.message_handler(func=lambda m: True)
         def _on_message(message):
             # A delivered update means getUpdates succeeded -> clear any 409 streak.
-            self._health.record_success()
+            _HEALTH.record_success()
             text = message.text or ""
             ctx = Context(
                 adapter=self,
