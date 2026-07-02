@@ -136,7 +136,11 @@ def _server_from_dict(d: dict) -> ServerConfig:
     mc_dir = Path(os.path.expanduser(mc_raw)) if mc_raw else None
     name = (d.get("name") or "").strip()
     if not name and mc_dir is not None:
-        name = get_level_name(mc_dir)
+        # Fall back to the Minecraft level-name, slugified: the user didn't type
+        # this, and level-names routinely contain spaces (e.g. "Bedrock level"),
+        # so make it a safe key rather than tripping name validation. An
+        # explicitly-set name is left as-is and validated (see validate_config).
+        name = _slug(get_level_name(mc_dir))
 
     rcon = d.get("rcon") or {}
     mux = d.get("mux") or {}
@@ -250,12 +254,21 @@ def validate_config(app: AppConfig) -> list:
             if not s.name:
                 problems.append(f"{slabel}: could not determine a server name; "
                                 "set \"name\"")
+            elif _slug(s.name) != s.name:
+                # The name is used verbatim as the data-dir key, the chat->server
+                # binding, and the /use & /authorize argument, so it must be
+                # filesystem- and command-token-safe: letters, digits, '.', '_',
+                # '-' only, no spaces.
+                problems.append(
+                    f"{slabel}: server name '{s.name}' isn't allowed — use only "
+                    f"letters, digits, '.', '_' and '-' with no spaces (replace "
+                    f"each space with '-' or '_'). Try \"{_slug(s.name)}\".")
             else:
                 key = s.key
                 if key in seen_keys:
                     problems.append(
-                        f"server name '{s.name}' (data key '{key}') collides with "
-                        f"'{seen_keys[key]}'; give one a unique \"name\"")
+                        f"server name '{s.name}' collides with '{seen_keys[key]}'; "
+                        f"give one a unique \"name\"")
                 else:
                     seen_keys[key] = s.name
     return problems
@@ -276,7 +289,8 @@ def _env_to_doc() -> dict:
     platforms = [p.strip().lower()
                  for p in os.environ.get("CHAT_PLATFORMS", "telegram").split(",")
                  if p.strip()] or ["telegram"]
-    name = get_level_name(Path(os.path.expanduser(mc_dir))) if mc_dir else ""
+    name = (_slug(get_level_name(Path(os.path.expanduser(mc_dir))))
+            if mc_dir else "")
 
     server = {
         "name": name,
