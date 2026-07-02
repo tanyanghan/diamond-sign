@@ -104,9 +104,9 @@ def register_player(server, uuid: str, name: str) -> None:
     names[uuid] = name
     changed = server.backend.register_name(uuid, name)
     if old and old != name:
-        logger.info("Player registry: %s renamed %s -> %s", uuid, old, name)
+        server.log.info("Player registry: %s renamed %s -> %s", uuid, old, name)
     elif changed and not old:
-        logger.info("Player registry: registered %s (%s)", name, uuid)
+        server.log.info("Player registry: registered %s (%s)", name, uuid)
 
 
 def _uuid_by_name(player_name: str, names: dict) -> str | None:
@@ -128,7 +128,7 @@ def load_achievements(path: Path) -> dict:
             with open(path) as f:
                 return json.load(f)
         except Exception:
-            logger.exception("Failed to load player_achievements.json")
+            logger.exception("Failed to load %s", path)
     return {}
 
 
@@ -165,7 +165,7 @@ def load_deaths(path: Path) -> dict:
             with open(path) as f:
                 return json.load(f)
         except Exception:
-            logger.exception("Failed to load player_deaths.json")
+            logger.exception("Failed to load %s", path)
     return {}
 
 
@@ -189,6 +189,14 @@ def record_death(uuid: str, message: str, timestamp: str,
 # ---------------------------------------------------------------------------
 # 3. Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
+class _ServerLogAdapter(logging.LoggerAdapter):
+    """Prefix every record with [<server name>] so interleaved multi-server
+    logs stay attributable (backups, notifications, watcher events)."""
+
+    def process(self, msg, kwargs):
+        return f"[{self.extra['server']}] {msg}", kwargs
+
+
 class Server:
     """One Minecraft server's runtime: its config, backend, and per-server
     mutable state (online players, session xuids, pending UUID correlation, and
@@ -199,6 +207,7 @@ class Server:
 
     def __init__(self, config, migrate_legacy=False):
         self.config = config
+        self.log = _ServerLogAdapter(logger, {"server": config.name})
         self.backend = None  # set in main() after make_backend
         self.watcher = None  # LogWatcher, set when the server is brought up
         self.observer = None  # watchdog Observer, stopped on shutdown
@@ -263,7 +272,7 @@ class Server:
                 try:
                     shutil.move(str(legacy), str(target))
                 except OSError:
-                    logger.warning("Could not migrate %s into %s",
+                    self.log.warning("Could not migrate %s into %s",
                                    filename, self.data_dir)
         return target
 
@@ -307,7 +316,7 @@ class Server:
                         data.get("base_full", ""),
                         data.get("files", {}))
             except Exception:
-                logger.exception("Failed to load backup_manifest.json")
+                self.log.exception("Failed to load backup_manifest.json")
         return "", "", {}
 
     def save_manifest(self, files: dict, chain_id: str, base_full: str) -> None:
@@ -330,7 +339,7 @@ class Server:
             if self.chain_marker_path_legacy.exists():
                 self.chain_marker_path_legacy.unlink()
         except Exception:
-            logger.exception("Failed to write chain marker")
+            self.log.exception("Failed to write chain marker")
 
     def read_chain_marker(self) -> str:
         """Read the chain ID from the chain marker, falling back to the legacy
@@ -342,7 +351,7 @@ class Server:
             except FileNotFoundError:
                 continue
             except Exception:
-                logger.exception("Failed to read chain marker")
+                self.log.exception("Failed to read chain marker")
                 return ""
         return ""
 
@@ -354,14 +363,14 @@ class Server:
         except FileNotFoundError:
             return {}
         except Exception:
-            logger.exception("Failed to read bedrock_player_state.json")
+            self.log.exception("Failed to read bedrock_player_state.json")
             return {}
 
     def save_player_state(self, hashes: dict) -> None:
         try:
             self.player_state_path.write_text(json.dumps(hashes))
         except Exception:
-            logger.exception("Failed to write bedrock_player_state.json")
+            self.log.exception("Failed to write bedrock_player_state.json")
 
     def maybe_learn_player(self, sidecar: dict, log) -> None:
         """Bind a player's xuid to their (account-stable) identity uuids by
@@ -440,7 +449,7 @@ class Server:
                 f"({len(new_hashes)} total)")
             self.maybe_learn_player(filtered, log)
         except Exception as e:
-            logger.exception("Player sidecar generation failed")
+            self.log.exception("Player sidecar generation failed")
             log(f"Player sidecar generation failed: {e}")
 
     # --- Full backup --------------------------------------------------------
@@ -464,7 +473,7 @@ class Server:
         backup_dir = self.config.backup_dir
 
         def status(msg):
-            logger.info("Backup: %s", msg)
+            self.log.info("Backup: %s", msg)
             if status_cb:
                 status_cb(msg)
 
@@ -548,10 +557,10 @@ class Server:
             self.save_manifest(fresh_files, chain_id=chain_id,
                                base_full=final_path.name)
             self.write_chain_marker(chain_id)
-            logger.info("Backup: new chain %s established (base: %s)",
+            self.log.info("Backup: new chain %s established (base: %s)",
                         chain_id, final_path.name)
         except Exception:
-            logger.exception("Failed to reset incremental manifest after full backup")
+            self.log.exception("Failed to reset incremental manifest after full backup")
 
         return str(final_path)
 
@@ -578,7 +587,7 @@ class Server:
         backup_dir = self.config.backup_dir
 
         if not self.backup_lock.acquire(blocking=False):
-            logger.info("Incremental backup skipped: another backup is in progress")
+            self.log.info("Incremental backup skipped: another backup is in progress")
             return None
 
         try:
@@ -589,7 +598,7 @@ class Server:
             # incremental backups can run. Without a chain, we don't know which
             # full backup these incrementals belong to.
             if not chain_id:
-                logger.warning("Incremental backup skipped: no chain established. "
+                self.log.warning("Incremental backup skipped: no chain established. "
                                "Run a full backup first.")
                 return None
 
@@ -599,18 +608,18 @@ class Server:
 
             changed, deleted = _diff_manifest(old_files, new_manifest)
             if not changed and not deleted:
-                logger.info("Incremental backup: no changes detected, skipping")
+                self.log.info("Incremental backup: no changes detected, skipping")
                 return None
 
-            logger.info("Incremental backup: %d changed/added, %d deleted",
+            self.log.info("Incremental backup: %d changed/added, %d deleted",
                          len(changed), len(deleted))
 
             if not self.backend.is_available():
-                logger.warning("Incremental backup skipped: server backend not available")
+                self.log.warning("Incremental backup skipped: server backend not available")
                 return None
 
             backup_dir.mkdir(parents=True, exist_ok=True)
-            inc_log = lambda msg: logger.info("Incremental backup: %s", msg)
+            inc_log = lambda msg: self.log.info("Incremental backup: %s", msg)
 
             # Freeze the world state and flush pending writes (edition-specific)
             # — ensures we zip consistent file state, not partially-written files.
@@ -660,7 +669,7 @@ class Server:
                     self.write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
 
                 size_mb = zip_path.stat().st_size / (1024 * 1024)
-                logger.info("Incremental backup saved: %s (%.1f MB, %d files)",
+                self.log.info("Incremental backup saved: %s (%.1f MB, %d files)",
                             zip_path.name, size_mb, len(changed))
 
                 # Update the manifest: same chain, but new mtime baseline
@@ -676,12 +685,12 @@ class Server:
 
             # Copy off-server if configured
             run_copy_command(zip_path, self.config.backup_copy_cmd,
-                             log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
+                             log_fn=lambda msg: self.log.info("Incremental backup: %s", msg))
 
             return str(zip_path)
 
         except Exception:
-            logger.exception("Incremental backup failed")
+            self.log.exception("Incremental backup failed")
             return None
         finally:
             self.backup_lock.release()
@@ -715,7 +724,7 @@ class Server:
         with self.incr_lock:
             if self.incr_timer is not None:
                 return  # already running
-            logger.info("Incremental backup cycle started (every %d min)",
+            self.log.info("Incremental backup cycle started (every %d min)",
                         self.config.incremental_interval_minutes)
             self.incr_timer = threading.Timer(
                 self.config.incremental_interval_minutes * 60,
@@ -737,9 +746,9 @@ class Server:
                 return
             self.incr_timer.cancel()
             self.incr_timer = None
-        logger.info("Incremental backup cycle stopped")
+        self.log.info("Incremental backup cycle stopped")
         if final:
-            logger.info("Running final incremental backup before stop")
+            self.log.info("Running final incremental backup before stop")
             threading.Thread(target=self.run_incremental_backup, daemon=True).start()
 
 
@@ -1204,7 +1213,7 @@ class LogWatcher(FileSystemEventHandler):
             self._inode = stat.st_ino
             self._pos = stat.st_size
         except FileNotFoundError:
-            logger.warning("Log file not found at startup: %s (server may be offline)", self._path)
+            self._server.log.warning("Log file not found at startup: %s (server may be offline)", self._path)
 
     def _check_rotation(self) -> bool:
         """Detect if latest.log was replaced (rotated) by checking inode."""
@@ -1213,7 +1222,7 @@ class LogWatcher(FileSystemEventHandler):
             if inode != self._inode:
                 self._inode = inode
                 self._pos = 0
-                logger.info("Log file rotation detected, resetting position")
+                self._server.log.info("Log file rotation detected, resetting position")
                 return True
         except FileNotFoundError:
             pass
@@ -1262,7 +1271,7 @@ class LogWatcher(FileSystemEventHandler):
         if now - self._last_start_trigger < self._START_DEBOUNCE:
             return
         self._last_start_trigger = now
-        logger.info("Server start detected in log; resyncing online status")
+        self._server.log.info("Server start detected in log; resyncing online status")
         threading.Thread(target=self._on_server_start, daemon=True).start()
 
     def on_modified(self, event):
@@ -1287,7 +1296,7 @@ class LogWatcher(FileSystemEventHandler):
             except FileNotFoundError:
                 pass
             except Exception:
-                logger.exception("Error reading Minecraft log")
+                self._server.log.exception("Error reading Minecraft log")
 
 
 # ---------------------------------------------------------------------------
@@ -1324,7 +1333,7 @@ def make_notify_callback(bot, server):
 
             verb = _ACH_VERB_MAP[ach_type]
             msg = f"{player} has {verb} [{achievement}]"
-            logger.info("Achievement: %s — %s — sending to %d chat(s)",
+            server.log.info("Achievement: %s — %s — sending to %d chat(s)",
                         player, achievement, bot.announce_chat_count(server))
             _send_to_chats(msg)
             return
@@ -1340,7 +1349,7 @@ def make_notify_callback(bot, server):
                              server.deaths_path)
 
             msg = f"{player} {death_msg}"
-            logger.info("Death: %s %s — sending to %d chat(s)",
+            server.log.info("Death: %s %s — sending to %d chat(s)",
                         player, death_msg, bot.announce_chat_count(server))
             _send_to_chats(msg)
             return
@@ -1351,7 +1360,7 @@ def make_notify_callback(bot, server):
             # at the parser; nothing recorded.
             player = payload["player"]
             message = payload["message"]
-            logger.info("Chat: %s: %s — sending to %d chat(s)",
+            server.log.info("Chat: %s: %s — sending to %d chat(s)",
                         player, message, bot.announce_chat_count(server))
             _send_to_chats(f"\U0001f4ac {player}: {message}")
             return
@@ -1382,7 +1391,7 @@ def make_notify_callback(bot, server):
         status = "online" if event_type == "join" else "offline"
         msg = f"{name} {verb}\nPlayers online: {count} ({names_str})"
 
-        logger.info("Notification: player %s %s — sending to %d chat(s)",
+        server.log.info("Notification: player %s %s — sending to %d chat(s)",
                     name, status, bot.announce_chat_count(server))
         _send_to_chats(msg)
 
@@ -1450,7 +1459,7 @@ def _scan_log_for_achievements(file_path: Path, date_str: str, server) -> int:
                                           server.achievements_path):
                         count += 1
                 else:
-                    logger.warning("Scan: no UUID for player %s, skipping achievement", player)
+                    server.log.warning("Scan: no UUID for player %s, skipping achievement", player)
     return count
 
 
@@ -1475,7 +1484,7 @@ def _scan_log_for_deaths(file_path: Path, date_str: str, server) -> int:
                                         server.deaths_path):
                             count += 1
                     else:
-                        logger.warning("Scan: no UUID for player %s, skipping death", player)
+                        server.log.warning("Scan: no UUID for player %s, skipping death", player)
     return count
 
 
@@ -1498,7 +1507,7 @@ def _scan_logs(scan_fn, server) -> int:
                     out_f.write(gz_f.read())
             total += scan_fn(extracted, date_str, server)
         except Exception as e:
-            logger.warning("Scan: failed to process %s: %s", gz_path.name, e)
+            server.log.warning("Scan: failed to process %s: %s", gz_path.name, e)
         finally:
             if extracted.exists():
                 extracted.unlink()
@@ -1687,18 +1696,18 @@ def _recover_online_identities(server, online_names: list) -> None:
     except FileNotFoundError:
         return
     except Exception:
-        logger.exception("Failed to scan log for online-player identities")
+        server.log.exception("Failed to scan log for online-player identities")
         return
     for name in missing:
         if name in found:
             register_player(server, found[name], name)
     recovered = [n for n in missing if n in found]
     if recovered:
-        logger.info("Recovered identity from log for %d already-online "
+        server.log.info("Recovered identity from log for %d already-online "
                     "player(s): %s", len(recovered), ", ".join(recovered))
     unresolved = [n for n in missing if n not in found]
     if unresolved:
-        logger.info("No identity in log yet for: %s (will resolve on leave)",
+        server.log.info("No identity in log yet for: %s (will resolve on leave)",
                     ", ".join(unresolved))
 
 
@@ -1723,7 +1732,7 @@ def reconcile_online(server, *, reason: str = "") -> list | None:
         try:
             actual = server.backend.query_online_players()
         except Exception as e:
-            logger.warning("Reconcile online failed%s: %s",
+            server.log.warning("Reconcile online failed%s: %s",
                            f" ({reason})" if reason else "", e)
             return None
         actual_set = set(actual)
@@ -1731,7 +1740,7 @@ def reconcile_online(server, *, reason: str = "") -> list | None:
         joined = actual_set - before
         left = before - actual_set
         if joined or left:
-            logger.info("Reconcile online%s: +%s -%s",
+            server.log.info("Reconcile online%s: +%s -%s",
                         f" ({reason})" if reason else "",
                         sorted(joined) or "none", sorted(left) or "none")
         for name in joined:
@@ -2129,7 +2138,7 @@ def register_commands(router, auth: dict) -> None:
         if not server.backup_lock.acquire(blocking=False):
             ctx.reply("A backup is already in progress.")
             return
-        logger.info("Backup: manually triggered by %s", ctx.sender_label)
+        server.log.info("Backup: manually triggered by %s", ctx.sender_label)
         ctx.reply("Starting backup...")
         say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
@@ -2138,7 +2147,7 @@ def register_commands(router, auth: dict) -> None:
                 path = server.run_backup(status_cb=say)
                 say(f"Backup complete: {Path(path).name}")
             except Exception as e:
-                logger.exception("Backup failed")
+                server.log.exception("Backup failed")
                 say(f"Backup failed: {e}")
             finally:
                 server.backup_lock.release()
@@ -2223,7 +2232,7 @@ def register_commands(router, auth: dict) -> None:
             _set_pending_player_restore(
                 pkey, stage="listed", username=canonical, uuid=uuid,
                 versions=versions, selected_n=None, page_offset=0)
-            logger.info("RestorePlayer: %s listed %d version(s) for %s",
+            server.log.info("RestorePlayer: %s listed %d version(s) for %s",
                         ctx.sender_label, len(versions), canonical)
             ctx.reply(_format_versions_reply(canonical, uuid, versions, offset=0))
             return
@@ -2239,7 +2248,7 @@ def register_commands(router, auth: dict) -> None:
                 ctx.reply(f"No more versions for {canonical}.")
                 return
             _set_pending_player_restore(pkey, page_offset=new_offset)
-            logger.info("RestorePlayer: %s paged to offset %d for %s",
+            server.log.info("RestorePlayer: %s paged to offset %d for %s",
                         ctx.sender_label, new_offset, canonical)
             ctx.reply(_format_versions_reply(canonical, uuid, versions, offset=new_offset))
             return
@@ -2265,7 +2274,7 @@ def register_commands(router, auth: dict) -> None:
                           f"Run /restore_player {canonical} again.")
                 return
             version = versions[n - 1]
-            logger.info("RestorePlayer: %s confirmed restore of %s to %s (source: %s)",
+            server.log.info("RestorePlayer: %s confirmed restore of %s to %s (source: %s)",
                         ctx.sender_label, canonical, version["timestamp"], version["source"])
             ctx.reply(f"Starting restore of {canonical} to {version['timestamp']}...")
             _clear_pending_player_restore(pkey)
@@ -2300,7 +2309,7 @@ def register_commands(router, auth: dict) -> None:
         _set_pending_player_restore(
             pkey, stage="selected", username=canonical, uuid=uuid,
             versions=versions, selected_n=n)
-        logger.info("RestorePlayer: %s selected version %d (%s) for %s",
+        server.log.info("RestorePlayer: %s selected version %d (%s) for %s",
                     ctx.sender_label, n, version["source"], canonical)
         ctx.reply(_format_confirm_reply(canonical, uuid, n, version))
     router.register("restore_player", cmd_restore_player,
