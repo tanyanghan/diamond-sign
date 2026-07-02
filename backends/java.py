@@ -49,8 +49,8 @@ class JavaBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
                     CAP_PLAYER_RESTORE, CAP_STATS}
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, migrate_legacy=False):
+        super().__init__(config, migrate_legacy)
         self.names_path = self._data_path("player_names.json")
 
     # --- availability / readiness ---

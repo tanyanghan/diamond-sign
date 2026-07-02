@@ -147,8 +147,8 @@ class BedrockBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, CAP_PLAYER_RESTORE, CAP_STATS}
     ALLOWLIST_VERB = "allowlist"  # Bedrock's name for Java's "whitelist"
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, migrate_legacy=False):
+        super().__init__(config, migrate_legacy)
         self.players_path = self._data_path("bedrock_players.json")
         self.stats_path = self._data_path("statistics.json")
         self._mux = detect(config.mux_session)

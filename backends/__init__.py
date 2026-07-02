@@ -8,18 +8,20 @@ from .base import (
 )
 
 
-def make_backend(config) -> ServerBackend:
-    """Construct the backend for ``config.edition``.
+def make_backend(config, migrate_legacy=False) -> ServerBackend:
+    """Construct the backend for ``config.edition``. ``migrate_legacy`` lets the
+    historical single-server install pull its repo-root state files into
+    ``data/<key>/`` once (see ``ServerBackend._data_path``).
 
     May raise ``BackendUnavailable`` (e.g. Bedrock with no tmux/screen session),
     which ``main()`` handles by exiting with a clear message.
     """
     if config.edition == EDITION_BEDROCK:
         from .bedrock import BedrockBackend
-        return BedrockBackend(config)
+        return BedrockBackend(config, migrate_legacy)
     if config.edition == EDITION_JAVA:
         from .java import JavaBackend
-        return JavaBackend(config)
+        return JavaBackend(config, migrate_legacy)
     raise ValueError(f"Unknown edition: {config.edition}")
 
 

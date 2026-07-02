@@ -2558,7 +2558,8 @@ def _bring_up_server(server, bot) -> bool:
     True on success; on backend failure alerts the bot's admins and returns False
     (the caller drops the server so the bot skips it)."""
     try:
-        server.backend = make_backend(server.config)
+        server.backend = make_backend(server.config,
+                                      migrate_legacy=server._migrate_legacy)
     except BackendUnavailable as e:
         logger.error("[%s] Cannot start backend (edition '%s'): %s",
                      server.config.name, server.config.edition, e)
