@@ -2189,7 +2189,12 @@ def register_commands(router, auth: dict) -> None:
     def cmd_restore_player(ctx):
         server = ctx.server
         backend = server.backend
-        pkey = f"{ctx.platform}:{ctx.user_id}"
+        # Pending state is scoped to (bot, server, platform, admin): the
+        # list -> select -> confirm sequence must not survive a /use switch (or
+        # a same-admin second bot), or the confirm would restore onto a
+        # different server with an index chosen from another server's list.
+        pkey = (f"{ctx.bot.config.name}:{server.config.key}:"
+                f"{ctx.platform}:{ctx.user_id}")
         if not ctx.args:
             ctx.reply("Usage:\n"
                       "  /restore_player <username>\n"
@@ -2675,7 +2680,10 @@ def main():
 
     # One auth.json for the whole process; each bot operates on its own slice
     # (shared dict objects, so save_auth(_AUTH_DOC) persists in-place mutations).
-    _AUTH_DOC = load_auth(_AUTH_PATH, bots_cfg)
+    # Always pass the FULL bot list (not the --only-filtered one): load_auth
+    # folds a legacy platform-level doc under the first bot, and filtering could
+    # misattribute the historical admin/chats to whichever bot --only selected.
+    _AUTH_DOC = load_auth(_AUTH_PATH, APP_CONFIG.bots)
 
     bots = []
     for bcfg in bots_cfg:
