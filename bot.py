@@ -2317,18 +2317,38 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /authorize ---
     def cmd_authorize(ctx):
+        multi = len(ctx.bot.servers) > 1
+        usage = ("Usage: /authorize <chat_id> <server>" if multi
+                 else "Usage: /authorize <chat_id>")
         if not ctx.args:
-            ctx.reply("Usage: /authorize <chat_id>")
+            ctx.reply(usage)
             return
         target_id = str(ctx.args[0]).strip()
+        # Resolve the target server: single-server bots auto-bind to the sole
+        # server; multi-server bots require an explicit <server> arg so the
+        # channel's events aren't silently misrouted.
+        if len(ctx.args) >= 2:
+            server = ctx.bot.find_server(ctx.args[1])
+            if server is None:
+                names = ", ".join(sorted(ctx.bot.by_name)) or "(none)"
+                ctx.reply(f"Unknown server '{ctx.args[1]}'.\nServers: {names}")
+                return
+        elif multi:
+            names = ", ".join(sorted(ctx.bot.by_name))
+            ctx.reply(f"{usage}\nServers: {names}")
+            return
+        else:
+            server = ctx.bot.servers[0]
         with _auth_lock:
             ns = _auth_ns(auth, ctx.platform)
             if target_id not in ns["authorized_chat_ids"]:
                 ns["authorized_chat_ids"].append(target_id)
-                save_auth(_AUTH_DOC, _AUTH_PATH)
-        logger.info("Authorize: chat %s added by %s on %s",
-                    target_id, ctx.sender_label, ctx.platform)
-        ctx.reply(f"Chat {target_id} is now authorized.")
+            ns["chat_servers"][target_id] = server.config.key
+            save_auth(_AUTH_DOC, _AUTH_PATH)
+        logger.info("Authorize: chat %s -> %s added by %s on %s",
+                    target_id, server.config.name, ctx.sender_label, ctx.platform)
+        ctx.reply(f"Chat {target_id} is now authorized for "
+                  f"{server.config.name}.")
     router.register("authorize", cmd_authorize, private_only=True,
                     admin_only=True, needs_server=False)
 
@@ -2340,11 +2360,15 @@ def register_commands(router, auth: dict) -> None:
         target_id = str(ctx.args[0]).strip()
         with _auth_lock:
             ns = _auth_ns(auth, ctx.platform)
+            was_bound = ns["chat_servers"].pop(target_id, None) is not None
             if target_id in ns["authorized_chat_ids"]:
                 ns["authorized_chat_ids"].remove(target_id)
                 save_auth(_AUTH_DOC, _AUTH_PATH)
                 logger.info("Revoke: chat %s removed by %s on %s",
                             target_id, ctx.sender_label, ctx.platform)
+                ctx.reply(f"Chat {target_id} has been revoked.")
+            elif was_bound:
+                save_auth(_AUTH_DOC, _AUTH_PATH)
                 ctx.reply(f"Chat {target_id} has been revoked.")
             else:
                 ctx.reply(f"Chat {target_id} was not authorized.")
@@ -2354,11 +2378,23 @@ def register_commands(router, auth: dict) -> None:
     # --- /listchats ---
     def cmd_listchats(ctx):
         logger.info("ListChats: requested by %s", ctx.sender_label)
-        ids = (auth.get(ctx.platform) or {}).get("authorized_chat_ids", [])
-        if ids:
-            ctx.reply("Authorized chats:\n" + "\n".join(str(i) for i in ids))
-        else:
+        ns = auth.get(ctx.platform) or {}
+        ids = ns.get("authorized_chat_ids", [])
+        if not ids:
             ctx.reply("No authorized chats.")
+            return
+        binding = ns.get("chat_servers", {})
+        multi = len(ctx.bot.servers) > 1
+        lines = ["Authorized chats:"]
+        for cid in ids:
+            key = binding.get(cid)
+            if multi:
+                srv = ctx.bot.by_key.get(key)
+                label = srv.config.name if srv else (key or "(unbound)")
+                lines.append(f"  {cid} -> {label}")
+            else:
+                lines.append(f"  {cid}")
+        ctx.reply("\n".join(lines))
     router.register("listchats", cmd_listchats, private_only=True,
                     admin_only=True, needs_server=False)
 
