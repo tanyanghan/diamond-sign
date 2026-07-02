@@ -2541,6 +2541,13 @@ def _start_scheduled_backup(server, bot) -> None:
                                server.config.name)
                 continue
 
+            # Same exclusivity as /backup and the incremental cycle: never
+            # overlap another backup's save-hold on this server.
+            if not server.backup_lock.acquire(blocking=False):
+                logger.warning("[%s] Scheduled backup skipped: another backup "
+                               "is in progress", server.config.name)
+                continue
+
             logger.info("[%s] Scheduled %s backup starting",
                         server.config.name, schedule)
 
@@ -2553,6 +2560,8 @@ def _start_scheduled_backup(server, bot) -> None:
             except Exception as e:
                 logger.exception("[%s] Scheduled backup failed", server.config.name)
                 status_cb(f"Failed: {e}")
+            finally:
+                server.backup_lock.release()
 
     threading.Thread(target=_loop, daemon=True,
                      name=f"backup-{server.config.key}").start()
