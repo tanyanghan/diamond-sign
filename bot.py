@@ -16,7 +16,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from utils.backup_utils import (
-    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, RE_FULL, RE_INCR,
+    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, META_FILES, RE_FULL, RE_INCR,
     build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
 )
 from utils.config import (
@@ -511,9 +511,14 @@ class Server:
                     except ValueError:
                         pass
                     for fn in filenames:
-                        # Chain marker (new + legacy) and bot infrastructure are
-                        # not server data
+                        # Chain marker (new + legacy), backup-format entries
+                        # (META_FILES — the sidecar/meta/deletions the bot writes
+                        # into the zip itself), and bot infrastructure are not
+                        # server data. Skipping META_FILES avoids a "Duplicate
+                        # name" if a copy lingers in the world dir (e.g. from a
+                        # restore extraction).
                         if fn in (CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY) \
+                                or fn in META_FILES \
                                 or fn in self.backup_exclude_names:
                             continue
                         fp = dp / fn

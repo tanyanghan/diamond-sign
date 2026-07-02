@@ -114,6 +114,11 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None,
 
     Skips:
     - CHAIN_MARKER_NAME: backup metadata, not server data
+    - META_FILES (_meta.json / _deletions.json / _players.json): backup-format
+      entries the bot writes into each zip. If a copy of one lingers in the
+      world dir (e.g. extracted by a restore), it must not be treated as world
+      data — otherwise the backup zips it AND re-writes it (a "Duplicate name"
+      warning) and it shows as perpetually changed in incrementals.
     - Any basename in exclude_names: bot infrastructure that lives in the
       server directory but isn't server data (e.g. the Bedrock console.log
       the bot tails). Must match the set excluded from the backup zips, or
@@ -121,7 +126,8 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None,
     - Anything under backup_dir: if the backup output directory happens to
       be inside the server directory, we don't want to back up backups
     """
-    skip = {CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY} | (exclude_names or set())
+    skip = ({CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY} | META_FILES
+            | (exclude_names or set()))
     backup_dir_resolved = backup_dir.resolve() if backup_dir else None
     files = {}
     for dirpath, _dirnames, filenames in os.walk(root_dir):
