@@ -745,12 +745,6 @@ class Server:
 
 SERVER = Server(SERVER_CONFIG, migrate_legacy=True)
 
-# Single-instance shim: the remaining module-level call sites (in main() and
-# register_commands, retargeted to ctx.server in step 6d) use these aliases; the
-# event path now threads the resolved Server object through instead.
-player_join = SERVER.player_join
-get_online_players = SERVER.get_online_players
-
 
 class Bot:
     """One chat identity (its Telegram bot and/or Slack app) fronting a set of
@@ -1515,7 +1509,6 @@ def _scan_logs(scan_fn, server) -> int:
 # ---------------------------------------------------------------------------
 # 7d. RCON & Backup
 # ---------------------------------------------------------------------------
-_backup_lock = SERVER.backup_lock  # alias to the single server's lock (see Server)
 _watcher_ref: LogWatcher | None = None
 
 # Chat adapters, the router, and the auth slice now live on the single Bot (see
@@ -1559,20 +1552,6 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
     zf.write(fp, rel)
 
 
-# Bedrock per-player sidecar / identity-learning helpers now live on Server
-# (see the class body). The single-server call sites use these aliases; the
-# multi-server steps thread the resolved Server through instead.
-_load_player_state = SERVER.load_player_state
-_save_player_state = SERVER.save_player_state
-_maybe_learn_player = SERVER.maybe_learn_player
-_write_player_sidecar = SERVER.write_player_sidecar
-
-
-# run_backup now lives on Server (see the class body); this alias keeps the
-# single-server call sites unchanged.
-run_backup = SERVER.run_backup
-
-
 # ---------------------------------------------------------------------------
 # 7e. Incremental Backup
 # ---------------------------------------------------------------------------
@@ -1610,15 +1589,6 @@ def _diff_manifest(old: dict, new: dict) -> tuple:
             changed.append(path)
     deleted = [path for path in old if path not in new]
     return changed, deleted
-
-
-# Manifest + chain-marker helpers now live on Server (see the class body). The
-# single-server call sites use these aliases; multi-server steps thread the
-# resolved Server through instead.
-_load_manifest = SERVER.load_manifest
-_save_manifest = SERVER.save_manifest
-_write_chain_marker = SERVER.write_chain_marker
-_read_chain_marker = SERVER.read_chain_marker
 
 
 # ---------------------------------------------------------------------------
@@ -1694,15 +1664,6 @@ def _set_pending_player_restore(user_id: int, **fields) -> None:
 def _clear_pending_player_restore(user_id: int) -> None:
     with _pending_player_lock:
         _pending_player_restore.pop(user_id, None)
-
-
-# run_incremental_backup and the incremental cycle now live on Server (see the
-# class body). These aliases keep the single-server call sites unchanged; the
-# multi-server steps thread the resolved Server through instead.
-run_incremental_backup = SERVER.run_incremental_backup
-_incremental_cycle = SERVER._incremental_cycle
-_start_incremental_cycle = SERVER.start_incremental_cycle
-_stop_incremental_cycle = SERVER.stop_incremental_cycle
 
 
 def _recover_online_identities(server, online_names: list) -> None:
@@ -1901,45 +1862,49 @@ def is_authorized(platform: str, chat_id, user_id, is_private: bool,
 # ---------------------------------------------------------------------------
 # 9. Bot Commands
 # ---------------------------------------------------------------------------
-def register_commands(router, auth: dict, names: dict,
-                      achievements: dict, deaths: dict) -> None:
+def register_commands(router, auth: dict) -> None:
     """Register every command on the platform-agnostic router. Handlers take a
-    Context and reply via it, so the same logic serves any chat platform."""
+    Context and reply via it, so the same logic serves any chat platform. Each
+    server-scoped handler acts on ``ctx.server`` (set by the router's resolve
+    hook) — its backend, name registry, achievements, and deaths."""
 
     # --- /start, /help ---
     def cmd_help(ctx):
         logger.info("Help: requested by %s", ctx.sender_label)
+        backend = ctx.server.backend
         lines = [
             "Available commands:",
             f"{ctx.adapter.command_label('status')} — show online players",
             "/list — list all known players",
         ]
-        if BACKEND.supports(CAP_STATS):
+        if backend.supports(CAP_STATS):
             lines += [
                 "/stats [player] — player statistics",
                 "/playtime — playtime leaderboard",
             ]
-        if BACKEND.supports(EVENT_ACHIEVEMENT):
+        if backend.supports(EVENT_ACHIEVEMENT):
             lines.append("/achievements [player] — player achievements")
-        if BACKEND.supports(EVENT_DEATH):
+        if backend.supports(EVENT_DEATH):
             lines += [
                 "/deaths [player] — death history",
                 "/death_summary — deaths grouped by cause",
             ]
         lines.append("/chat_id — show this chat's ID")
         if ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth):
+            if len(ctx.bot.servers) > 1:
+                lines.append("/use <server> — pick the server your commands act on")
             lines += [
                 "/authorize <chat_id> — whitelist a chat",
                 "/revoke <chat_id> — remove a chat from whitelist",
                 "/listchats — list authorized chats",
             ]
-            if BACKEND.supports(EVENT_ACHIEVEMENT):
+            if backend.supports(EVENT_ACHIEVEMENT):
                 lines.append("/scan_achievements — scan all logs for achievements")
-            if BACKEND.supports(EVENT_DEATH):
+            if backend.supports(EVENT_DEATH):
                 lines.append("/scan_deaths — scan all logs for deaths")
             lines.append("/backup — trigger a server backup now")
             lines.append(f"/allowlist <on|off|add|remove|list|reload> [player] "
-                         f"— server {BACKEND.ALLOWLIST_VERB}")
+                         f"— server {backend.ALLOWLIST_VERB}")
         ctx.reply("\n".join(lines))
     router.register(["start", "help"], cmd_help)
 
@@ -1948,10 +1913,10 @@ def register_commands(router, auth: dict, names: dict,
         logger.info("Status: requested by %s", ctx.sender_label)
         # Query the server live (and reconcile the in-memory set) so the answer
         # reflects reality, not just what the bot last parsed from the log.
-        online = reconcile_online(SERVER, reason="/status")
+        online = reconcile_online(ctx.server, reason="/status")
         suffix = ""
         if online is None:  # server unreachable — fall back to last-known set
-            online = get_online_players()
+            online = ctx.server.get_online_players()
             suffix = " (server unreachable; last known)"
         if online:
             reply = f"Players online: {len(online)} ({', '.join(online)}){suffix}"
@@ -1963,10 +1928,10 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /stats ---
     def cmd_stats(ctx):
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
         target = ctx.args[0].lower() if ctx.args else None
         logger.info("Stats: requested by %s (player=%s)", ctx.sender_label, target or "all")
-        all_stats = BACKEND.player_stats(names)
+        all_stats = ctx.server.backend.player_stats(ctx.server.names)
         if not all_stats:
             ctx.reply("No player statistics recorded yet.")
             return
@@ -1979,28 +1944,30 @@ def register_commands(router, auth: dict, names: dict,
         else:
             lines = [_format_stats(p) for p in sorted(all_stats, key=lambda p: p["name"].lower())]
             ctx.reply("\n\n".join(lines))
-    router.register("stats", cmd_stats, cap=lambda: BACKEND.supports(CAP_STATS),
+    router.register("stats", cmd_stats,
+                    cap=lambda ctx: ctx.server.backend.supports(CAP_STATS),
                     cap_message="Player statistics are not available on this server edition.")
 
     # --- /playtime ---
     def cmd_playtime(ctx):
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
         logger.info("Playtime: requested by %s", ctx.sender_label)
-        all_stats = BACKEND.player_stats(names)
+        all_stats = ctx.server.backend.player_stats(ctx.server.names)
         if not all_stats:
             ctx.reply("No player statistics recorded yet.")
             return
         ranked = sorted(all_stats, key=lambda p: p["time_played_hours"], reverse=True)
         lines = [f"{i+1}. {p['name']} — {p['time_played_hours']}h" for i, p in enumerate(ranked)]
         ctx.reply("Playtime leaderboard:\n" + "\n".join(lines))
-    router.register("playtime", cmd_playtime, cap=lambda: BACKEND.supports(CAP_STATS),
+    router.register("playtime", cmd_playtime,
+                    cap=lambda ctx: ctx.server.backend.supports(CAP_STATS),
                     cap_message="Playtime is not available on this server edition.")
 
     # --- /list ---
     def cmd_list(ctx):
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
         logger.info("List: requested by %s", ctx.sender_label)
-        entries = BACKEND.list_known_players(names)
+        entries = ctx.server.backend.list_known_players(ctx.server.names)
         if not entries:
             ctx.reply("No players found.")
             logger.info("List: replied to %s — no known players", ctx.sender_label)
@@ -2012,7 +1979,9 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /achievements ---
     def cmd_achievements(ctx):
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
+        names = ctx.server.names
+        achievements = ctx.server.achievements
         target = ctx.args[0].lower() if ctx.args else None
         logger.info("Achievements: requested by %s (player=%s)", ctx.sender_label, target or "all")
         if not achievements:
@@ -2044,25 +2013,27 @@ def register_commands(router, auth: dict, names: dict,
                 lines.append(f"{names.get(uuid, uuid)}: {len(entries)} achievement(s)")
             ctx.reply("Achievements summary:\n" + "\n".join(lines))
     router.register("achievements", cmd_achievements,
-                    cap=lambda: BACKEND.supports(EVENT_ACHIEVEMENT),
+                    cap=lambda ctx: ctx.server.backend.supports(EVENT_ACHIEVEMENT),
                     cap_message="Achievements are not tracked on this server edition.")
 
     # --- /scan_achievements ---
     def cmd_scan_achievements(ctx):
         logger.info("ScanAchievements: requested by %s", ctx.sender_label)
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
         ctx.reply("Scanning log files for achievements...")
-        total = _scan_logs(_scan_log_for_achievements, SERVER)
+        total = _scan_logs(_scan_log_for_achievements, ctx.server)
         ctx.reply(f"Scan complete. {total} new achievement(s) recorded.")
         logger.info("ScanAchievements: %d new achievement(s) found", total)
     router.register("scan_achievements", cmd_scan_achievements,
                     private_only=True, admin_only=True,
-                    cap=lambda: BACKEND.supports(EVENT_ACHIEVEMENT),
+                    cap=lambda ctx: ctx.server.backend.supports(EVENT_ACHIEVEMENT),
                     cap_message="Achievements are not tracked on this server edition.")
 
     # --- /deaths ---
     def cmd_deaths(ctx):
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
+        names = ctx.server.names
+        deaths = ctx.server.deaths
         target = ctx.args[0].lower() if ctx.args else None
         logger.info("Deaths: requested by %s (player=%s)", ctx.sender_label, target or "all")
         if not deaths:
@@ -2095,12 +2066,15 @@ def register_commands(router, auth: dict, names: dict,
             for player_name, count in ranked:
                 lines.append(f"  {player_name}: {count} death(s)")
             ctx.reply("\n".join(lines), monospace=True)
-    router.register("deaths", cmd_deaths, cap=lambda: BACKEND.supports(EVENT_DEATH),
+    router.register("deaths", cmd_deaths,
+                    cap=lambda ctx: ctx.server.backend.supports(EVENT_DEATH),
                     cap_message="Deaths are not tracked on this server edition.")
 
     # --- /death_summary ---
     def cmd_death_summary(ctx):
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
+        names = ctx.server.names
+        deaths = ctx.server.deaths
         logger.info("DeathSummary: requested by %s", ctx.sender_label)
         if not deaths:
             ctx.reply("No deaths recorded yet.")
@@ -2132,25 +2106,26 @@ def register_commands(router, auth: dict, names: dict,
             lines.append("")
         ctx.reply("\n".join(lines).rstrip(), monospace=True)
     router.register("death_summary", cmd_death_summary,
-                    cap=lambda: BACKEND.supports(EVENT_DEATH),
+                    cap=lambda ctx: ctx.server.backend.supports(EVENT_DEATH),
                     cap_message="Deaths are not tracked on this server edition.")
 
     # --- /scan_deaths ---
     def cmd_scan_deaths(ctx):
         logger.info("ScanDeaths: requested by %s", ctx.sender_label)
-        refresh_player_names(SERVER)
+        refresh_player_names(ctx.server)
         ctx.reply("Scanning log files for deaths...")
-        total = _scan_logs(_scan_log_for_deaths, SERVER)
+        total = _scan_logs(_scan_log_for_deaths, ctx.server)
         ctx.reply(f"Scan complete. {total} new death(s) recorded.")
         logger.info("ScanDeaths: %d new death(s) found", total)
     router.register("scan_deaths", cmd_scan_deaths,
                     private_only=True, admin_only=True,
-                    cap=lambda: BACKEND.supports(EVENT_DEATH),
+                    cap=lambda ctx: ctx.server.backend.supports(EVENT_DEATH),
                     cap_message="Deaths are not tracked on this server edition.")
 
     # --- /backup ---
     def cmd_backup(ctx):
-        if not _backup_lock.acquire(blocking=False):
+        server = ctx.server
+        if not server.backup_lock.acquire(blocking=False):
             ctx.reply("A backup is already in progress.")
             return
         logger.info("Backup: manually triggered by %s", ctx.sender_label)
@@ -2159,13 +2134,13 @@ def register_commands(router, auth: dict, names: dict,
 
         def run():
             try:
-                path = run_backup(status_cb=say)
+                path = server.run_backup(status_cb=say)
                 say(f"Backup complete: {Path(path).name}")
             except Exception as e:
                 logger.exception("Backup failed")
                 say(f"Backup failed: {e}")
             finally:
-                _backup_lock.release()
+                server.backup_lock.release()
 
         threading.Thread(target=run, daemon=True).start()
     router.register("backup", cmd_backup, private_only=True, admin_only=True)
@@ -2174,7 +2149,8 @@ def register_commands(router, auth: dict, names: dict,
     _ALLOWLIST_SUBS = {"on", "off", "add", "remove", "list", "reload"}
 
     def cmd_allowlist(ctx):
-        verb = BACKEND.ALLOWLIST_VERB
+        backend = ctx.server.backend
+        verb = backend.ALLOWLIST_VERB
         usage = (f"Usage: /allowlist <on|off|add|remove|list|reload> [player]\n"
                  f"(runs the server '{verb}' command)")
         if not ctx.args:
@@ -2187,7 +2163,7 @@ def register_commands(router, auth: dict, names: dict,
         if sub in ("add", "remove") and len(ctx.args) < 2:
             ctx.reply(f"Usage: /allowlist {sub} <player>")
             return
-        if not BACKEND.is_available():
+        if not backend.is_available():
             ctx.reply("Server is not reachable right now — try again once it's up.")
             return
         logger.info("Allowlist: %s ran '%s %s'", ctx.sender_label, verb,
@@ -2196,7 +2172,7 @@ def register_commands(router, auth: dict, names: dict,
         # Run in a thread: Bedrock capture polls the log for up to a few seconds.
         def run():
             try:
-                resp = BACKEND.allowlist_command(ctx.args)
+                resp = backend.allowlist_command(ctx.args)
             except Exception as e:
                 logger.exception("Allowlist command failed")
                 ctx.adapter.send(ctx.chat_id, f"{verb} command failed: {e}")
@@ -2210,6 +2186,8 @@ def register_commands(router, auth: dict, names: dict,
 
     # --- /restore_player ---
     def cmd_restore_player(ctx):
+        server = ctx.server
+        backend = server.backend
         pkey = f"{ctx.platform}:{ctx.user_id}"
         if not ctx.args:
             ctx.reply("Usage:\n"
@@ -2224,14 +2202,14 @@ def register_commands(router, auth: dict, names: dict,
         if typed_confirm is not None and typed_confirm.lower() != "confirm":
             ctx.reply(f"Unexpected argument: '{typed_confirm}' (did you mean 'confirm'?)")
             return
-        resolved = BACKEND.resolve_player(typed_name, names)
+        resolved = backend.resolve_player(typed_name, server.names)
         if resolved is None:
             ctx.reply(f"Unknown player: {typed_name}")
             return
         canonical, uuid = resolved
 
         if typed_n is None:
-            versions = BACKEND.list_player_versions(uuid, _load_manifest()[:2])
+            versions = backend.list_player_versions(uuid, server.load_manifest()[:2])
             if not versions:
                 _clear_pending_player_restore(pkey)
                 ctx.reply(_format_versions_reply(canonical, uuid, versions))
@@ -2273,7 +2251,7 @@ def register_commands(router, auth: dict, names: dict,
                 ctx.reply(f"You must select a timestamp first with "
                           f"/restore_player {canonical} {n}")
                 return
-            versions = BACKEND.list_player_versions(uuid, _load_manifest()[:2])
+            versions = backend.list_player_versions(uuid, server.load_manifest()[:2])
             if not (1 <= n <= len(versions)):
                 _clear_pending_player_restore(pkey)
                 ctx.reply(f"Selection {n} is no longer valid (only "
@@ -2288,18 +2266,18 @@ def register_commands(router, auth: dict, names: dict,
             say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
             def run():
-                if not _backup_lock.acquire(blocking=False):
+                if not server.backup_lock.acquire(blocking=False):
                     say("A backup or restore is in progress.")
                     return
                 try:
-                    BACKEND.restore_player(canonical, uuid, version, say)
+                    backend.restore_player(canonical, uuid, version, say)
                     # A Bedrock restore restarts the server (stop -> edit ->
                     # start), kicking everyone with no "disconnect" lines, so the
                     # in-memory online set would be left stale. Resync it against
                     # the freshly-restarted server (no-op on Java — no restart).
-                    reconcile_online(SERVER, reason="after restore")
+                    reconcile_online(server, reason="after restore")
                 finally:
-                    _backup_lock.release()
+                    server.backup_lock.release()
 
             threading.Thread(target=run, daemon=True).start()
             return
@@ -2321,7 +2299,7 @@ def register_commands(router, auth: dict, names: dict,
         ctx.reply(_format_confirm_reply(canonical, uuid, n, version))
     router.register("restore_player", cmd_restore_player,
                     private_only=True, admin_only=True,
-                    cap=lambda: BACKEND.supports(CAP_PLAYER_RESTORE),
+                    cap=lambda ctx: ctx.server.backend.supports(CAP_PLAYER_RESTORE),
                     cap_message="Per-player restore is not available on this server edition.")
 
     # --- /chat_id (public — lets an unauthorized chat learn its ID) ---
@@ -2439,9 +2417,6 @@ def main():
     # Load this server's player registry, achievements, and deaths (registry is
     # backend-sourced, so this follows backend construction).
     SERVER.load_state()
-    names = SERVER.names
-    achievements = SERVER.achievements
-    deaths = SERVER.deaths
 
     # Command router shared by all adapters; replies go to the originating chat.
     # bot + resolve give handlers ctx.bot and (for server-scoped commands) the
@@ -2457,7 +2432,7 @@ def main():
         resolve=BOT.resolve_command,
     )
     BOT.router = router
-    register_commands(router, auth, names, achievements, deaths)
+    register_commands(router, auth)
 
     notify = make_notify_callback(BOT, SERVER)
     watcher = LogWatcher(LOG_PATH, SERVER, notify,
@@ -2499,8 +2474,8 @@ def main():
             # join event predates this bot run).
             BACKEND.reset_open_sessions()
             for name in online:
-                player_join(name)
-            current = get_online_players()
+                SERVER.player_join(name)
+            current = SERVER.get_online_players()
             if current:
                 logger.info("%d player(s) already online: %s",
                             len(current), ", ".join(current))
@@ -2509,12 +2484,12 @@ def main():
                 # them properly (Bedrock; no-op on Java).
                 _recover_online_identities(SERVER, current)
                 for name in current:
-                    pid = _uuid_by_name(name, names)
+                    pid = _uuid_by_name(name, SERVER.names)
                     if pid:
                         BACKEND.record_player_session("join", pid)
                 # The join notify callback never fired for these players, so
                 # start the incremental backup cycle here.
-                _start_incremental_cycle()
+                SERVER.start_incremental_cycle()
             else:
                 logger.info("No players online")
         else:
@@ -2527,9 +2502,9 @@ def main():
                 "Backups and /list will not work until the server is up.")
 
     # Validate incremental backup chain
-    chain_id, base_full, _ = _load_manifest()
+    chain_id, base_full, _ = SERVER.load_manifest()
     if chain_id:
-        marker = _read_chain_marker()
+        marker = SERVER.read_chain_marker()
         if marker == chain_id:
             logger.info("Backup chain %s valid (base: %s)", chain_id, base_full)
         else:
@@ -2537,7 +2512,7 @@ def main():
                           "marker %s. Incremental backups will be skipped until "
                           "a full backup is run.", chain_id, marker or "(missing)")
             # Clear chain_id so incrementals are skipped
-            _save_manifest({}, chain_id="", base_full="")
+            SERVER.save_manifest({}, chain_id="", base_full="")
     else:
         logger.info("No backup chain established. Run /backup to start one.")
 
@@ -2591,7 +2566,7 @@ def main():
                 _alert_admins(f"[Backup] {msg}")
 
             try:
-                path = run_backup(status_cb=status_cb)
+                path = SERVER.run_backup(status_cb=status_cb)
                 status_cb(f"Complete: {Path(path).name}")
             except Exception as e:
                 logger.exception("Scheduled backup failed")

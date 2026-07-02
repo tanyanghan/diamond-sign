@@ -158,7 +158,7 @@ class CommandRouter:
         if spec["needs_server"] and self._resolve is not None:
             if not self._resolve(ctx):
                 return
-        if spec["cap"] is not None and not spec["cap"]():
+        if spec["cap"] is not None and not spec["cap"](ctx):
             if spec["cap_message"]:
                 ctx.reply(spec["cap_message"])
             return
