@@ -1,3 +1,4 @@
+import argparse
 import gzip
 import json
 import logging
@@ -40,19 +41,10 @@ except ConfigError as e:
     print(f"\n{e}\n", file=sys.stderr)
     sys.exit(1)
 
-# Step-1 shim: this refactor still drives a single bot + single server. The
-# module-level helpers and main() read BOT_CONFIG / SERVER_CONFIG; later steps
-# move per-server/per-bot state onto Server/Bot objects and loop over all of
-# them. ``CONFIG`` aliases the single ServerConfig so existing CONFIG.<field>
-# reads (all server-level) keep working unchanged.
-BOT_CONFIG = APP_CONFIG.bots[0]
-SERVER_CONFIG = BOT_CONFIG.servers[0]
-CONFIG = SERVER_CONFIG
-
-LOG_PATH = SERVER_CONFIG.log_path              # Java: logs/latest.log; Bedrock: console.log
-
-# Server backend (Java RCON / Bedrock mux). Constructed in main().
-BACKEND = None
+# main() builds a Server per server-config and a Bot per bot-config from
+# APP_CONFIG and loops over all of them (see main / _bring_up_*). No module-level
+# server/bot/backend singletons — every instance carries its own config, backend,
+# and state.
 
 # Per-server state lives under data/<server-name>/ so multiple servers in one
 # process never collide. (auth.json stays at the repo root — it's per-bot, not
@@ -208,6 +200,8 @@ class Server:
     def __init__(self, config, migrate_legacy=False):
         self.config = config
         self.backend = None  # set in main() after make_backend
+        self.watcher = None  # LogWatcher, set when the server is brought up
+        self.observer = None  # watchdog Observer, stopped on shutdown
         # Only the historical single-server install has state at the repo root;
         # that server migrates it into data/<key>/ once. Additional servers in a
         # multi-server config start clean and never pull from the root.
@@ -743,9 +737,6 @@ class Server:
             threading.Thread(target=self.run_incremental_backup, daemon=True).start()
 
 
-SERVER = Server(SERVER_CONFIG, migrate_legacy=True)
-
-
 class Bot:
     """One chat identity (its Telegram bot and/or Slack app) fronting a set of
     servers. Owns the adapters, the command router, and this bot's slice of the
@@ -769,6 +760,13 @@ class Bot:
         self.router = None
         self.auth_doc: dict = {}   # whole {bot: {platform: ns}} doc (for saves)
         self.auth: dict = {}       # this bot's slice: {platform: ns}
+
+    def drop_server(self, server) -> None:
+        """Remove a server from this bot (e.g. its backend failed to start), so
+        resolution and announcements ignore it."""
+        self.servers = [s for s in self.servers if s is not server]
+        self.by_name.pop(server.config.name, None)
+        self.by_key.pop(server.config.key, None)
 
     def find_server(self, token: str):
         """Resolve a user-typed server token (its name or data key) to a Server,
@@ -870,9 +868,6 @@ class Bot:
                     adapter.send(admin, msg)
                 except Exception:
                     logger.warning("Failed to alert %s admin", adapter.name)
-
-
-BOT = Bot(BOT_CONFIG, [SERVER])
 
 
 # ---------------------------------------------------------------------------
@@ -1509,13 +1504,6 @@ def _scan_logs(scan_fn, server) -> int:
 # ---------------------------------------------------------------------------
 # 7d. RCON & Backup
 # ---------------------------------------------------------------------------
-_watcher_ref: LogWatcher | None = None
-
-# Chat adapters, the router, and the auth slice now live on the single Bot (see
-# the Bot class); announcements/alerts are Bot methods. This alias keeps the
-# operational-alert call sites (startup failures, scheduled-backup status)
-# unchanged.
-_alert_admins = BOT.alert_admins
 
 # /restore_player pending-state, keyed by admin user_id.
 # Forces the admin through the list -> select -> confirm sequence so a typo
@@ -1764,10 +1752,10 @@ def reconcile_online(server, *, reason: str = "") -> list | None:
 _AUTH_PATH = Path(__file__).parent / "auth.json"
 _auth_lock = threading.Lock()
 
-# The whole bot-namespaced auth doc ({bot_name: {platform: ns}}), set in main().
-# `BOT.auth` is this bot's slice — the {platform: ns} value for BOT_CONFIG.name,
-# sharing the same dict objects — so mutating the slice and persisting the doc
-# (save_auth(_AUTH_DOC)) stay consistent.
+# The whole bot-namespaced auth doc ({bot_name: {platform: ns}}) for the process,
+# set in main(). Each Bot's `auth` is its own slice (the {platform: ns} value for
+# its name), sharing the same dict objects — so mutating a bot's slice and
+# persisting the doc (save_auth(_AUTH_DOC)) stay consistent.
 _AUTH_DOC: dict = {}
 
 
@@ -2428,42 +2416,183 @@ def _make_unclaimed_handler(auth: dict):
 # ---------------------------------------------------------------------------
 # 10. Main
 # ---------------------------------------------------------------------------
-def main():
-    setup_logging(Path(__file__).parent / "logs")
-
-    global _watcher_ref, BACKEND, _AUTH_DOC
-    # Load the whole bot-namespaced auth doc; this bot operates on its own slice
-    # (the {platform: ns} value for its name), which shares dict objects with the
-    # doc so save_auth(_AUTH_DOC) persists in-place mutations.
-    _AUTH_DOC = load_auth(_AUTH_PATH, [BOT_CONFIG])
-    auth = _AUTH_DOC[BOT_CONFIG.name]
-    BOT.auth_doc = _AUTH_DOC
-    BOT.auth = auth
-
-    # Build the chat adapters (Telegram, Slack, …). They're constructed now but
-    # only started later, after the backend and command router are ready.
-    BOT.adapters = make_adapters(BOT_CONFIG)
-    logger.info("Chat platforms: %s", ", ".join(a.name for a in BOT.adapters))
-
-    # Construct the edition-specific backend — the name registry is sourced from
-    # it. Bedrock raises BackendUnavailable if no tmux/screen session is hosting
-    # the server — exit gracefully (alerting each platform's admin).
-    try:
-        BACKEND = make_backend(CONFIG)
-    except BackendUnavailable as e:
-        logger.error("Cannot start backend for edition '%s': %s", CONFIG.edition, e)
-        _alert_admins(f"⚠️ Diamond Sign cannot start: {e}")
+def _capture_initial_online(server, bot) -> None:
+    """On startup, capture players already online (the bot may have restarted
+    mid-session) and open their online-time sessions. Alerts the bot's admins if
+    the server can't be reached at all."""
+    backend = server.backend
+    if not backend.is_available(log_warnings=True):
         return
-    SERVER.backend = BACKEND  # the single server owns its backend (same object)
-    logger.info("Server edition: %s", CONFIG.edition)
+    online = None
+    try:
+        online = backend.query_online_players()
+    except Exception as e:
+        logger.warning("[%s] Online query failed, server may still be starting: %s",
+                       server.config.name, e)
+        if backend.wait_for_ready(timeout=120):
+            logger.info("[%s] Server is now ready, retrying online query",
+                        server.config.name)
+            try:
+                online = backend.query_online_players()
+            except Exception as e2:
+                logger.warning("[%s] Online query retry failed: %s",
+                               server.config.name, e2)
 
-    # Load this server's player registry, achievements, and deaths (registry is
-    # backend-sourced, so this follows backend construction).
-    SERVER.load_state()
+    if online is None:
+        # Never connected — server is likely not running. Alert the bot's admins.
+        logger.error("[%s] Could not connect to the Minecraft server. "
+                     "Server may not be running.", server.config.name)
+        bot.alert_admins(
+            f"⚠️ Could not connect to {server.config.name}.\n"
+            "The server may not be running or not ready yet.\n"
+            "Backups and /list will not work until the server is up.")
+        return
 
-    # Command router shared by all adapters; replies go to the originating chat.
-    # bot + resolve give handlers ctx.bot and (for server-scoped commands) the
-    # resolved ctx.server.
+    # Online-time bookkeeping: clear any sessions left open by a prior crash, then
+    # open a session for each currently-online player (their join predates us).
+    backend.reset_open_sessions()
+    for name in online:
+        server.player_join(name)
+    current = server.get_online_players()
+    if not current:
+        logger.info("[%s] No players online", server.config.name)
+        return
+    logger.info("[%s] %d player(s) already online: %s", server.config.name,
+                len(current), ", ".join(current))
+    # The bot missed these players' connect lines (started mid-session), so
+    # recover their xuids from the log to register them (Bedrock; no-op on Java).
+    _recover_online_identities(server, current)
+    for name in current:
+        pid = _uuid_by_name(name, server.names)
+        if pid:
+            backend.record_player_session("join", pid)
+    # The join notify callback never fired for these players, so start the cycle.
+    server.start_incremental_cycle()
+
+
+def _validate_chain(server) -> None:
+    """Validate the incremental backup chain against the on-disk marker; clear a
+    stale chain so incrementals are skipped until the next full backup."""
+    chain_id, base_full, _ = server.load_manifest()
+    if not chain_id:
+        logger.info("[%s] No backup chain established. Run /backup to start one.",
+                    server.config.name)
+        return
+    marker = server.read_chain_marker()
+    if marker == chain_id:
+        logger.info("[%s] Backup chain %s valid (base: %s)",
+                    server.config.name, chain_id, base_full)
+    else:
+        logger.warning("[%s] Backup chain invalid: manifest chain %s does not "
+                       "match marker %s. Incremental backups will be skipped "
+                       "until a full backup is run.",
+                       server.config.name, chain_id, marker or "(missing)")
+        server.save_manifest({}, chain_id="", base_full="")
+
+
+def _start_scheduled_backup(server, bot) -> None:
+    """Start the per-server scheduled full-backup thread. Status is reported to
+    the owning bot's admins."""
+    hour = server.config.backup_hour
+    schedule = server.config.backup_schedule
+
+    def _next_backup_time(now: datetime) -> datetime:
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if schedule == "weekly":
+            days_ahead = (7 - now.weekday()) % 7  # Monday = 0
+            target = target + timedelta(days=days_ahead)
+            if target <= now:
+                target = target + timedelta(weeks=1)
+        elif schedule == "monthly":
+            target = target.replace(day=1)
+            if target <= now:
+                if now.month == 12:
+                    target = target.replace(year=now.year + 1, month=1)
+                else:
+                    target = target.replace(month=now.month + 1)
+        else:  # daily (default)
+            if target <= now:
+                target = target + timedelta(days=1)
+        return target
+
+    def _loop():
+        while True:
+            now = datetime.now()
+            target = _next_backup_time(now)
+            wait = (target - now).total_seconds()
+            logger.info("[%s] Next %s backup in %.0f seconds (at %s)",
+                        server.config.name, schedule, wait,
+                        target.strftime("%Y-%m-%d %H:%M"))
+            time.sleep(wait)
+
+            if not server.backend.is_available():
+                logger.warning("[%s] Scheduled backup skipped: backend not available",
+                               server.config.name)
+                continue
+
+            logger.info("[%s] Scheduled %s backup starting",
+                        server.config.name, schedule)
+
+            def status_cb(msg):
+                bot.alert_admins(f"[Backup {server.config.name}] {msg}")
+
+            try:
+                path = server.run_backup(status_cb=status_cb)
+                status_cb(f"Complete: {Path(path).name}")
+            except Exception as e:
+                logger.exception("[%s] Scheduled backup failed", server.config.name)
+                status_cb(f"Failed: {e}")
+
+    threading.Thread(target=_loop, daemon=True,
+                     name=f"backup-{server.config.key}").start()
+
+
+def _bring_up_server(server, bot) -> bool:
+    """Construct one server's backend and start watching + backing it up. Returns
+    True on success; on backend failure alerts the bot's admins and returns False
+    (the caller drops the server so the bot skips it)."""
+    try:
+        server.backend = make_backend(server.config)
+    except BackendUnavailable as e:
+        logger.error("[%s] Cannot start backend (edition '%s'): %s",
+                     server.config.name, server.config.edition, e)
+        bot.alert_admins(f"⚠️ Diamond Sign cannot start "
+                         f"{server.config.name}: {e}")
+        return False
+    logger.info("[%s] Server edition: %s", server.config.name, server.config.edition)
+
+    # Player registry, achievements, deaths (registry is backend-sourced).
+    server.load_state()
+
+    notify = make_notify_callback(bot, server)
+    log_path = server.config.log_path
+    watcher = LogWatcher(log_path, server, notify,
+                         on_server_start=lambda: reconcile_online(
+                             server, reason="server start"))
+    server.watcher = watcher
+    server.backend.attach_watcher(watcher)
+    observer = Observer()
+    observer.schedule(watcher, path=str(log_path.parent), recursive=False)
+    observer.start()
+    server.observer = observer
+    logger.info("[%s] Watching %s for join/leave events",
+                server.config.name, log_path)
+
+    _capture_initial_online(server, bot)
+    _validate_chain(server)
+    _start_scheduled_backup(server, bot)
+    return True
+
+
+def _bring_up_bot(bot) -> None:
+    """Build a bot's command router and start its adapter threads. Its adapters
+    and servers must already be built (backends ready)."""
+    auth = bot.auth
+    logger.info("[%s] Chat platforms: %s", bot.config.name,
+                ", ".join(a.name for a in bot.adapters))
+
+    # Command router shared by this bot's adapters; replies go to the originating
+    # chat. bot + resolve give handlers ctx.bot and the resolved ctx.server.
     router = CommandRouter(
         auth,
         is_admin=lambda platform, uid: is_admin(platform, uid, auth),
@@ -2471,180 +2600,116 @@ def main():
             is_authorized(platform, cid, uid, priv, auth),
         on_unclaimed=_make_unclaimed_handler(auth),
         logger=logger,
-        bot=BOT,
-        resolve=BOT.resolve_command,
+        bot=bot,
+        resolve=bot.resolve_command,
     )
-    BOT.router = router
+    bot.router = router
     register_commands(router, auth)
 
-    notify = make_notify_callback(BOT, SERVER)
-    watcher = LogWatcher(LOG_PATH, SERVER, notify,
-                         on_server_start=lambda: reconcile_online(
-                             SERVER, reason="server start"))
-    _watcher_ref = watcher
-    BACKEND.attach_watcher(watcher)
-    observer = Observer()
-    observer.schedule(watcher, path=str(LOG_PATH.parent), recursive=False)
-    observer.start()
-    logger.info("Watching %s for join/leave events", LOG_PATH)
-
-    # Validate server.properties RCON settings before attempting any RCON commands.
-    # If validation fails, skip RCON entirely — the settings are wrong and
-    # connections will fail regardless.
-    backend_available = BACKEND.is_available(log_warnings=True)
-
-    # Capture any players already online via RCON /list.
-    # The server may already be running (bot restarted), or it may still be
-    # starting up. We try /list immediately; if it fails, we watch latest.log
-    # for the "RCON running on" line and retry. If that also times out, the
-    # server is likely not running — alert the admin.
-    if backend_available:
-        online = None
-        try:
-            online = BACKEND.query_online_players()
-        except Exception as e:
-            logger.warning("Online query failed, server may still be starting: %s", e)
-            if BACKEND.wait_for_ready(timeout=120):
-                logger.info("Server is now ready, retrying online query")
-                try:
-                    online = BACKEND.query_online_players()
-                except Exception as e2:
-                    logger.warning("Online query retry failed: %s", e2)
-
-        if online is not None:
-            # Online-time bookkeeping: clear any sessions left open by a prior
-            # crash, then open a session for each currently-online player (their
-            # join event predates this bot run).
-            BACKEND.reset_open_sessions()
-            for name in online:
-                SERVER.player_join(name)
-            current = SERVER.get_online_players()
-            if current:
-                logger.info("%d player(s) already online: %s",
-                            len(current), ", ".join(current))
-                # The bot missed these players' connect lines (started
-                # mid-session), so recover their xuids from the log to register
-                # them properly (Bedrock; no-op on Java).
-                _recover_online_identities(SERVER, current)
-                for name in current:
-                    pid = _uuid_by_name(name, SERVER.names)
-                    if pid:
-                        BACKEND.record_player_session("join", pid)
-                # The join notify callback never fired for these players, so
-                # start the incremental backup cycle here.
-                SERVER.start_incremental_cycle()
-            else:
-                logger.info("No players online")
-        else:
-            # Never connected — server is likely not running. Alert the admin.
-            logger.error("Could not connect to the Minecraft server. "
-                         "Server may not be running.")
-            _alert_admins(
-                "\u26a0\ufe0f Could not connect to the Minecraft server.\n"
-                "The server may not be running or not ready yet.\n"
-                "Backups and /list will not work until the server is up.")
-
-    # Validate incremental backup chain
-    chain_id, base_full, _ = SERVER.load_manifest()
-    if chain_id:
-        marker = SERVER.read_chain_marker()
-        if marker == chain_id:
-            logger.info("Backup chain %s valid (base: %s)", chain_id, base_full)
-        else:
-            logger.warning("Backup chain invalid: manifest chain %s does not match "
-                          "marker %s. Incremental backups will be skipped until "
-                          "a full backup is run.", chain_id, marker or "(missing)")
-            # Clear chain_id so incrementals are skipped
-            SERVER.save_manifest({}, chain_id="", base_full="")
-    else:
-        logger.info("No backup chain established. Run /backup to start one.")
-
-    # Scheduled full backup
-    _BACKUP_HOUR = CONFIG.backup_hour
-    _BACKUP_SCHEDULE = CONFIG.backup_schedule
-
-    def _next_backup_time(now: datetime) -> datetime:
-        """Calculate the next scheduled backup time."""
-        from calendar import monthrange
-
-        target = now.replace(hour=_BACKUP_HOUR, minute=0, second=0, microsecond=0)
-
-        if _BACKUP_SCHEDULE == "weekly":
-            # Run on Monday at _BACKUP_HOUR
-            days_ahead = (7 - now.weekday()) % 7  # Monday = 0
-            target = target + timedelta(days=days_ahead)
-            if target <= now:
-                target = target + timedelta(weeks=1)
-        elif _BACKUP_SCHEDULE == "monthly":
-            # Run on the 1st of each month at _BACKUP_HOUR
-            target = target.replace(day=1)
-            if target <= now:
-                # Advance to 1st of next month
-                if now.month == 12:
-                    target = target.replace(year=now.year + 1, month=1)
-                else:
-                    target = target.replace(month=now.month + 1)
-        else:
-            # Daily (default)
-            if target <= now:
-                target = target + timedelta(days=1)
-
-        return target
-
-    def _scheduled_backup_loop():
-        while True:
-            now = datetime.now()
-            target = _next_backup_time(now)
-            wait = (target - now).total_seconds()
-            logger.info("Next %s backup in %.0f seconds (at %s)", _BACKUP_SCHEDULE,
-                        wait, target.strftime("%Y-%m-%d %H:%M"))
-            time.sleep(wait)
-
-            if not BACKEND.is_available():
-                logger.warning("Scheduled backup skipped: server backend not available")
-                continue
-
-            logger.info("Scheduled %s backup starting", _BACKUP_SCHEDULE)
-            def status_cb(msg):
-                _alert_admins(f"[Backup] {msg}")
-
-            try:
-                path = SERVER.run_backup(status_cb=status_cb)
-                status_cb(f"Complete: {Path(path).name}")
-            except Exception as e:
-                logger.exception("Scheduled backup failed")
-                status_cb(f"Failed: {e}")
-
-    backup_thread = threading.Thread(target=_scheduled_backup_loop, daemon=True)
-    backup_thread.start()
-
-    # Start each chat adapter in its own daemon thread (each runs a blocking
-    # poll/socket loop); the main thread waits for Ctrl-C.
-    for adapter in BOT.adapters:
+    for adapter in bot.adapters:
         threading.Thread(target=adapter.start, args=(router.dispatch,),
-                         name=f"chat-{adapter.name}", daemon=True).start()
-        logger.info("Started %s adapter", adapter.name)
+                         name=f"chat-{bot.config.name}-{adapter.name}",
+                         daemon=True).start()
+        logger.info("[%s] Started %s adapter", bot.config.name, adapter.name)
 
+
+def _shutdown(bots) -> None:
+    """Stop every bot's adapters and every server's watcher + flush its sessions."""
+    for bot in bots:
+        for adapter in bot.adapters:
+            try:
+                adapter.stop()
+            except Exception:
+                logger.exception("[%s] Failed to stop %s adapter",
+                                 bot.config.name, adapter.name)
+        for server in bot.servers:
+            server.stop_incremental_cycle()
+            # Flush open online-time sessions so playtime isn't lost on a clean
+            # stop (a hard crash still loses the in-progress session).
+            try:
+                server.backend.close_open_sessions()
+            except Exception:
+                logger.exception("[%s] Failed to close open sessions on shutdown",
+                                 server.config.name)
+            if server.observer is not None:
+                server.observer.stop()
+                server.observer.join()
+    logger.info("Diamond Sign stopped")
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="diamondsign",
+        description="Diamond Sign - Minecraft chat notifier + backups")
+    parser.add_argument("--only", metavar="BOT",
+                        help="run only the bot with this name (per-process "
+                             "isolation); default runs every configured bot")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = _parse_args()
+    setup_logging(Path(__file__).parent / "logs")
+
+    global _AUTH_DOC
+
+    bots_cfg = APP_CONFIG.bots
+    if args.only:
+        bots_cfg = [b for b in APP_CONFIG.bots if b.name == args.only]
+        if not bots_cfg:
+            names = ", ".join(b.name for b in APP_CONFIG.bots)
+            print(f"--only: no bot named '{args.only}'. Configured bots: {names}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    # Legacy repo-root state is migrated into data/<key>/ only for the classic
+    # single-server install; a multi-server config can't unambiguously claim it.
+    migrate_legacy = len(APP_CONFIG.all_servers()) == 1
+
+    # One auth.json for the whole process; each bot operates on its own slice
+    # (shared dict objects, so save_auth(_AUTH_DOC) persists in-place mutations).
+    _AUTH_DOC = load_auth(_AUTH_PATH, bots_cfg)
+
+    bots = []
+    for bcfg in bots_cfg:
+        servers = [Server(scfg, migrate_legacy=migrate_legacy)
+                   for scfg in bcfg.servers]
+        bot = Bot(bcfg, servers)
+        bot.auth_doc = _AUTH_DOC
+        bot.auth = _AUTH_DOC[bcfg.name]
+        # Adapters first so a server backend failure can still alert the admins.
+        bot.adapters = make_adapters(bcfg)
+        # Bring up each server; drop any whose backend won't start.
+        for server in list(bot.servers):
+            if not _bring_up_server(server, bot):
+                bot.drop_server(server)
+        if not bot.servers:
+            logger.error("[%s] No servers came up; skipping this bot", bcfg.name)
+            for adapter in bot.adapters:
+                try:
+                    adapter.stop()
+                except Exception:
+                    pass
+            continue
+        bots.append(bot)
+
+    if not bots:
+        logger.error("No bots could be started (no reachable servers). Exiting.")
+        return
+
+    # Now that every server is up, wire each bot's router + start its adapters.
+    for bot in bots:
+        _bring_up_bot(bot)
+
+    logger.info("Diamond Sign running: %d bot(s), %d server(s)",
+                len(bots), sum(len(b.servers) for b in bots))
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
-        for adapter in BOT.adapters:
-            try:
-                adapter.stop()
-            except Exception:
-                logger.exception("Failed to stop %s adapter", adapter.name)
-        # Flush any open online-time sessions so playtime isn't lost on a clean
-        # stop (a hard crash still loses the in-progress session).
-        try:
-            BACKEND.close_open_sessions()
-        except Exception:
-            logger.exception("Failed to close open sessions on shutdown")
-        observer.stop()
-        observer.join()
-        logger.info("Bot stopped")
+        _shutdown(bots)
 
 
 if __name__ == "__main__":
