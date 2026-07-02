@@ -1787,18 +1787,20 @@ def _normalize_ns(ns: dict) -> dict:
     }
 
 
-def load_auth(path: Path, bot_name: str, default_server_key: str = None) -> dict:
-    """Load bot-namespaced auth:
+def load_auth(path: Path, bots: list) -> dict:
+    """Load the whole bot-namespaced auth doc for the configured ``bots`` (a list
+    of BotConfig):
     ``{bot_name: {platform: {admin_user_id, authorized_chat_ids, chat_servers}}}``.
 
-    Chains three migrations so any older on-disk shape upgrades in place:
+    Chains the legacy migrations so any older on-disk shape upgrades in place:
       1. flat ``{admin_user_id, authorized_chat_ids}`` -> ``{telegram: …}``
          (pre-multi-platform installs);
-      2. platform-level ``{platform: ns}`` -> ``{bot_name: {platform: ns}}``
-         (pre-multi-bot installs, folded under this bot's name);
-      3. per platform, existing authorized chats are bound to
-         ``default_server_key`` (when given) so a later multi-server config keeps
-         delivering to them.
+      2. platform-level ``{platform: ns}`` -> ``{<first bot>: {platform: ns}}``
+         (pre-multi-bot installs — the legacy doc belonged to the sole bot, so
+         it's folded under the first configured bot's name);
+      3. every configured bot gets a namespace, and any bot that fronts exactly
+         one server has its existing authorized chats bound to that server's key
+         so a later multi-server config keeps delivering to them.
 
     Migration is in-memory only; the new shape is persisted on the next auth
     mutation (admin claim / authorize / revoke).
@@ -1815,20 +1817,25 @@ def load_auth(path: Path, bot_name: str, default_server_key: str = None) -> dict
         data = {"telegram": data}
     # 2. platform-level -> bot-namespaced. A platform-level doc has ns dicts
     #    (with admin_user_id/authorized_chat_ids) as its top-level values; a
-    #    bot-namespaced doc has platform maps there instead.
+    #    bot-namespaced doc has platform maps there instead. Fold a legacy
+    #    platform-level doc under the first configured bot (the historical one).
     if any(isinstance(v, dict)
            and ("admin_user_id" in v or "authorized_chat_ids" in v)
            for v in data.values()):
-        data = {bot_name: data}
-    # Ensure this bot has a namespace and normalize every bot/platform.
-    data.setdefault(bot_name, {})
+        data = {bots[0].name: data}
+    # Ensure every configured bot has a namespace and normalize all of them.
+    for b in bots:
+        data.setdefault(b.name, {})
     out = {bname: {p: _normalize_ns(ns) for p, ns in bns.items()}
            for bname, bns in data.items()}
-    # 3. bind pre-existing authorized chats to the sole server.
-    if default_server_key:
-        for ns in out[bot_name].values():
-            for cid in ns["authorized_chat_ids"]:
-                ns["chat_servers"].setdefault(cid, default_server_key)
+    # 3. bind pre-existing authorized chats to the sole server (per single-server
+    #    bot), so an eventual multi-server upgrade keeps delivering to them.
+    for b in bots:
+        if len(b.servers) == 1:
+            key = b.servers[0].key
+            for ns in out[b.name].values():
+                for cid in ns["authorized_chat_ids"]:
+                    ns["chat_servers"].setdefault(cid, key)
     return out
 
 
@@ -2428,7 +2435,7 @@ def main():
     # Load the whole bot-namespaced auth doc; this bot operates on its own slice
     # (the {platform: ns} value for its name), which shares dict objects with the
     # doc so save_auth(_AUTH_DOC) persists in-place mutations.
-    _AUTH_DOC = load_auth(_AUTH_PATH, BOT_CONFIG.name, SERVER.config.key)
+    _AUTH_DOC = load_auth(_AUTH_PATH, [BOT_CONFIG])
     auth = _AUTH_DOC[BOT_CONFIG.name]
     BOT.auth_doc = _AUTH_DOC
     BOT.auth = auth
