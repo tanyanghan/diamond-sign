@@ -528,7 +528,7 @@ class Server:
             self.backend.end_save(status)
 
         # Step 4: Copy off-server if configured (e.g., rsync to NAS/cloud)
-        run_copy_command(final_path, log_fn=status)
+        run_copy_command(final_path, self.config.backup_copy_cmd, log_fn=status)
 
         # Step 5: Start a new incremental chain
         # Every full backup starts a fresh chain. The manifest records the mtime
@@ -670,7 +670,8 @@ class Server:
             self.backend.checkpoint_open_sessions()
 
             # Copy off-server if configured
-            run_copy_command(zip_path, log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
+            run_copy_command(zip_path, self.config.backup_copy_cmd,
+                             log_fn=lambda msg: logger.info("Incremental backup: %s", msg))
 
             return str(zip_path)
 

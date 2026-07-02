@@ -188,19 +188,19 @@ def wait_for_settle(root_dir: Path, backup_dir: Path | None = None,
     return manifest
 
 
-def run_copy_command(file_path: Path, log_fn=None) -> None:
-    """Run BACKUP_COPY_CMD to upload a backup file to off-server storage.
+def run_copy_command(file_path: Path, cmd_template: str, log_fn=None) -> None:
+    """Run a copy command to upload a backup file to off-server storage.
 
-    Reads BACKUP_COPY_CMD from the environment. The placeholder {file} in the
-    command is replaced with the full path to the backup zip. Does nothing if
-    BACKUP_COPY_CMD is not set.
+    ``cmd_template`` is the per-server ``backup.copy_cmd`` from the config; the
+    placeholder {file} in it is replaced with the full path to the backup zip.
+    Does nothing if ``cmd_template`` is empty.
 
     Args:
-        file_path: Path to the backup zip file to copy.
-        log_fn:    Callback for status messages, e.g. logger.info or print.
-                   If None, messages are silently discarded.
+        file_path:    Path to the backup zip file to copy.
+        cmd_template: The shell command template (with an optional {file}).
+        log_fn:       Callback for status messages, e.g. logger.info or print.
+                      If None, messages are silently discarded.
     """
-    cmd_template = os.environ.get("BACKUP_COPY_CMD", "")
     if not cmd_template:
         return
 

@@ -82,6 +82,10 @@ class ServerConfig:
     incremental_interval_minutes: int = 15
     backup_hour: int = 4
     backup_schedule: str = "daily"
+    # Optional off-server copy run after each backup; "{file}" is replaced with
+    # the backup zip path (e.g. "rsync -az {file} user@nas:/backups/"). Empty
+    # disables the copy step.
+    backup_copy_cmd: str = ""
 
     @property
     def log_path(self) -> Path:
@@ -181,6 +185,7 @@ def _server_from_dict(d: dict) -> ServerConfig:
         incremental_interval_minutes=int(incr.get("interval_minutes") or 15),
         backup_hour=int(backup.get("hour") or 4),
         backup_schedule=(backup.get("schedule") or "daily").lower(),
+        backup_copy_cmd=(backup.get("copy_cmd") or "").strip(),
     )
 
 
@@ -312,6 +317,7 @@ def _env_to_doc() -> dict:
             "dir": os.environ.get("BACKUP_DIR", "~/minecraft_backup"),
             "schedule": os.environ.get("BACKUP_SCHEDULE", "daily"),
             "hour": int(os.environ.get("BACKUP_HOUR", "4") or 4),
+            "copy_cmd": os.environ.get("BACKUP_COPY_CMD", "").strip(),
             "incremental": {
                 "enabled": _env_bool("INCREMENTAL_BACKUP_ENABLED"),
                 "interval_minutes": int(
@@ -463,6 +469,7 @@ _EXAMPLE_DOC = {
                     "rcon": {"password": "your_rcon_password"},
                     "backup": {"dir": "~/minecraft_backup", "schedule": "daily",
                                "hour": 4,
+                               "copy_cmd": "",  # e.g. "rsync -az {file} user@nas:/backups/"
                                "incremental": {"enabled": True,
                                                "interval_minutes": 15}},
                 }

@@ -609,7 +609,9 @@ def restore(chains: list, chain_idx: int, point_idx: int,
 
                 print(f"  Merged incremental created "
                       f"({format_size(merged_path.stat().st_size)})")
-                run_copy_command(merged_path, log_fn=print)
+                run_copy_command(merged_path,
+                                 os.environ.get("BACKUP_COPY_CMD", ""),
+                                 log_fn=print)
             else:
                 # Restoring to a full-only point: no incrementals applied,
                 # just give the existing full backup a new chain ID.
