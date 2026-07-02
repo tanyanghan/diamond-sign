@@ -93,14 +93,13 @@ class CommandRouter:
     """Maps ``/command`` names to handlers and enforces access rules.
 
     Replaces telebot's ``@bot.message_handler`` decorators and the per-handler
-    ``guard``/``is_admin``/``chat.type`` boilerplate. ``auth`` is the per-platform
-    authorization object (see ``bot`` auth helpers).
+    ``guard``/``is_admin``/``chat.type`` boilerplate. Authorization is delegated
+    to the ``is_admin``/``is_authorized`` callables (see ``bot`` auth helpers).
     """
 
-    def __init__(self, auth, is_admin, is_authorized, on_unclaimed=None,
+    def __init__(self, is_admin, is_authorized, on_unclaimed=None,
                  logger=None, bot=None, resolve=None):
         self._cmds = {}              # name -> spec dict
-        self._auth = auth
         self._is_admin = is_admin
         self._is_authorized = is_authorized
         self._on_unclaimed = on_unclaimed  # called for any message when admin unclaimed

@@ -451,6 +451,13 @@ def load_config() -> AppConfig:
         where = _CONFIG_PATH if not migrated else f"{_CONFIG_PATH} (migrated from .env)"
         raise ConfigError("Diamond Sign cannot start - fix the following in "
                           f"{where}:\n" + "\n".join(f"  - {p}" for p in problems))
+    # Non-fatal: a Java server without an RCON password still gets log-driven
+    # notifications, but /status, /backup save-flush, and /allowlist need RCON.
+    for s in app.all_servers():
+        if s.edition == EDITION_JAVA and not s.rcon_password:
+            print(f"Warning: server '{s.name}' has no rcon.password — "
+                  "commands and backups that need RCON will be unavailable.",
+                  file=sys.stderr)
     return app
 
 

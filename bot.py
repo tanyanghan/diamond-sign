@@ -220,6 +220,9 @@ class Server:
 
         self.online_players: set = set()
         self.online_lock = threading.Lock()
+        # Serializes reconcile_online passes for this server (a /status and an
+        # on_server_start resync may race).
+        self.reconcile_lock = threading.Lock()
 
         # Bedrock identity learning: xuids seen online since the last backup
         # (kept even after a player leaves, so a short session that only triggers
@@ -870,10 +873,6 @@ class Bot:
                                    adapter.name, chat_id, e)
         return sent
 
-    def announce_chat_count(self, server) -> int:
-        return sum(sum(1 for _ in self._server_chats(a, server))
-                   for a in self.adapters)
-
     def alert_admins(self, msg: str) -> None:
         """Send an operational alert to each platform's admin (if claimed)."""
         for adapter in self.adapters:
@@ -1191,10 +1190,9 @@ class LogWatcher(FileSystemEventHandler):
     _START_MARKERS = ("RCON running on", "Server started")
     _START_DEBOUNCE = 15  # seconds; collapse a burst of start lines into one
 
-    def __init__(self, log_path: Path, server, notify_cb,
-                 on_server_start=None):
-        self._path = log_path
-        self._filename = log_path.name  # "latest.log" (Java) or "console.log" (Bedrock)
+    def __init__(self, server, notify_cb, on_server_start=None):
+        self._path = server.config.log_path
+        self._filename = self._path.name  # "latest.log" (Java) or "console.log" (Bedrock)
         self._server = server  # the Server whose log this tails; parse into it
         self._notify = notify_cb
         self._on_server_start = on_server_start  # called when the server (re)starts
@@ -1310,8 +1308,8 @@ def make_notify_callback(bot, server):
     _last_event: dict = {}
     _cooldown = 3
 
-    def _send_to_chats(msg: str) -> None:
-        bot.announce(server, msg)
+    def _send_to_chats(msg: str) -> int:
+        return bot.announce(server, msg)
 
     def notify(event_type: str, payload) -> None:
         if event_type == "achievement":
@@ -1332,10 +1330,9 @@ def make_notify_callback(bot, server):
                                    server.achievements, server.achievements_path)
 
             verb = _ACH_VERB_MAP[ach_type]
-            msg = f"{player} has {verb} [{achievement}]"
-            server.log.info("Achievement: %s — %s — sending to %d chat(s)",
-                        player, achievement, bot.announce_chat_count(server))
-            _send_to_chats(msg)
+            sent = _send_to_chats(f"{player} has {verb} [{achievement}]")
+            server.log.info("Achievement: %s — %s — sent to %d chat(s)",
+                            player, achievement, sent)
             return
 
         if event_type == "death":
@@ -1348,10 +1345,9 @@ def make_notify_callback(bot, server):
                 record_death(uuid, death_msg, timestamp, server.deaths,
                              server.deaths_path)
 
-            msg = f"{player} {death_msg}"
-            server.log.info("Death: %s %s — sending to %d chat(s)",
-                        player, death_msg, bot.announce_chat_count(server))
-            _send_to_chats(msg)
+            sent = _send_to_chats(f"{player} {death_msg}")
+            server.log.info("Death: %s %s — sent to %d chat(s)",
+                            player, death_msg, sent)
             return
 
         if event_type == "chat":
@@ -1360,9 +1356,9 @@ def make_notify_callback(bot, server):
             # at the parser; nothing recorded.
             player = payload["player"]
             message = payload["message"]
-            server.log.info("Chat: %s: %s — sending to %d chat(s)",
-                        player, message, bot.announce_chat_count(server))
-            _send_to_chats(f"\U0001f4ac {player}: {message}")
+            sent = _send_to_chats(f"\U0001f4ac {player}: {message}")
+            server.log.info("Chat: %s: %s — sent to %d chat(s)",
+                            player, message, sent)
             return
 
         name = payload
@@ -1389,11 +1385,9 @@ def make_notify_callback(bot, server):
 
         verb = "joined the game" if event_type == "join" else "left the game"
         status = "online" if event_type == "join" else "offline"
-        msg = f"{name} {verb}\nPlayers online: {count} ({names_str})"
-
-        server.log.info("Notification: player %s %s — sending to %d chat(s)",
-                    name, status, bot.announce_chat_count(server))
-        _send_to_chats(msg)
+        sent = _send_to_chats(f"{name} {verb}\nPlayers online: {count} ({names_str})")
+        server.log.info("Notification: player %s %s — sent to %d chat(s)",
+                        name, status, sent)
 
         # Incremental backup triggers
         if event_type == "join" and count == 1:
@@ -1711,9 +1705,6 @@ def _recover_online_identities(server, online_names: list) -> None:
                     ", ".join(unresolved))
 
 
-_reconcile_lock = threading.Lock()
-
-
 def reconcile_online(server, *, reason: str = "") -> list | None:
     """Reconcile ``server``'s in-memory online set with what it actually reports.
 
@@ -1728,7 +1719,7 @@ def reconcile_online(server, *, reason: str = "") -> list | None:
     Returns the reconciled online list, or None if the server couldn't be
     queried (in which case the in-memory set is left untouched — best-effort).
     """
-    with _reconcile_lock:
+    with server.reconcile_lock:
         try:
             actual = server.backend.query_online_players()
         except Exception as e:
@@ -1843,8 +1834,11 @@ def load_auth(path: Path, bots: list) -> dict:
 
 
 def save_auth(auth: dict, path: Path) -> None:
-    with open(path, "w") as f:
+    # Write-then-rename so a crash mid-write can't corrupt auth.json.
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as f:
         json.dump(auth, f, indent=2)
+    os.replace(tmp, path)
 
 
 def _auth_ns(auth: dict, platform: str) -> dict:
@@ -2596,7 +2590,7 @@ def _bring_up_server(server, bot) -> bool:
 
     notify = make_notify_callback(bot, server)
     log_path = server.config.log_path
-    watcher = LogWatcher(log_path, server, notify,
+    watcher = LogWatcher(server, notify,
                          on_server_start=lambda: reconcile_online(
                              server, reason="server start"))
     server.watcher = watcher
@@ -2624,7 +2618,6 @@ def _bring_up_bot(bot) -> None:
     # Command router shared by this bot's adapters; replies go to the originating
     # chat. bot + resolve give handlers ctx.bot and the resolved ctx.server.
     router = CommandRouter(
-        auth,
         is_admin=lambda platform, uid: is_admin(platform, uid, auth),
         is_authorized=lambda platform, cid, uid, priv:
             is_authorized(platform, cid, uid, priv, auth),
