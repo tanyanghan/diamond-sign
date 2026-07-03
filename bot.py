@@ -2407,8 +2407,8 @@ def register_commands(router, auth: dict) -> None:
             _set_pending_player_restore(
                 pkey, stage="listed", username=canonical, uuid=uuid,
                 versions=versions, selected_n=None, page_offset=0)
-            server.log.info("RestorePlayer: %s listed %d version(s) for %s",
-                        ctx.sender_label, len(versions), canonical)
+            server.log.info("RestorePlayer: [%s] on [%s] listed %d version(s) for %s",
+                        ctx.sender_label, ctx.chat_label, len(versions), canonical)
             ctx.reply(_format_versions_reply(canonical, uuid, versions, offset=0))
             return
 
@@ -2423,8 +2423,8 @@ def register_commands(router, auth: dict) -> None:
                 ctx.reply(f"No more versions for {canonical}.")
                 return
             _set_pending_player_restore(pkey, page_offset=new_offset)
-            server.log.info("RestorePlayer: %s paged to offset %d for %s",
-                        ctx.sender_label, new_offset, canonical)
+            server.log.info("RestorePlayer: [%s] on [%s] paged to offset %d for %s",
+                        ctx.sender_label, ctx.chat_label, new_offset, canonical)
             ctx.reply(_format_versions_reply(canonical, uuid, versions, offset=new_offset))
             return
 
@@ -2485,8 +2485,8 @@ def register_commands(router, auth: dict) -> None:
         _set_pending_player_restore(
             pkey, stage="selected", username=canonical, uuid=uuid,
             versions=versions, selected_n=n)
-        server.log.info("RestorePlayer: %s selected version %d (%s) for %s",
-                    ctx.sender_label, n, version["source"], canonical)
+        server.log.info("RestorePlayer: [%s] on [%s] selected version %d (%s) for %s",
+                    ctx.sender_label, ctx.chat_label, n, version["source"], canonical)
         ctx.reply(_format_confirm_reply(canonical, uuid, n, version))
     router.register("restore_player", cmd_restore_player,
                     private_only=True, admin_only=True,
@@ -2520,8 +2520,8 @@ def register_commands(router, auth: dict) -> None:
                     ctx.reply("No more restore points.")
                     return
                 _set_pending_world_restore(pkey, offset=offset)
-            server.log.info("Restore: %s listed %d point(s)",
-                            ctx.sender_label, len(points))
+            server.log.info("Restore: [%s] on [%s] listed %d point(s)",
+                            ctx.sender_label, ctx.chat_label, len(points))
             ctx.reply(_format_restore_points(points, offset=offset))
             return
 

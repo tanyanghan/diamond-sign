@@ -540,7 +540,7 @@ class BedrockBackend(ServerBackend):
         from utils import bedrock_player
 
         def status(msg):
-            logger.info("RestorePlayer(BR): %s", msg)
+            logger.info("[%s] RestorePlayer: %s", self.config.name, msg)
             if status_cb:
                 status_cb(msg)
 

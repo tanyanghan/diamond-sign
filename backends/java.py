@@ -413,7 +413,7 @@ class JavaBackend(ServerBackend):
         uuid = player_id
 
         def status(msg):
-            logger.info("RestorePlayer: %s", msg)
+            logger.info("[%s] RestorePlayer: %s", self.config.name, msg)
             if status_cb:
                 status_cb(msg)
 
@@ -449,7 +449,7 @@ class JavaBackend(ServerBackend):
             status(f"Restored {username}.dat from {version['source']} "
                    f"({version['timestamp']})")
         except Exception as e:
-            logger.exception("RestorePlayer failed")
+            logger.exception("[%s] RestorePlayer failed", self.config.name)
             status(f"Restore failed: {e}")
         finally:
             if save_started:
