@@ -755,6 +755,34 @@ class Server:
             self.log.info("Running final incremental backup before stop")
             threading.Thread(target=self.run_incremental_backup, daemon=True).start()
 
+    def reattach_log_watch(self) -> None:
+        """Re-establish the log-directory watch after a restore replaced the
+        server directory. A world restore wipes minecraft_dir, which for Java
+        deletes the logs/ dir that inotify was watching — so the observer keeps
+        watching the now-gone directory and never sees the new latest.log (join/
+        leave, save-off/save-all confirmations, RCON readiness all go unseen).
+        Point a fresh observer at the recreated log dir and re-seek the watcher.
+        Bedrock tails console.log at the server root (not wiped), so this is a
+        no-op there in practice, but it's safe to call for either edition."""
+        if self.watcher is None:
+            return
+        log_dir = self.config.log_path.parent
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self.watcher.reset()  # re-seek to the (new) latest.log
+            observer = Observer()
+            observer.schedule(self.watcher, path=str(log_dir), recursive=False)
+            observer.start()
+            old = self.observer
+            self.observer = observer
+            if old is not None:
+                old.stop()
+                old.join()
+            self.log.info("Re-attached log watch on %s (server dir was replaced)",
+                          log_dir)
+        except Exception:
+            self.log.exception("Failed to re-attach log watch after restore")
+
     # --- Whole-world restore (stop -> replace -> restart) -------------------
 
     def restore_world(self, chain: dict, point_idx: int, *, say) -> None:
@@ -821,6 +849,9 @@ class Server:
             say("Restarting the server...")
             if backend.relaunch(say):
                 relaunched = True
+                # The wipe replaced the server dir; rebind the log watcher to the
+                # recreated log dir before reconciling / awaiting future events.
+                self.reattach_log_watch()
                 reconcile_online(self, reason="after world restore")
                 chain_note = (f" New chain {summary['chain_id']}."
                               if summary.get("chain_id") else "")
@@ -838,6 +869,7 @@ class Server:
             if down and not relaunched:
                 say("Bringing the server back up...")
                 if backend.relaunch(say):
+                    self.reattach_log_watch()
                     reconcile_online(self, reason="after world restore")
                 else:
                     say("Could not relaunch. Start the server manually:\n  "
@@ -1327,6 +1359,13 @@ class LogWatcher(FileSystemEventHandler):
             self._pos = stat.st_size
         except FileNotFoundError:
             self._server.log.warning("Log file not found at startup: %s (server may be offline)", self._path)
+
+    def reset(self) -> None:
+        """Re-seek to the current end of the log file. Used after a restore
+        replaces the server directory (new inode / new latest.log), so tailing
+        resumes cleanly from the current file rather than a stale position."""
+        with self._lock:
+            self._seek_to_end()
 
     def _check_rotation(self) -> bool:
         """Detect if latest.log was replaced (rotated) by checking inode."""
