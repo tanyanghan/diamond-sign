@@ -2105,11 +2105,13 @@ def register_commands(router, auth: dict) -> None:
     def cmd_status(ctx):
         _cmd_log(ctx, "Status")
         server = ctx.server
+        name = server.config.name
         # Liveness first, so a down server gets a clear "offline" answer instead
-        # of a slow/last-known one.
+        # of a slow/last-known one. Every branch states the server's up/down
+        # state by name, then the player detail.
         if not server.backend.is_online():
             start_hint = " Start it with /start." if server.backend.can_restart else ""
-            reply = f"🔴 {server.config.name} is offline.{start_hint}"
+            reply = f"🔴 {name} is offline.{start_hint}"
             ctx.reply(reply)
             ctx.bot.log.info("Status: replied to [%s] — offline", ctx.sender_label)
             return
@@ -2119,11 +2121,12 @@ def register_commands(router, auth: dict) -> None:
         suffix = ""
         if online is None:  # reachable a moment ago but query failed — last-known
             online = server.get_online_players()
-            suffix = " (server unreachable; last known)"
+            suffix = " (last known — live query failed)"
         if online:
-            reply = f"🟢 Players online: {len(online)} ({', '.join(online)}){suffix}"
+            reply = (f"🟢 {name} is online — {len(online)} player(s): "
+                     f"{', '.join(online)}{suffix}")
         else:
-            reply = f"🟢 {server.config.name} online — no players currently online.{suffix}"
+            reply = f"🟢 {name} is online — no players online.{suffix}"
         ctx.reply(reply)
         ctx.bot.log.info("Status: replied to [%s] — %s", ctx.sender_label, reply)
     router.register("status", cmd_status)
