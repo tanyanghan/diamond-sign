@@ -108,7 +108,8 @@ class SlackAdapter(ChatAdapter):
                 arg_text = command.get("text", "") or ""    # args after the command
                 full = cmd + ((" " + arg_text) if arg_text else "")
                 channel_id = command["channel_id"]
-                is_private = (command.get("channel_name") == "directmessage"
+                channel_name = command.get("channel_name")
+                is_private = (channel_name == "directmessage"
                               or channel_id.startswith("D"))
                 ctx = Context(
                     adapter=self,
@@ -119,6 +120,7 @@ class SlackAdapter(ChatAdapter):
                     args=arg_text.split(),
                     sender_label=command.get("user_name") or command["user_id"],
                     reply_to=None,  # slash commands aren't messages — no thread anchor
+                    chat_name=channel_name,  # Slack channel name (no API call)
                 )
                 dispatch(ctx)
             except Exception:

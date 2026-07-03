@@ -22,7 +22,7 @@ class Context:
     """
 
     def __init__(self, adapter, chat_id, user_id, is_private, text, args,
-                 sender_label, reply_to=None):
+                 sender_label, reply_to=None, chat_name=None):
         self.adapter = adapter
         self.platform = adapter.name
         self.chat_id = str(chat_id)
@@ -31,12 +31,24 @@ class Context:
         self.text = text
         self.args = args                 # command args, whitespace-split, sans the /cmd
         self.sender_label = sender_label  # human-readable, for logging
+        # Human-readable group/channel name from the inbound payload (Telegram
+        # chat title / Slack channel name); None for private chats or when the
+        # platform didn't supply one. Used for readable audit logs.
+        self.chat_name = chat_name
         self.reply_to = reply_to          # opaque per-adapter handle for threaded replies
         # Populated by CommandRouter.dispatch before the handler runs: the Bot
         # this router serves, and (for server-scoped commands) the resolved
         # target Server. See Bot.resolve_target_server.
         self.bot = None
         self.server = None
+
+    @property
+    def chat_label(self) -> str:
+        """Readable location for audit logs: 'direct' for a DM, else the chat's
+        name (falling back to its raw ID if the platform gave no name)."""
+        if self.is_private:
+            return "direct"
+        return self.chat_name or self.chat_id
 
     def reply(self, text, *, monospace=False):
         self.adapter.send(self.chat_id, text, monospace=monospace,
@@ -124,6 +136,11 @@ class CommandRouter:
         """Parse and route one inbound message. Silently ignores non-commands and
         unauthorized callers (no reply), matching the original Telegram behaviour."""
         ctx.bot = self._bot
+
+        # Learn/refresh this chat's human name (for readable audit logs and
+        # /listchats). Runs on every inbound message so a group rename is caught.
+        if self._bot is not None:
+            self._bot.note_chat_name(ctx)
 
         # Admin-claim hook: before an admin exists on this platform, a private
         # message may claim it.

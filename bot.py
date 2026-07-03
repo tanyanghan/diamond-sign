@@ -190,12 +190,12 @@ def record_death(uuid: str, message: str, timestamp: str,
 # ---------------------------------------------------------------------------
 # 3. Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
-class _ServerLogAdapter(logging.LoggerAdapter):
-    """Prefix every record with [<server name>] so interleaved multi-server
-    logs stay attributable (backups, notifications, watcher events)."""
+class _TagLogAdapter(logging.LoggerAdapter):
+    """Prefix every record with [<tag>] so interleaved multi-bot / multi-server
+    logs stay attributable (per-server backups/notifications, per-bot commands)."""
 
     def process(self, msg, kwargs):
-        return f"[{self.extra['server']}] {msg}", kwargs
+        return f"[{self.extra['tag']}] {msg}", kwargs
 
 
 class Server:
@@ -208,7 +208,7 @@ class Server:
 
     def __init__(self, config, migrate_legacy=False):
         self.config = config
-        self.log = _ServerLogAdapter(logger, {"server": config.name})
+        self.log = _TagLogAdapter(logger, {"tag": config.name})
         self.backend = None  # set in main() after make_backend
         self.watcher = None  # LogWatcher, set when the server is brought up
         self.observer = None  # watchdog Observer, stopped on shutdown
@@ -850,6 +850,7 @@ class Bot:
 
     def __init__(self, config, servers):
         self.config = config
+        self.log = _TagLogAdapter(logger, {"tag": config.name})
         self.servers = list(servers)
         self.by_name = {s.config.name: s for s in self.servers}
         self.by_key = {s.config.key: s for s in self.servers}
@@ -874,6 +875,31 @@ class Bot:
         if not token:
             return None
         return self.by_name.get(token) or self.by_key.get(token)
+
+    def note_chat_name(self, ctx) -> None:
+        """Learn/refresh an authorized chat's human name from an inbound message
+        and persist it in auth.json. Called for every dispatched message, so a
+        group/channel rename is picked up on its next message. Only authorized
+        chats are recorded (keeps the map bounded and relevant)."""
+        if ctx.is_private or not ctx.chat_name:
+            return
+        ns = self.auth.get(ctx.platform)
+        if ns is None or ctx.chat_id not in ns.get("authorized_chat_ids", []):
+            return
+        names = ns.setdefault("chat_names", {})
+        if names.get(ctx.chat_id) == ctx.chat_name:
+            return  # unchanged — no write
+        with _auth_lock:
+            names[ctx.chat_id] = ctx.chat_name
+            save_auth(self.auth_doc, _AUTH_PATH)
+        self.log.info("Chat name learned: %s = [%s]", ctx.chat_id, ctx.chat_name)
+
+    def chat_display(self, platform: str, chat_id: str) -> str:
+        """Human label for a chat ID from the persisted names, else the ID —
+        for logs/listings that have no live inbound message to read a name from."""
+        ns = self.auth.get(platform) or {}
+        name = (ns.get("chat_names") or {}).get(str(chat_id))
+        return f"{name} ({chat_id})" if name else str(chat_id)
 
     def resolve_target_server(self, ctx):
         """Pick the Server a server-scoped command should act on, or None if it's
@@ -1904,7 +1930,9 @@ def _normalize_ns(ns: dict) -> dict:
 
     ``chat_servers`` binds an authorized chat to a specific server key (used
     once a bot fronts several servers); single-server bots ignore it and
-    announce to every authorized chat.
+    announce to every authorized chat. ``chat_names`` records each authorized
+    chat's human name (group/channel title) — learned + refreshed from inbound
+    messages — so logs and /listchats show names, not raw IDs.
     """
     admin = ns.get("admin_user_id")
     return {
@@ -1912,6 +1940,8 @@ def _normalize_ns(ns: dict) -> dict:
         "authorized_chat_ids": [str(c) for c in ns.get("authorized_chat_ids", [])],
         "chat_servers": {str(c): str(s)
                          for c, s in (ns.get("chat_servers") or {}).items()},
+        "chat_names": {str(c): str(n)
+                       for c, n in (ns.get("chat_names") or {}).items()},
     }
 
 
@@ -1976,9 +2006,12 @@ def save_auth(auth: dict, path: Path) -> None:
 
 
 def _auth_ns(auth: dict, platform: str) -> dict:
-    return auth.setdefault(
+    ns = auth.setdefault(
         platform,
-        {"admin_user_id": None, "authorized_chat_ids": [], "chat_servers": {}})
+        {"admin_user_id": None, "authorized_chat_ids": [], "chat_servers": {},
+         "chat_names": {}})
+    ns.setdefault("chat_names", {})  # older docs predate chat_names
+    return ns
 
 
 def is_admin(platform: str, user_id, auth: dict) -> bool:
@@ -2000,6 +2033,14 @@ def is_authorized(platform: str, chat_id, user_id, is_private: bool,
 # ---------------------------------------------------------------------------
 # 9. Bot Commands
 # ---------------------------------------------------------------------------
+def _cmd_log(ctx, action: str, extra: str = "") -> None:
+    """Uniform command audit line, prefixed with the handling bot:
+    ``[<bot>] <action>: requested by [<sender>] on [<chat>]<extra>`` — where
+    <chat> is the group/channel name (or 'direct' for a DM)."""
+    ctx.bot.log.info("%s: requested by [%s] on [%s]%s",
+                     action, ctx.sender_label, ctx.chat_label, extra)
+
+
 def register_commands(router, auth: dict) -> None:
     """Register every command on the platform-agnostic router. Handlers take a
     Context and reply via it, so the same logic serves any chat platform. Each
@@ -2008,7 +2049,7 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /start, /help ---
     def cmd_help(ctx):
-        logger.info("Help: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "Help")
         backend = ctx.server.backend
         lines = [
             "Available commands:",
@@ -2053,7 +2094,7 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /status ---
     def cmd_status(ctx):
-        logger.info("Status: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "Status")
         # Query the server live (and reconcile the in-memory set) so the answer
         # reflects reality, not just what the bot last parsed from the log.
         online = reconcile_online(ctx.server, reason="/status")
@@ -2066,14 +2107,14 @@ def register_commands(router, auth: dict) -> None:
         else:
             reply = f"No players currently online.{suffix}"
         ctx.reply(reply)
-        logger.info("Status: replied to %s — %s", ctx.sender_label, reply)
+        ctx.bot.log.info("Status: replied to [%s] — %s", ctx.sender_label, reply)
     router.register("status", cmd_status)
 
     # --- /stats ---
     def cmd_stats(ctx):
         refresh_player_names(ctx.server)
         target = ctx.args[0].lower() if ctx.args else None
-        logger.info("Stats: requested by %s (player=%s)", ctx.sender_label, target or "all")
+        _cmd_log(ctx, "Stats", f" (player={target or 'all'})")
         all_stats = ctx.server.backend.player_stats(ctx.server.names)
         if not all_stats:
             ctx.reply("No player statistics recorded yet.")
@@ -2094,7 +2135,7 @@ def register_commands(router, auth: dict) -> None:
     # --- /playtime ---
     def cmd_playtime(ctx):
         refresh_player_names(ctx.server)
-        logger.info("Playtime: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "Playtime")
         all_stats = ctx.server.backend.player_stats(ctx.server.names)
         if not all_stats:
             ctx.reply("No player statistics recorded yet.")
@@ -2109,15 +2150,15 @@ def register_commands(router, auth: dict) -> None:
     # --- /list ---
     def cmd_list(ctx):
         refresh_player_names(ctx.server)
-        logger.info("List: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "List")
         entries = ctx.server.backend.list_known_players(ctx.server.names)
         if not entries:
             ctx.reply("No players found.")
-            logger.info("List: replied to %s — no known players", ctx.sender_label)
+            ctx.bot.log.info("List: replied to [%s] — no known players", ctx.sender_label)
             return
         ctx.reply("Known players:\n" + "\n".join(entries))
-        logger.info("List: replied to %s — %d known player(s)",
-                    ctx.sender_label, len(entries))
+        ctx.bot.log.info("List: replied to [%s] — %d known player(s)",
+                         ctx.sender_label, len(entries))
     router.register("list", cmd_list)
 
     # --- /achievements ---
@@ -2126,7 +2167,7 @@ def register_commands(router, auth: dict) -> None:
         names = ctx.server.names
         achievements = ctx.server.achievements
         target = ctx.args[0].lower() if ctx.args else None
-        logger.info("Achievements: requested by %s (player=%s)", ctx.sender_label, target or "all")
+        _cmd_log(ctx, "Achievements", f" (player={target or 'all'})")
         if not achievements:
             ctx.reply("No achievements recorded yet.")
             return
@@ -2161,12 +2202,12 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /scan_achievements ---
     def cmd_scan_achievements(ctx):
-        logger.info("ScanAchievements: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "ScanAchievements")
         refresh_player_names(ctx.server)
         ctx.reply("Scanning log files for achievements...")
         total = _scan_logs(_scan_log_for_achievements, ctx.server)
         ctx.reply(f"Scan complete. {total} new achievement(s) recorded.")
-        logger.info("ScanAchievements: %d new achievement(s) found", total)
+        ctx.bot.log.info("ScanAchievements: %d new achievement(s) found", total)
     router.register("scan_achievements", cmd_scan_achievements,
                     private_only=True, admin_only=True,
                     cap=lambda ctx: ctx.server.backend.supports(EVENT_ACHIEVEMENT),
@@ -2178,7 +2219,7 @@ def register_commands(router, auth: dict) -> None:
         names = ctx.server.names
         deaths = ctx.server.deaths
         target = ctx.args[0].lower() if ctx.args else None
-        logger.info("Deaths: requested by %s (player=%s)", ctx.sender_label, target or "all")
+        _cmd_log(ctx, "Deaths", f" (player={target or 'all'})")
         if not deaths:
             ctx.reply("No deaths recorded yet.")
             return
@@ -2218,7 +2259,7 @@ def register_commands(router, auth: dict) -> None:
         refresh_player_names(ctx.server)
         names = ctx.server.names
         deaths = ctx.server.deaths
-        logger.info("DeathSummary: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "DeathSummary")
         if not deaths:
             ctx.reply("No deaths recorded yet.")
             return
@@ -2254,12 +2295,12 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /scan_deaths ---
     def cmd_scan_deaths(ctx):
-        logger.info("ScanDeaths: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "ScanDeaths")
         refresh_player_names(ctx.server)
         ctx.reply("Scanning log files for deaths...")
         total = _scan_logs(_scan_log_for_deaths, ctx.server)
         ctx.reply(f"Scan complete. {total} new death(s) recorded.")
-        logger.info("ScanDeaths: %d new death(s) found", total)
+        ctx.bot.log.info("ScanDeaths: %d new death(s) found", total)
     router.register("scan_deaths", cmd_scan_deaths,
                     private_only=True, admin_only=True,
                     cap=lambda ctx: ctx.server.backend.supports(EVENT_DEATH),
@@ -2271,7 +2312,8 @@ def register_commands(router, auth: dict) -> None:
         if not server.backup_lock.acquire(blocking=False):
             ctx.reply("A backup is already in progress.")
             return
-        server.log.info("Backup: manually triggered by %s", ctx.sender_label)
+        server.log.info("Backup: manually triggered by [%s] on [%s]",
+                        ctx.sender_label, ctx.chat_label)
         ctx.reply("Starting backup...")
         say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
@@ -2407,8 +2449,9 @@ def register_commands(router, auth: dict) -> None:
                           f"Run /restore_player {canonical} again.")
                 return
             version = versions[n - 1]
-            server.log.info("RestorePlayer: %s confirmed restore of %s to %s (source: %s)",
-                        ctx.sender_label, canonical, version["timestamp"], version["source"])
+            server.log.info("RestorePlayer: [%s] on [%s] confirmed restore of %s "
+                        "to %s (source: %s)", ctx.sender_label, ctx.chat_label,
+                        canonical, version["timestamp"], version["source"])
             ctx.reply(f"Starting restore of {canonical} to {version['timestamp']}...")
             _clear_pending_player_restore(pkey)
             say = lambda m: ctx.adapter.send(ctx.chat_id, m)
@@ -2518,8 +2561,9 @@ def register_commands(router, auth: dict) -> None:
             ctx.reply(f"Select first: /restore {n}")
             return
         _clear_pending_world_restore(pkey)
-        server.log.info("Restore: %s confirmed world restore to %s (%s)",
-                        ctx.sender_label, point["pretty_ts"], point["kind"])
+        server.log.info("Restore: [%s] on [%s] confirmed world restore to %s (%s)",
+                        ctx.sender_label, ctx.chat_label,
+                        point["pretty_ts"], point["kind"])
         ctx.reply(f"Starting world restore to {point['pretty_ts']}...")
         say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
@@ -2541,13 +2585,13 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /chat_id (public — lets an unauthorized chat learn its ID) ---
     def cmd_chat_id(ctx):
-        logger.info("ChatID: requested by %s (chat=%s)", ctx.sender_label, ctx.chat_id)
+        _cmd_log(ctx, "ChatID", f" (chat_id={ctx.chat_id})")
         ctx.reply(f"Chat ID: {ctx.chat_id}")
     router.register("chat_id", cmd_chat_id, public=True, needs_server=False)
 
     # --- /use (multi-server: pick this admin's target server) ---
     def cmd_use(ctx):
-        logger.info("Use: requested by %s (args=%s)", ctx.sender_label, ctx.args)
+        _cmd_log(ctx, "Use", f" (args={ctx.args})")
         ctx.bot.set_use(ctx)
     router.register("use", cmd_use, private_only=True, admin_only=True,
                     needs_server=False)
@@ -2582,8 +2626,9 @@ def register_commands(router, auth: dict) -> None:
                 ns["authorized_chat_ids"].append(target_id)
             ns["chat_servers"][target_id] = server.config.key
             save_auth(_AUTH_DOC, _AUTH_PATH)
-        logger.info("Authorize: chat %s -> %s added by %s on %s",
-                    target_id, server.config.name, ctx.sender_label, ctx.platform)
+        ctx.bot.log.info("Authorize: chat %s -> %s by [%s] on [%s]",
+                         ctx.bot.chat_display(ctx.platform, target_id),
+                         server.config.name, ctx.sender_label, ctx.chat_label)
         ctx.reply(f"Chat {target_id} is now authorized for "
                   f"{server.config.name}.")
     router.register("authorize", cmd_authorize, private_only=True,
@@ -2599,10 +2644,12 @@ def register_commands(router, auth: dict) -> None:
             ns = _auth_ns(auth, ctx.platform)
             was_bound = ns["chat_servers"].pop(target_id, None) is not None
             if target_id in ns["authorized_chat_ids"]:
+                display = ctx.bot.chat_display(ctx.platform, target_id)
                 ns["authorized_chat_ids"].remove(target_id)
+                ns.get("chat_names", {}).pop(target_id, None)
                 save_auth(_AUTH_DOC, _AUTH_PATH)
-                logger.info("Revoke: chat %s removed by %s on %s",
-                            target_id, ctx.sender_label, ctx.platform)
+                ctx.bot.log.info("Revoke: chat %s by [%s] on [%s]",
+                                 display, ctx.sender_label, ctx.chat_label)
                 ctx.reply(f"Chat {target_id} has been revoked.")
             elif was_bound:
                 save_auth(_AUTH_DOC, _AUTH_PATH)
@@ -2614,23 +2661,25 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /listchats ---
     def cmd_listchats(ctx):
-        logger.info("ListChats: requested by %s", ctx.sender_label)
+        _cmd_log(ctx, "ListChats")
         ns = auth.get(ctx.platform) or {}
         ids = ns.get("authorized_chat_ids", [])
         if not ids:
             ctx.reply("No authorized chats.")
             return
         binding = ns.get("chat_servers", {})
+        names = ns.get("chat_names", {})
         multi = len(ctx.bot.servers) > 1
         lines = ["Authorized chats:"]
         for cid in ids:
-            key = binding.get(cid)
+            name = names.get(cid)
+            who = f"{name} ({cid})" if name else cid
             if multi:
-                srv = ctx.bot.by_key.get(key)
-                label = srv.config.name if srv else (key or "(unbound)")
-                lines.append(f"  {cid} -> {label}")
+                srv = ctx.bot.by_key.get(binding.get(cid))
+                label = srv.config.name if srv else (binding.get(cid) or "(unbound)")
+                lines.append(f"  {who} -> {label}")
             else:
-                lines.append(f"  {cid}")
+                lines.append(f"  {who}")
         ctx.reply("\n".join(lines))
     router.register("listchats", cmd_listchats, private_only=True,
                     admin_only=True, needs_server=False)
@@ -2648,8 +2697,8 @@ def _make_unclaimed_handler(auth: dict):
                 return False
             _auth_ns(auth, ctx.platform)["admin_user_id"] = ctx.user_id
             save_auth(_AUTH_DOC, _AUTH_PATH)
-        logger.info("Admin claimed on %s by %s (id=%s)",
-                    ctx.platform, ctx.sender_label, ctx.user_id)
+        ctx.bot.log.info("Admin claimed on %s by [%s] (id=%s)",
+                         ctx.platform, ctx.sender_label, ctx.user_id)
         ctx.reply("You are now the admin.")
         return True
     return on_unclaimed

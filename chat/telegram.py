@@ -165,6 +165,8 @@ class TelegramAdapter(ChatAdapter):
                 args=text.split()[1:],
                 sender_label=_sender_label(message),
                 reply_to=message.message_id,
+                # Group/supergroup/channel title (None in a private chat).
+                chat_name=getattr(message.chat, "title", None),
             )
             dispatch(ctx)
 
