@@ -15,6 +15,7 @@ command transport, the save/flush sequence, and server-side queries.
 """
 
 import shutil
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -106,6 +107,48 @@ class ServerBackend(ABC):
     @abstractmethod
     def wait_for_ready(self, timeout: float = 120) -> bool:
         """Block until the server is ready to accept commands, or timeout."""
+
+    def wait_until_online(self, log_fn=None, *, stall: float = 120,
+                          cap: float = 900) -> bool:
+        """Wait for the server to accept commands, tolerating a slow boot.
+
+        Polls ``is_online`` and EXTENDS the wait as long as the server log keeps
+        growing (boot in progress) — so a server that takes minutes to start
+        (Paper + plugins on a Pi) isn't abandoned on a fixed timeout. Gives up
+        only if the log stays idle for ``stall`` seconds with the server still
+        offline (stuck/crashed), or after ``cap`` seconds overall. Uses
+        ``is_online`` (a port/lock probe), so it's robust across the log rotation
+        a restart causes — unlike matching a one-off 'ready' log line."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+
+        def size():
+            try:
+                return self.config.log_path.stat().st_size
+            except OSError:
+                return -1
+
+        start = time.time()
+        last_size, last_activity = size(), time.time()
+        announced = False
+        while time.time() - start < cap:
+            if self.is_online():
+                return True
+            time.sleep(3)
+            cur = size()
+            if cur != last_size:            # log grew -> boot is making progress
+                last_size, last_activity = cur, time.time()
+                if not announced:
+                    log("Server is starting (log active); waiting for it to "
+                        "accept commands...")
+                    announced = True
+            elif time.time() - last_activity > stall:
+                log(f"Server log idle for {int(stall)}s and still not accepting "
+                    "commands — giving up.")
+                return False
+        log(f"Server did not come online within {int(cap)}s.")
+        return False
 
     # --- command transport ---
     @abstractmethod

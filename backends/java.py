@@ -190,17 +190,15 @@ class JavaBackend(ServerBackend):
             time.sleep(1)
         return False
 
-    def relaunch(self, log_fn=None, timeout: float = 180) -> bool:
-        """Type the start command into the mux session ONCE, then poll the RCON
-        port until the server accepts connections.
+    def relaunch(self, log_fn=None) -> bool:
+        """Type the start command into the mux session ONCE, then wait
+        (activity-aware) for the server to accept RCON.
 
-        Readiness is detected with is_online() (a TCP connect), NOT by watching
-        for 'RCON running on' in the log: a restart rotates latest.log, and the
-        line can be missed — which previously made relaunch time out, retry, and
-        re-type the start command into the now-running console (garbage
-        'Unknown command's). Sending once and polling the port is rotation-proof
-        and never types into a live console. Java + plugins can boot slowly
-        (~1 min on a Pi), so the default timeout is generous."""
+        Sends once and confirms readiness via wait_until_online() — which polls
+        the RCON port and extends while latest.log keeps growing. This is
+        rotation-proof (a restart rotates latest.log) and never re-types the
+        start command into a now-running console, which previously produced
+        'Unknown command' spam and a false 'relaunch not confirmed'."""
         def log(msg):
             if log_fn:
                 log_fn(msg)
@@ -210,15 +208,10 @@ class JavaBackend(ServerBackend):
         if self.is_online():
             return True  # already up — don't type the start cmd into the console
         self._mux.send(self.config.mux_start_cmd)
-        log("Start command sent; waiting for the server to accept RCON...")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            time.sleep(3)
-            if self.is_online():
-                log("Server relaunched")
-                return True
-        log(f"Relaunch not confirmed within {int(timeout)}s "
-            "(server still not accepting RCON)")
+        log("Start command sent; waiting for the server to come up...")
+        if self.wait_until_online(log_fn):
+            log("Server relaunched")
+            return True
         return False
 
     # --- backup freeze/flush ---

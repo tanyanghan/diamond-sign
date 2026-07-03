@@ -2768,16 +2768,15 @@ def _capture_initial_online(server, bot) -> None:
     try:
         online = backend.query_online_players()
     except Exception as e:
-        logger.warning("[%s] Online query failed, server may still be starting: %s",
-                       server.config.name, e)
-        if backend.wait_for_ready(timeout=120):
-            logger.info("[%s] Server is now ready, retrying online query",
-                        server.config.name)
+        # Server not reachable yet — it may be booting. Wait activity-aware
+        # (extends while the log grows), then retry once it's online.
+        server.log.info("Online query failed (%s); waiting for the server to "
+                        "come up...", e)
+        if backend.wait_until_online(log_fn=server.log.info):
             try:
                 online = backend.query_online_players()
             except Exception as e2:
-                logger.warning("[%s] Online query retry failed: %s",
-                               server.config.name, e2)
+                server.log.warning("Online query retry failed: %s", e2)
 
     if online is None:
         # Never connected — server is likely not running. Alert the bot's admins.
