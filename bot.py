@@ -22,6 +22,7 @@ from utils.backup_utils import (
 from utils.config import (
     load_config, backup_exclude_names, EDITION_BEDROCK, ConfigError,
 )
+from utils import restore_core
 from backends import (
     make_backend, BackendUnavailable, CAP_PLAYER_RESTORE, CAP_STATS,
     EVENT_DEATH, EVENT_ACHIEVEMENT,
@@ -753,6 +754,87 @@ class Server:
         if final:
             self.log.info("Running final incremental backup before stop")
             threading.Thread(target=self.run_incremental_backup, daemon=True).start()
+
+    # --- Whole-world restore (stop -> replace -> restart) -------------------
+
+    def restore_world(self, chain: dict, point_idx: int, *, say) -> None:
+        """Restore the whole world to a chosen backup point: warn players,
+        (optionally) take a pre-restore backup, stop the server, replace its
+        files with the restored chain, then relaunch. Assumes the caller holds
+        ``backup_lock``. ``say`` reports progress to the chat.
+
+        Fail-safe: if the server is taken down but the restore or relaunch
+        errors, the ``finally`` brings it back up (or tells the admin how).
+        Nothing is relaunched unless we confirmed the server was fully down, so
+        a stuck stop can't cause a double start.
+        """
+        backend = self.backend
+        warn = self.config.restore_warning_seconds
+        stopped = down = relaunched = False
+        try:
+            # 1. In-game warning + countdown (only if the server is reachable).
+            if warn > 0 and backend.is_available():
+                backend.broadcast(f"Server restoring in {warn}s — you will be "
+                                  "disconnected. Reconnect shortly.")
+                self.log.info("World restore: warned players, %ds countdown", warn)
+                time.sleep(warn)
+                backend.broadcast("Restoring now — disconnecting...")
+
+            # 2. Optional pre-restore backup of the CURRENT world.
+            if self.config.pre_restore_backup:
+                say("Taking a pre-restore backup of the current world...")
+                try:
+                    self.run_backup(status_cb=say)
+                except Exception as e:
+                    say(f"Pre-restore backup failed, aborting restore: {e}")
+                    return
+
+            # 3. Stop and confirm the server is fully down.
+            say("Stopping the server...")
+            backend.stop_server(say)
+            stopped = True
+            if not backend.wait_until_stopped(timeout=120):
+                say("Server did not shut down in time — aborting. It was not "
+                    "relaunched (avoiding a double start); check it manually.")
+                return
+            down = True
+
+            # 4. Replace the world with the restored chain while it's down.
+            say("Restoring world files...")
+            summary = restore_core.restore_chain(
+                chain, point_idx, self.config.minecraft_dir,
+                backup_dir=self.config.backup_dir,
+                exclude_names=self.backup_exclude_names,
+                copy_cmd=self.config.backup_copy_cmd,
+                manifest_path=self.manifest_path,
+                preserve_names=self.backup_exclude_names,
+                log_fn=say)
+
+            # 5. Relaunch and confirm ready.
+            say("Restarting the server...")
+            if backend.relaunch(say):
+                relaunched = True
+                reconcile_online(self, reason="after world restore")
+                chain_note = (f" New chain {summary['chain_id']}."
+                              if summary.get("chain_id") else "")
+                say(f"World restore complete.{chain_note}")
+            else:
+                say("Restore applied but relaunch was not confirmed. Start the "
+                    f"server manually:\n  {self.config.mux_start_cmd}")
+        except Exception as e:
+            self.log.exception("World restore failed")
+            say(f"World restore failed: {e}")
+        finally:
+            # If we took the server down but never got it back up (restore error,
+            # or a relaunch we didn't confirm), try once more so it isn't left
+            # offline. Skip when it never confirmed down (avoids a double start).
+            if down and not relaunched:
+                say("Bringing the server back up...")
+                if backend.relaunch(say):
+                    reconcile_online(self, reason="after world restore")
+                else:
+                    say("Could not relaunch. Start the server manually:\n  "
+                        f"{self.config.mux_start_cmd}")
 
 
 class Bot:
@@ -1522,6 +1604,58 @@ _pending_player_lock = threading.Lock()
 _PENDING_PLAYER_RESTORE_TTL = 300  # seconds; older entries are treated as missing
 _RESTORE_PLAYER_PAGE_SIZE = 10  # versions shown per page in /restore_player listing
 
+# /restore (whole-world) pending-state, keyed like the player restore by
+# "{bot}:{server}:{platform}:{user}". Same list -> select -> confirm gate so an
+# accidental /restore can't wipe and rebuild the world in one command.
+_pending_world_restore: dict = {}
+_pending_world_lock = threading.Lock()
+_PENDING_WORLD_RESTORE_TTL = 300
+_RESTORE_PAGE_SIZE = 10  # restore points shown per page
+
+
+def _get_pending_world_restore(pkey: str, expected_stage: str | None = None) -> dict | None:
+    with _pending_world_lock:
+        entry = _pending_world_restore.get(pkey)
+        if entry is None:
+            return None
+        if time.time() - entry["ts"] > _PENDING_WORLD_RESTORE_TTL:
+            _pending_world_restore.pop(pkey, None)
+            return None
+        if expected_stage is not None and entry.get("stage") != expected_stage:
+            return None
+        return entry
+
+
+def _set_pending_world_restore(pkey: str, **fields) -> None:
+    with _pending_world_lock:
+        existing = _pending_world_restore.get(pkey, {})
+        existing.update(fields)
+        existing["ts"] = time.time()
+        _pending_world_restore[pkey] = existing
+
+
+def _clear_pending_world_restore(pkey: str) -> None:
+    with _pending_world_lock:
+        _pending_world_restore.pop(pkey, None)
+
+
+def _format_restore_points(points: list, offset: int = 0) -> str:
+    """Render one page of the numbered restore-point list for /restore."""
+    if not points:
+        return ("No backups found for this server.\n"
+                "Run /backup first, or check the backup directory.")
+    page = points[offset:offset + _RESTORE_PAGE_SIZE]
+    lines = ["World restore points (latest first).",
+             "To select, send: /restore <number>", ""]
+    for p in page:
+        chain = f"chain {p['chain_id']}" if p['chain_id'] else "standalone"
+        lines.append(f"  {p['n']:3d}.  [{p['kind']}] {p['pretty_ts']}   "
+                     f"({p['pretty_size']}, {chain})")
+    remaining = len(points) - (offset + _RESTORE_PAGE_SIZE)
+    if remaining > 0:
+        lines.append(f"\n{remaining} more. Send: /restore more")
+    return "\n".join(lines)
+
 
 def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> None:
     """Add ``fp`` to the zip under ``rel``, honouring an optional snapshot map.
@@ -1907,6 +2041,11 @@ def register_commands(router, auth: dict) -> None:
             if backend.supports(EVENT_DEATH):
                 lines.append("/scan_deaths — scan all logs for deaths")
             lines.append("/backup — trigger a server backup now")
+            if backend.supports(CAP_PLAYER_RESTORE):
+                lines.append("/restore_player <username> — restore one player's data")
+            if backend.can_restart:
+                lines.append("/restore [<N>] — restore the whole world (stops + "
+                             "restarts the server)")
             lines.append(f"/allowlist <on|off|add|remove|list|reload> [player] "
                          f"— server {backend.ALLOWLIST_VERB}")
         ctx.reply("\n".join(lines))
@@ -2310,6 +2449,95 @@ def register_commands(router, auth: dict) -> None:
                     private_only=True, admin_only=True,
                     cap=lambda ctx: ctx.server.backend.supports(CAP_PLAYER_RESTORE),
                     cap_message="Per-player restore is not available on this server edition.")
+
+    # --- /restore (whole-world restore: stop -> replace -> restart) ---
+    def cmd_restore(ctx):
+        server = ctx.server
+        pkey = (f"{ctx.bot.config.name}:{server.config.key}:"
+                f"{ctx.platform}:{ctx.user_id}")
+        sub = ctx.args[0] if ctx.args else None
+
+        def discover():
+            return restore_core.list_restore_points(
+                restore_core.discover_chains(server.config.backup_dir))
+
+        # Bare /restore or "/restore more": (re)show the paged list.
+        if sub is None or sub.lower() == "more":
+            points = discover()
+            if sub is None:
+                offset = 0
+                _set_pending_world_restore(pkey, stage="listed", offset=0)
+            else:
+                entry = _get_pending_world_restore(pkey)
+                if entry is None:
+                    ctx.reply("Send /restore first to see the list.")
+                    return
+                offset = entry.get("offset", 0) + _RESTORE_PAGE_SIZE
+                if offset >= len(points):
+                    ctx.reply("No more restore points.")
+                    return
+                _set_pending_world_restore(pkey, offset=offset)
+            server.log.info("Restore: %s listed %d point(s)",
+                            ctx.sender_label, len(points))
+            ctx.reply(_format_restore_points(points, offset=offset))
+            return
+
+        # "/restore <N> [confirm]"
+        try:
+            n = int(sub)
+        except ValueError:
+            ctx.reply("Usage: /restore  |  /restore <N>  |  /restore <N> confirm")
+            return
+        confirm = len(ctx.args) >= 2 and ctx.args[1].lower() == "confirm"
+        points = discover()
+        if not (1 <= n <= len(points)):
+            ctx.reply(f"Invalid selection: {n}. Choose 1-{len(points)}.")
+            return
+        point = points[n - 1]
+        chains = restore_core.discover_chains(server.config.backup_dir)
+
+        if not confirm:
+            _set_pending_world_restore(pkey, stage="selected", selected_n=n)
+            pre = ("A fresh full backup of the current world will be taken first."
+                   if server.config.pre_restore_backup
+                   else "No pre-restore backup will be taken (backup.pre_restore_"
+                        "backup is off).")
+            ctx.reply(
+                "Confirm WORLD restore — this stops the server, replaces the "
+                "world, and restarts it:\n"
+                f"  Point:  [{point['kind']}] {point['pretty_ts']}\n"
+                f"  Chain:  {point['chain_id'] or 'standalone'}\n"
+                f"  {pre}\n"
+                f"  Players will be warned {server.config.restore_warning_seconds}s "
+                "in-game, then disconnected.\n\n"
+                f"  To proceed, send:  /restore {n} confirm")
+            return
+
+        entry = _get_pending_world_restore(pkey, expected_stage="selected")
+        if entry is None or entry.get("selected_n") != n:
+            ctx.reply(f"Select first: /restore {n}")
+            return
+        _clear_pending_world_restore(pkey)
+        server.log.info("Restore: %s confirmed world restore to %s (%s)",
+                        ctx.sender_label, point["pretty_ts"], point["kind"])
+        ctx.reply(f"Starting world restore to {point['pretty_ts']}...")
+        say = lambda m: ctx.adapter.send(ctx.chat_id, m)
+
+        def run():
+            if not server.backup_lock.acquire(blocking=False):
+                say("A backup or restore is already in progress.")
+                return
+            try:
+                server.restore_world(chains[point["chain_idx"]],
+                                     point["point_idx"], say=say)
+            finally:
+                server.backup_lock.release()
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("restore", cmd_restore, private_only=True, admin_only=True,
+                    cap=lambda ctx: ctx.server.backend.can_restart,
+                    cap_message="World restore needs a restart transport — set "
+                                "mux.session + mux.start_cmd for this server.")
 
     # --- /chat_id (public — lets an unauthorized chat learn its ID) ---
     def cmd_chat_id(ctx):
