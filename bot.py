@@ -2862,27 +2862,47 @@ def _bring_up_server(server, bot) -> bool:
         return False
     logger.info("[%s] Server edition: %s", server.config.name, server.config.edition)
 
-    # Player registry, achievements, deaths (registry is backend-sourced).
-    server.load_state()
+    try:
+        # Player registry, achievements, deaths (registry is backend-sourced).
+        server.load_state()
 
-    notify = make_notify_callback(bot, server)
-    log_path = server.config.log_path
-    watcher = LogWatcher(server, notify,
-                         on_server_start=lambda: reconcile_online(
-                             server, reason="server start"))
-    server.watcher = watcher
-    server.backend.attach_watcher(watcher)
-    observer = Observer()
-    observer.schedule(watcher, path=str(log_path.parent), recursive=False)
-    observer.start()
-    server.observer = observer
-    logger.info("[%s] Watching %s for join/leave events",
-                server.config.name, log_path)
+        notify = make_notify_callback(bot, server)
+        log_path = server.config.log_path
+        # inotify needs the watch directory to exist. For Java the server
+        # creates logs/ on start; create it here so a not-yet-started server
+        # (or one whose dir was just replaced by a restore) doesn't fail the
+        # watcher. LogWatcher already tolerates the log file itself being absent.
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        watcher = LogWatcher(server, notify,
+                             on_server_start=lambda: reconcile_online(
+                                 server, reason="server start"))
+        server.watcher = watcher
+        server.backend.attach_watcher(watcher)
+        observer = Observer()
+        observer.schedule(watcher, path=str(log_path.parent), recursive=False)
+        observer.start()
+        server.observer = observer
+        logger.info("[%s] Watching %s for join/leave events",
+                    server.config.name, log_path)
 
-    _capture_initial_online(server, bot)
-    _validate_chain(server)
-    _start_scheduled_backup(server, bot)
-    return True
+        _capture_initial_online(server, bot)
+        _validate_chain(server)
+        _start_scheduled_backup(server, bot)
+        return True
+    except Exception as e:
+        # One server failing to come up must not crash the whole process (other
+        # bots/servers keep running); drop it and alert this bot's admins.
+        logger.exception("[%s] Failed to bring up server", server.config.name)
+        bot.alert_admins(f"⚠️ Diamond Sign could not bring up "
+                         f"{server.config.name}: {e}")
+        if server.observer is not None:
+            try:
+                server.observer.stop()
+                server.observer.join()
+            except Exception:
+                pass
+            server.observer = None
+        return False
 
 
 def _bring_up_bot(bot) -> None:
