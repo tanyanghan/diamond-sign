@@ -137,6 +137,7 @@ both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
       { "command": "/allowlist", "description": "Manage the allow/whitelist", "should_escape": false },
       { "command": "/restore_player", "description": "Restore one player", "should_escape": false },
       { "command": "/chat_id", "description": "Show this chat's ID", "should_escape": false },
+      { "command": "/use", "description": "Pick the server your commands act on", "should_escape": false },
       { "command": "/authorize", "description": "Whitelist a chat", "should_escape": false },
       { "command": "/revoke", "description": "Remove a chat", "should_escape": false },
       { "command": "/listchats", "description": "List authorized chats", "should_escape": false },
@@ -286,9 +287,10 @@ chat on every platform, and answers commands in whichever chat they're sent.
 | `/deaths [player]` | Show death history |
 | `/death_summary` | Deaths grouped by cause with per-player counts |
 | `/chat_id` | Show the current chat's ID |
-| `/authorize <chat_id>` | *(Admin)* Whitelist a chat |
+| `/use [<server>]` | *(Admin)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only) |
+| `/authorize <chat_id> [<server>]` | *(Admin)* Whitelist a chat; on a multi-server bot bind it to `<server>` |
 | `/revoke <chat_id>` | *(Admin)* Remove a chat from the whitelist |
-| `/listchats` | *(Admin)* List authorised chats |
+| `/listchats` | *(Admin)* List authorised chats (and their bound server) |
 | `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
 | `/backup` | *(Admin)* Trigger a server backup now |
