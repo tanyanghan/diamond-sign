@@ -104,10 +104,6 @@ class ServerBackend(ABC):
         without a probe doesn't over-restrict command gating."""
         return True
 
-    @abstractmethod
-    def wait_for_ready(self, timeout: float = 120) -> bool:
-        """Block until the server is ready to accept commands, or timeout."""
-
     def wait_until_online(self, log_fn=None, *, stall: float = 120,
                           cap: float = 900) -> bool:
         """Wait for the server to accept commands, tolerating a slow boot.

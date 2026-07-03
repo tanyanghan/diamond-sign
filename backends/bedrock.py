@@ -22,7 +22,6 @@ import re
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 from utils.backup_utils import RE_FULL, RE_INCR
 from .base import (
@@ -180,13 +179,6 @@ class BedrockBackend(ServerBackend):
                 bedrock_player.world_db_path(self.config.minecraft_dir))
         except Exception:
             return False
-
-    def wait_for_ready(self, timeout: float = 120) -> bool:
-        """Wait for BDS to report it has started (in console.log)."""
-        logger.info("Waiting for Bedrock server to be ready (monitoring %s)...",
-                    self.config.log_path.name)
-        waiter = self._watcher.expect_line("Server started")
-        return waiter.wait(timeout=timeout)
 
     # --- command transport (fire-and-forget) ---
     def send_command(self, cmd: str) -> str:

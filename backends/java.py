@@ -121,12 +121,6 @@ class JavaBackend(ServerBackend):
         except OSError:
             return False
 
-    def wait_for_ready(self, timeout: float = 120) -> bool:
-        """Wait for the 'RCON running on' line in latest.log via the watcher."""
-        logger.info("Waiting for RCON to be ready (monitoring latest.log)...")
-        waiter = self._watcher.expect_line("RCON running on")
-        return waiter.wait(timeout=timeout)
-
     # --- command transport ---
     def send_command(self, cmd: str) -> str:
         """Send an RCON command and return the response.

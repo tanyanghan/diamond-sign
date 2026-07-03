@@ -16,7 +16,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from utils.backup_utils import (
-    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, META_FILES, RE_FULL, RE_INCR,
+    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, META_FILES,
     build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
 )
 from utils.config import (
@@ -770,7 +770,7 @@ class Server:
         """
         backend = self.backend
         warn = self.config.restore_warning_seconds
-        stopped = down = relaunched = False
+        down = relaunched = False
         try:
             # 1. In-game warning + countdown — best-effort, and only when the
             #    server is actually running (is_online, not is_available: a
@@ -800,7 +800,6 @@ class Server:
             # 3. Stop and confirm the server is fully down.
             say("Stopping the server...")
             backend.stop_server(say)
-            stopped = True
             if not backend.wait_until_stopped(timeout=120):
                 say("Server did not shut down in time — aborting. It was not "
                     "relaunched (avoiding a double start); check it manually.")
