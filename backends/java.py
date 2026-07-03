@@ -190,22 +190,35 @@ class JavaBackend(ServerBackend):
             time.sleep(1)
         return False
 
-    def relaunch(self, log_fn=None) -> bool:
-        """Type the start command into the mux session, then wait for RCON to
-        come back ('RCON running on' in latest.log)."""
+    def relaunch(self, log_fn=None, timeout: float = 180) -> bool:
+        """Type the start command into the mux session ONCE, then poll the RCON
+        port until the server accepts connections.
+
+        Readiness is detected with is_online() (a TCP connect), NOT by watching
+        for 'RCON running on' in the log: a restart rotates latest.log, and the
+        line can be missed — which previously made relaunch time out, retry, and
+        re-type the start command into the now-running console (garbage
+        'Unknown command's). Sending once and polling the port is rotation-proof
+        and never types into a live console. Java + plugins can boot slowly
+        (~1 min on a Pi), so the default timeout is generous."""
         def log(msg):
             if log_fn:
                 log_fn(msg)
         if not self.can_restart:
             log("No mux/start command configured; cannot relaunch the server")
             return False
-        for attempt in range(1, 4):
-            self._mux.send(self.config.mux_start_cmd)
-            if self.wait_for_ready(timeout=120):
+        if self.is_online():
+            return True  # already up — don't type the start cmd into the console
+        self._mux.send(self.config.mux_start_cmd)
+        log("Start command sent; waiting for the server to accept RCON...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            if self.is_online():
                 log("Server relaunched")
                 return True
-            if attempt < 3:
-                log(f"Relaunch not confirmed (attempt {attempt}/3), retrying")
+        log(f"Relaunch not confirmed within {int(timeout)}s "
+            "(server still not accepting RCON)")
         return False
 
     # --- backup freeze/flush ---
