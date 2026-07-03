@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from .base import (
     ServerBackend, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
     CAP_PLAYER_RESTORE, CAP_STATS,
 )
+from .mux import detect
 
 logger = logging.getLogger("mcnotifier")
 
@@ -52,6 +54,11 @@ class JavaBackend(ServerBackend):
     def __init__(self, config, migrate_legacy=False):
         super().__init__(config, migrate_legacy)
         self.names_path = self._data_path("player_names.json")
+        # Optional mux — only needed to RESTART the JVM for a world restore
+        # (RCON dies with the server, so the start command must be typed into the
+        # session hosting it). Absent for a normal Java install; when unset the
+        # world-restore command is refused (see can_restart). Never fatal.
+        self._mux = detect(config.mux_session) if config.mux_session else None
 
     # --- availability / readiness ---
     def is_available(self, log_warnings: bool = False) -> bool:
@@ -109,6 +116,57 @@ class JavaBackend(ServerBackend):
             return mcr.command(cmd)
         finally:
             mcr.disconnect()
+
+    # --- server lifecycle (world restore: stop -> replace files -> start) ---
+    @property
+    def can_restart(self) -> bool:
+        """Java can stop/restart only if it runs under a mux with a start command
+        (RCON alone can stop but not relaunch the JVM)."""
+        return bool(self._mux and self.config.mux_start_cmd)
+
+    def stop_server(self, log_fn=None) -> bool:
+        """Issue the RCON ``stop`` command. The RCON link drops as the JVM shuts
+        down (so the call may error mid-shutdown — that's fine); actual shutdown
+        is confirmed by wait_until_stopped()."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+        try:
+            self.send_command("stop")
+        except Exception:
+            pass  # connection dropped as the server went down
+        log("Stop requested")
+        return True
+
+    def wait_until_stopped(self, timeout: float = 120) -> bool:
+        """Poll RCON until it stops answering — i.e. the JVM (and its RCON
+        listener) is gone."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.send_command("list")
+            except Exception:
+                return True  # RCON refused/failed -> server is down
+            time.sleep(1)
+        return False
+
+    def relaunch(self, log_fn=None) -> bool:
+        """Type the start command into the mux session, then wait for RCON to
+        come back ('RCON running on' in latest.log)."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+        if not self.can_restart:
+            log("No mux/start command configured; cannot relaunch the server")
+            return False
+        for attempt in range(1, 4):
+            self._mux.send(self.config.mux_start_cmd)
+            if self.wait_for_ready(timeout=120):
+                log("Server relaunched")
+                return True
+            if attempt < 3:
+                log(f"Relaunch not confirmed (attempt {attempt}/3), retrying")
+        return False
 
     # --- backup freeze/flush ---
     def begin_save(self, log_fn=None) -> None:

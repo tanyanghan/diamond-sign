@@ -291,9 +291,15 @@ class BedrockBackend(ServerBackend):
             log("Warning: 'save resume' not confirmed after retries")
 
     # --- server lifecycle (per-player restore: stop -> edit db -> relaunch) ---
+    @property
+    def can_restart(self) -> bool:
+        """Bedrock always runs under a mux (required at construction); it can
+        relaunch as long as a start command is set (synthesized by default)."""
+        return bool(self.config.mux_start_cmd)
+
     def stop_server(self, log_fn=None) -> bool:
         """Request a stop and confirm BDS acknowledged it. Actual shutdown (lock
-        release) is confirmed separately by wait_for_db_unlock()."""
+        release) is confirmed separately by wait_until_stopped()."""
         def log(msg):
             if log_fn:
                 log_fn(msg)
@@ -301,7 +307,7 @@ class BedrockBackend(ServerBackend):
         log("Stop requested" if ok else "Warning: 'stop' not confirmed")
         return ok
 
-    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
+    def wait_until_stopped(self, timeout: float = 120) -> bool:
         """Poll until the world db LevelDB lock is released (server fully down)."""
         from utils import bedrock_player
         db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
@@ -567,7 +573,7 @@ class BedrockBackend(ServerBackend):
             status("Stopping server...")
             self.stop_server(status)
             stopped = True
-            if not self.wait_for_db_unlock(timeout=120):
+            if not self.wait_until_stopped(timeout=120):
                 status("⚠️ Server did not release the world db in time. "
                        "Aborting; check the server manually.")
                 return

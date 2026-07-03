@@ -126,6 +126,15 @@ class ServerBackend(ABC):
             cmd += " " + " ".join(args)
         return self.capture_command(cmd, timeout=timeout)
 
+    def broadcast(self, message: str) -> None:
+        """Announce ``message`` to all players in-game via the console ``say``
+        command. Works on both editions (Java over RCON, Bedrock over the mux).
+        Newlines are stripped: ``say`` is a single line and the mux guard
+        (backends/mux.py) refuses control characters anyway."""
+        one_line = " ".join(message.split())
+        if one_line:
+            self.send_command(f"say {one_line}")
+
     # --- backup freeze/flush ---
     @abstractmethod
     def begin_save(self, log_fn=None) -> None:
@@ -161,16 +170,26 @@ class ServerBackend(ABC):
     # backup manifest/chain state; Bedrock simply omits the capability. The
     # backend's role there is limited to the save dance and ``is_player_online``.
 
-    # --- server lifecycle (Bedrock per-player restore: stop -> edit -> start) ---
-    # Java doesn't need these (RCON edits live), so they default to NotSupported
-    # and only the Bedrock backend overrides them.
+    # --- server lifecycle (stop -> replace files -> start) ---
+    # Used by Bedrock per-player restore and by the world-restore command on both
+    # editions. Bedrock always overrides these; Java overrides them only when a
+    # mux + start command are configured (else they stay NotSupported, and
+    # ``can_restart`` is False so /restore is refused with a clear message).
+    @property
+    def can_restart(self) -> bool:
+        """Whether this backend can stop and relaunch the server (needed for a
+        world restore). Subclasses override based on their transport."""
+        return False
+
     def stop_server(self, log_fn=None) -> bool:
-        """Stop the server and return once it has shut down."""
+        """Request a stop and return once the server has acknowledged it (actual
+        shutdown is confirmed by ``wait_until_stopped``)."""
         raise NotSupported("stop_server")
 
-    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
-        """Wait until the world db is no longer locked by the server."""
-        raise NotSupported("wait_for_db_unlock")
+    def wait_until_stopped(self, timeout: float = 120) -> bool:
+        """Block until the server process is fully down (Bedrock: world db lock
+        released; Java: RCON no longer answering)."""
+        raise NotSupported("wait_until_stopped")
 
     def relaunch(self, log_fn=None) -> bool:
         """Relaunch the server and return once it reports ready."""
