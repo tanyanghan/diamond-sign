@@ -11,10 +11,13 @@
           "edition": "java",
           "minecraft_dir": "/srv/survival",
           "rcon": { "password": "your_rcon_password", "host": "localhost", "port": 25575 },
+          "mux": { "session": "0:survival", "start_cmd": "cd /srv/survival && java -jar server.jar nogui" },
           "backup": {
             "dir": "~/backup/survival",
             "schedule": "daily",
             "hour": 4,
+            "pre_restore_backup": false,
+            "restore_warning_seconds": 15,
             "incremental": { "enabled": true, "interval_minutes": 15 }
           },
           "chat_relay": false
@@ -42,7 +45,12 @@
           "console_log": null,
           "bedrock_script_events": true,
           "chat_relay": true,
-          "backup": { "dir": "~/backup/bedrock", "incremental": { "enabled": true } }
+          "backup": {
+            "dir": "~/backup/bedrock",
+            "pre_restore_backup": false,
+            "restore_warning_seconds": 15,
+            "incremental": { "enabled": true }
+          }
         }
       ]
     }

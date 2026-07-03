@@ -136,6 +136,7 @@ both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
       { "command": "/backup", "description": "Trigger a backup now", "should_escape": false },
       { "command": "/allowlist", "description": "Manage the allow/whitelist", "should_escape": false },
       { "command": "/restore_player", "description": "Restore one player", "should_escape": false },
+      { "command": "/restore", "description": "Restore the whole world (stops + restarts the server)", "should_escape": false },
       { "command": "/chat_id", "description": "Show this chat's ID", "should_escape": false },
       { "command": "/use", "description": "Pick the server your commands act on", "should_escape": false },
       { "command": "/authorize", "description": "Whitelist a chat", "should_escape": false },
@@ -296,6 +297,7 @@ chat on every platform, and answers commands in whichever chat they're sent.
 | `/backup` | *(Admin)* Trigger a server backup now |
 | `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore one player's data |
+| `/restore [<N> [confirm]]` | *(Admin)* Restore the whole world to a backup point — warns players in-game, then stops, replaces, and restarts the server |
 
 **Slack note.** Slack reserves `/status` and `/help`, so on Slack they're
 `/online` and `/commands` respectively (the bot maps them back internally). Every
@@ -413,35 +415,55 @@ full backup. File naming:
 
 ## Restoring from backups
 
-Use `restore.py` to restore the whole server from a backup chain (full +
-incrementals). **Stop the server first** — restoring while it runs corrupts data.
+### Whole-world restore from chat — `/restore`
+
+`/restore` (admin, in a DM) restores the entire world to a chosen backup point
+**and handles the server for you**: it warns players in-game, stops the server,
+replaces the world with the restored chain, and restarts it — no manual
+stop/start. It runs in three enforced steps so a mistyped message can't wipe the
+world:
+
+1. `/restore` — lists restore points (full + incrementals, latest first);
+   `/restore more` pages.
+2. `/restore <N>` — shows a confirmation block (the point, whether a pre-restore
+   backup will run, and the in-game warning window).
+3. `/restore <N> confirm` — warns players, stops, restores, and restarts.
+
+Two `backup` config keys tune it:
+
+| `backup.…` key | Meaning | Default |
+|----------------|---------|---------|
+| `pre_restore_backup` | Take a fresh full backup of the **current** world before wiping it (a recoverable pre-restore snapshot). Off = a direct stop → wipe → extract. | `false` |
+| `restore_warning_seconds` | In-game "server restoring, you'll be disconnected" warning lead time before the stop. | `15` |
+
+**Restart transport.** `/restore` must stop and restart the server. **Bedrock**
+already runs under tmux/screen with a start command, so it works out of the box.
+**Java** additionally needs `mux.session` + `mux.start_cmd` set (run the JVM under
+tmux/screen; the bot stops it via RCON `stop` and restarts it by typing the start
+command into the session — RCON can't relaunch the JVM itself). Without them,
+`/restore` is refused with a clear message; everything else keeps working.
+
+### Offline restore — `restore.py`
+
+For disaster recovery when the bot isn't running, `restore.py` does the same
+restore from a shell (it does **not** stop/start the server — do that yourself):
 
 ```bash
-python restore.py [--backup-dir PATH] [--target-dir PATH] [--dry-run]
+python restore.py --server <name>            # per-server paths from diamondsign.json
+python restore.py --server <name> --dry-run  # preview only
+python restore.py --backup-dir P --target-dir Q   # files-only, no chain reset
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--backup-dir` | Directory containing backup zips | `BACKUP_DIR` from `.env` |
-| `--target-dir` | Directory to restore into | `MINECRAFT_DIR` from `.env` |
-| `--dry-run` | Preview without writing files | *(off)* |
+It scans the backup directory, groups incrementals into chains, shows restore
+points, then extracts the full backup and applies each incremental up to your
+pick. With `--server` (in-place) it rebuilds the manifest and writes a fresh
+`.diamondsign_chain`; restoring to an incremental point also writes a single
+**merged incremental** so the new chain needs only the original full + that one
+file. Without `--server` it extracts files only (no chain reset).
 
-The tool scans the backup directory, groups incrementals into chains, and shows
-restore points organised by chain. After you pick one it extracts the full backup
-and applies each incremental up to that point.
-
-- **In-place** (`--target-dir` is `MINECRAFT_DIR`, the default): rebuilds the
-  manifest and writes a fresh `.mcnotifier_chain`. Restoring to an incremental
-  point also writes a single **merged incremental** so the new chain needs only
-  the original full backup + that one file going forward.
-- **Out-of-place** (any other target): extracts files only — no new chain, no
-  marker, manifest untouched. The bot keeps tracking `MINECRAFT_DIR`'s chain. If
-  you later promote the target by replacing `MINECRAFT_DIR` with it, the missing
-  `.mcnotifier_chain` forces a fresh full backup on the next `/backup`.
-
-If you restore by other means (manual copy, other tools), delete
-`backup_manifest.json` and `.mcnotifier_chain` so the bot starts a fresh chain on
-the next full backup.
+If you restore by other means (manual copy, other tools), delete that server's
+`data/<name>/backup_manifest.json` and its `.diamondsign_chain` so the bot starts
+a fresh chain on the next full backup.
 
 ### Restoring a single player
 
@@ -596,7 +618,7 @@ Entry points (run directly):
 | File | Description |
 |------|-------------|
 | `bot.py` | Main bot — log watcher, command handlers, stats, orchestration |
-| `restore.py` | Interactive CLI to restore from backup chains |
+| `restore.py` | Interactive CLI to restore from backup chains (offline; over `utils/restore_core`) |
 | `install_bedrock_pack.py` | One-command installer/uninstaller for the Bedrock behavior pack |
 
 Packages and helpers (imported):
@@ -605,7 +627,7 @@ Packages and helpers (imported):
 |------|-------------|
 | `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base`, `java` (RCON), `bedrock` (tmux/screen), `mux` |
-| `utils/` | Imported helpers: `config` (`ServerConfig` + world-layout), `backup_utils` (chain/manifest), `bedrock_player` (world-LevelDB + sidecar) |
+| `utils/` | Imported helpers: `config` (`ServerConfig` + world-layout), `backup_utils` (chain/manifest), `restore_core` (headless restore, shared by the bot + `restore.py`), `bedrock_player` (world-LevelDB + sidecar) |
 | `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events (Script API) |
 | `requirements.txt` | Python dependencies |
 | `requirements-bedrock-restore.txt` | Optional deps for Bedrock per-player restore |
