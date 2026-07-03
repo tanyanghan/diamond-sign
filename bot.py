@@ -2885,9 +2885,16 @@ def _bring_up_server(server, bot) -> bool:
         logger.info("[%s] Watching %s for join/leave events",
                     server.config.name, log_path)
 
-        _capture_initial_online(server, bot)
         _validate_chain(server)
         _start_scheduled_backup(server, bot)
+        # Capturing who's already online can wait up to ~2 min for RCON when the
+        # server is still booting (or down). Do it off the startup path so a
+        # slow/down server doesn't delay this bot's chat adapters and leave it
+        # unresponsive — join/leave events and reconcile fill the online set
+        # meanwhile.
+        threading.Thread(
+            target=_capture_initial_online, args=(server, bot), daemon=True,
+            name=f"online-{server.config.key}").start()
         return True
     except Exception as e:
         # One server failing to come up must not crash the whole process (other
