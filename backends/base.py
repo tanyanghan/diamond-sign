@@ -91,8 +91,17 @@ class ServerBackend(ABC):
     # --- availability / readiness ---
     @abstractmethod
     def is_available(self, log_warnings: bool = False) -> bool:
-        """Whether the backend can currently issue commands (RCON configured and
-        server.properties valid for Java; a live mux session for Bedrock)."""
+        """Whether the backend is CONFIGURED to issue commands (RCON set up and
+        server.properties valid for Java; a mux session for Bedrock). This is a
+        config check — it does NOT mean the server process is running; use
+        ``is_online`` for liveness."""
+
+    def is_online(self) -> bool:
+        """Whether the server PROCESS is currently running/reachable — distinct
+        from ``is_available`` (config only). Subclasses probe cheaply (Java: the
+        RCON port; Bedrock: the world-db lock). Defaults True so a backend
+        without a probe doesn't over-restrict command gating."""
+        return True
 
     @abstractmethod
     def wait_for_ready(self, timeout: float = 120) -> bool:

@@ -171,6 +171,16 @@ class BedrockBackend(ServerBackend):
             logger.warning("Bedrock: no tmux/screen session available for commands")
         return ok
 
+    def is_online(self) -> bool:
+        """True if BDS holds the world LevelDB lock — i.e. the server process is
+        running. A cheap filesystem check (no console round-trip)."""
+        from utils import bedrock_player
+        try:
+            return bedrock_player.is_db_locked(
+                bedrock_player.world_db_path(self.config.minecraft_dir))
+        except Exception:
+            return False
+
     def wait_for_ready(self, timeout: float = 120) -> bool:
         """Wait for BDS to report it has started (in console.log)."""
         logger.info("Waiting for Bedrock server to be ready (monitoring %s)...",

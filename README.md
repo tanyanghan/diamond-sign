@@ -137,6 +137,7 @@ both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
       { "command": "/allowlist", "description": "Manage the allow/whitelist", "should_escape": false },
       { "command": "/restore_player", "description": "Restore one player", "should_escape": false },
       { "command": "/restore", "description": "Restore the whole world (stops + restarts the server)", "should_escape": false },
+      { "command": "/start", "description": "Start the server if it's offline", "should_escape": false },
       { "command": "/chat_id", "description": "Show this chat's ID", "should_escape": false },
       { "command": "/use", "description": "Pick the server your commands act on", "should_escape": false },
       { "command": "/authorize", "description": "Whitelist a chat", "should_escape": false },
@@ -298,6 +299,7 @@ chat on every platform, and answers commands in whichever chat they're sent.
 | `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore one player's data |
 | `/restore [<N> [confirm]]` | *(Admin)* Restore the whole world to a backup point — warns players in-game, then stops, replaces, and restarts the server |
+| `/start` | *(Admin)* Start the server if it's offline (via `mux.start_cmd`). Commands that need the live server (`/backup`, `/allowlist`, `/restore_player`) are refused while it's offline |
 
 **Slack note.** Slack reserves `/status` and `/help`, so on Slack they're
 `/online` and `/commands` respectively (the bot maps them back internally). Every

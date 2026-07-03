@@ -772,13 +772,21 @@ class Server:
         warn = self.config.restore_warning_seconds
         stopped = down = relaunched = False
         try:
-            # 1. In-game warning + countdown (only if the server is reachable).
-            if warn > 0 and backend.is_available():
-                backend.broadcast(f"Server restoring in {warn}s — you will be "
-                                  "disconnected. Reconnect shortly.")
-                self.log.info("World restore: warned players, %ds countdown", warn)
-                time.sleep(warn)
-                backend.broadcast("Restoring now — disconnecting...")
+            # 1. In-game warning + countdown — best-effort, and only when the
+            #    server is actually running (is_online, not is_available: a
+            #    down server can't be broadcast to, and a failed broadcast must
+            #    never abort the restore we're about to do anyway).
+            if warn > 0 and backend.is_online():
+                try:
+                    backend.broadcast(f"Server restoring in {warn}s — you will "
+                                      "be disconnected. Reconnect shortly.")
+                    self.log.info("World restore: warned players, %ds countdown",
+                                  warn)
+                    time.sleep(warn)
+                    backend.broadcast("Restoring now — disconnecting...")
+                except Exception:
+                    self.log.warning("World restore: in-game warning failed "
+                                     "(continuing)")
 
             # 2. Optional pre-restore backup of the CURRENT world.
             if self.config.pre_restore_backup:
@@ -2087,6 +2095,7 @@ def register_commands(router, auth: dict) -> None:
             if backend.can_restart:
                 lines.append("/restore [<N>] — restore the whole world (stops + "
                              "restarts the server)")
+                lines.append("/start — start the server if it's offline")
             lines.append(f"/allowlist <on|off|add|remove|list|reload> [player] "
                          f"— server {backend.ALLOWLIST_VERB}")
         ctx.reply("\n".join(lines))
@@ -2095,17 +2104,26 @@ def register_commands(router, auth: dict) -> None:
     # --- /status ---
     def cmd_status(ctx):
         _cmd_log(ctx, "Status")
+        server = ctx.server
+        # Liveness first, so a down server gets a clear "offline" answer instead
+        # of a slow/last-known one.
+        if not server.backend.is_online():
+            start_hint = " Start it with /start." if server.backend.can_restart else ""
+            reply = f"🔴 {server.config.name} is offline.{start_hint}"
+            ctx.reply(reply)
+            ctx.bot.log.info("Status: replied to [%s] — offline", ctx.sender_label)
+            return
         # Query the server live (and reconcile the in-memory set) so the answer
         # reflects reality, not just what the bot last parsed from the log.
-        online = reconcile_online(ctx.server, reason="/status")
+        online = reconcile_online(server, reason="/status")
         suffix = ""
-        if online is None:  # server unreachable — fall back to last-known set
-            online = ctx.server.get_online_players()
+        if online is None:  # reachable a moment ago but query failed — last-known
+            online = server.get_online_players()
             suffix = " (server unreachable; last known)"
         if online:
-            reply = f"Players online: {len(online)} ({', '.join(online)}){suffix}"
+            reply = f"🟢 Players online: {len(online)} ({', '.join(online)}){suffix}"
         else:
-            reply = f"No players currently online.{suffix}"
+            reply = f"🟢 {server.config.name} online — no players currently online.{suffix}"
         ctx.reply(reply)
         ctx.bot.log.info("Status: replied to [%s] — %s", ctx.sender_label, reply)
     router.register("status", cmd_status)
@@ -2328,7 +2346,8 @@ def register_commands(router, auth: dict) -> None:
                 server.backup_lock.release()
 
         threading.Thread(target=run, daemon=True).start()
-    router.register("backup", cmd_backup, private_only=True, admin_only=True)
+    router.register("backup", cmd_backup, private_only=True, admin_only=True,
+                    needs_online=True)
 
     # --- /allowlist (server whitelist/allowlist passthrough) ---
     _ALLOWLIST_SUBS = {"on", "off", "add", "remove", "list", "reload"}
@@ -2367,7 +2386,8 @@ def register_commands(router, auth: dict) -> None:
                              monospace=True)
 
         threading.Thread(target=run, daemon=True).start()
-    router.register("allowlist", cmd_allowlist, private_only=True, admin_only=True)
+    router.register("allowlist", cmd_allowlist, private_only=True,
+                    admin_only=True, needs_online=True)
 
     # --- /restore_player ---
     def cmd_restore_player(ctx):
@@ -2489,7 +2509,7 @@ def register_commands(router, auth: dict) -> None:
                     ctx.sender_label, ctx.chat_label, n, version["source"], canonical)
         ctx.reply(_format_confirm_reply(canonical, uuid, n, version))
     router.register("restore_player", cmd_restore_player,
-                    private_only=True, admin_only=True,
+                    private_only=True, admin_only=True, needs_online=True,
                     cap=lambda ctx: ctx.server.backend.supports(CAP_PLAYER_RESTORE),
                     cap_message="Per-player restore is not available on this server edition.")
 
@@ -2581,6 +2601,33 @@ def register_commands(router, auth: dict) -> None:
     router.register("restore", cmd_restore, private_only=True, admin_only=True,
                     cap=lambda ctx: ctx.server.backend.can_restart,
                     cap_message="World restore needs a restart transport — set "
+                                "mux.session + mux.start_cmd for this server.")
+
+    # --- /start (admin: bring the server up via its start command) ---
+    def cmd_start(ctx):
+        server = ctx.server
+        _cmd_log(ctx, "Start")
+        if server.backend.is_online():
+            ctx.reply(f"{server.config.name} is already running.")
+            return
+        ctx.reply(f"Starting {server.config.name}...")
+        say = lambda m: ctx.adapter.send(ctx.chat_id, m)
+
+        def run():
+            # relaunch = type the start command into the mux session, then wait
+            # for the server to report ready. We deliberately do NOT auto-start
+            # from other commands — the admin invokes /start explicitly.
+            if server.backend.relaunch(say):
+                reconcile_online(server, reason="after /start")
+                say(f"{server.config.name} is up.")
+            else:
+                say(f"Could not start {server.config.name}. Check the mux "
+                    f"session / start command:\n  {server.config.mux_start_cmd}")
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("start", cmd_start, private_only=True, admin_only=True,
+                    cap=lambda ctx: ctx.server.backend.can_restart,
+                    cap_message="/start needs a start transport — set "
                                 "mux.session + mux.start_cmd for this server.")
 
     # --- /chat_id (public — lets an unauthorized chat learn its ID) ---

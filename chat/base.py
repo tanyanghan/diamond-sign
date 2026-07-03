@@ -123,12 +123,14 @@ class CommandRouter:
         self._resolve = resolve
 
     def register(self, names, handler, *, private_only=False, admin_only=False,
-                 cap=None, cap_message=None, public=False, needs_server=True):
+                 cap=None, cap_message=None, public=False, needs_server=True,
+                 needs_online=False):
         if isinstance(names, str):
             names = [names]
         spec = {"handler": handler, "private_only": private_only,
                 "admin_only": admin_only, "cap": cap, "cap_message": cap_message,
-                "public": public, "needs_server": needs_server}
+                "public": public, "needs_server": needs_server,
+                "needs_online": needs_online}
         for n in names:
             self._cmds[n] = spec
 
@@ -174,6 +176,15 @@ class CommandRouter:
         if spec["needs_server"] and self._resolve is not None:
             if not self._resolve(ctx):
                 return
+        # Liveness gate: commands that act on the live server (backup, allowlist,
+        # per-player restore) are refused with a clear message when the server
+        # process is down — instead of failing with a transport error. The admin
+        # brings it up with /start (or /restore to recover).
+        if spec["needs_online"] and ctx.server is not None \
+                and not ctx.server.backend.is_online():
+            ctx.reply(f"⚠️ {ctx.server.config.name} is offline — /{name} needs "
+                      "the server running. Start it with /start.")
+            return
         if spec["cap"] is not None and not spec["cap"](ctx):
             if spec["cap_message"]:
                 ctx.reply(spec["cap_message"])

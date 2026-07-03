@@ -111,6 +111,16 @@ class JavaBackend(ServerBackend):
                             "RCON_PASSWORD from .env")
         return warnings
 
+    def is_online(self) -> bool:
+        """True if the RCON port is accepting connections — i.e. the JVM is up.
+        A plain TCP connect (no RCON round-trip), so it can't hang."""
+        try:
+            with socket.create_connection(
+                    (self.config.rcon_host, self.config.rcon_port), timeout=2):
+                return True
+        except OSError:
+            return False
+
     def wait_for_ready(self, timeout: float = 120) -> bool:
         """Wait for the 'RCON running on' line in latest.log via the watcher."""
         logger.info("Waiting for RCON to be ready (monitoring latest.log)...")
