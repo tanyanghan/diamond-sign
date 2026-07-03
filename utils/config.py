@@ -426,6 +426,14 @@ def load_config() -> AppConfig:
         except (OSError, json.JSONDecodeError) as e:
             raise ConfigError(f"Could not read {_CONFIG_PATH}: {e}")
         app = _app_from_dict(doc)
+        # The .env -> JSON migration is one-time (it runs only when no
+        # diamondsign.json exists), so a leftover .env is now ignored. Warn, in
+        # case the user is still editing .env expecting it to take effect — new
+        # settings must be added to diamondsign.json.
+        if _ENV_PATH.exists():
+            print(f"Note: {_CONFIG_PATH.name} is in use; {_ENV_PATH.name} is no "
+                  "longer read (migration is one-time). Put config changes in "
+                  f"{_CONFIG_PATH.name}.", file=sys.stderr)
     elif _ENV_PATH.exists():
         doc = _env_to_doc()
         app = _app_from_dict(doc)
