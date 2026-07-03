@@ -31,13 +31,11 @@ def _neutralize_rcon_alarm() -> None:
     blocked read would fire SIGALRM with its default disposition — terminating
     the whole process ("Alarm clock"). Ignore SIGALRM so a stray alarm can't
     kill us; recv is instead bounded by an explicit socket timeout (see
-    send_command). Must run in the main thread; no-op on Windows."""
-    if hasattr(signal, "SIGALRM"):
-        try:
-            signal.signal(signal.SIGALRM, signal.SIG_IGN)
-        except (ValueError, OSError):
-            pass  # not the main thread, or unsupported — send_command still
-                  # sets a socket timeout, which is the real bound
+    send_command)."""
+    try:
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass  # not the main thread — send_command's socket timeout is the bound
 
 from utils.backup_utils import RE_FULL, RE_INCR, wait_for_settle
 from utils.config import read_server_properties, get_level_name, backup_exclude_names
