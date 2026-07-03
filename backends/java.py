@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import shutil
+import signal
+import socket
 import threading
 import time
 import zipfile
@@ -20,6 +22,22 @@ from datetime import datetime
 from pathlib import Path
 
 from mcrcon import MCRcon
+
+
+def _neutralize_rcon_alarm() -> None:
+    """mcrcon's _read() arms signal.alarm(timeout) around every recv, and its
+    __init__ installs the SIGALRM handler. We bypass __init__ (signal.signal
+    can't run in a worker thread), so the handler is never installed and a
+    blocked read would fire SIGALRM with its default disposition — terminating
+    the whole process ("Alarm clock"). Ignore SIGALRM so a stray alarm can't
+    kill us; recv is instead bounded by an explicit socket timeout (see
+    send_command). Must run in the main thread; no-op on Windows."""
+    if hasattr(signal, "SIGALRM"):
+        try:
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass  # not the main thread, or unsupported — send_command still
+                  # sets a socket timeout, which is the real bound
 
 from utils.backup_utils import RE_FULL, RE_INCR, wait_for_settle
 from utils.config import read_server_properties, get_level_name, backup_exclude_names
@@ -54,6 +72,9 @@ class JavaBackend(ServerBackend):
     def __init__(self, config, migrate_legacy=False):
         super().__init__(config, migrate_legacy)
         self.names_path = self._data_path("player_names.json")
+        # Constructed in the main thread (main() startup), so we can safely
+        # disarm mcrcon's process-killing SIGALRM here.
+        _neutralize_rcon_alarm()
         # Optional mux — only needed to RESTART the JVM for a world restore
         # (RCON dies with the server, so the start command must be typed into the
         # session hosting it). Absent for a normal Java install; when unset the
@@ -113,6 +134,11 @@ class JavaBackend(ServerBackend):
         mcr.timeout = 5
         mcr.connect()
         try:
+            # Bound recv in THIS thread so a slow/dead server can't hang the read
+            # (mcrcon's own signal.alarm timeout is neutralized — see
+            # _neutralize_rcon_alarm).
+            if mcr.socket is not None:
+                mcr.socket.settimeout(mcr.timeout)
             return mcr.command(cmd)
         finally:
             mcr.disconnect()
@@ -139,14 +165,20 @@ class JavaBackend(ServerBackend):
         return True
 
     def wait_until_stopped(self, timeout: float = 120) -> bool:
-        """Poll RCON until it stops answering — i.e. the JVM (and its RCON
-        listener) is gone."""
+        """Poll the RCON port with a plain TCP connect until it stops accepting —
+        i.e. the JVM (and its RCON listener) is gone. Deliberately does NOT send
+        an RCON command: a shutting-down server can accept the socket but never
+        reply, blocking the read (mcrcon would fire its process-killing alarm).
+        A bare connect probe can't hang and needs no command round-trip."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                self.send_command("list")
-            except Exception:
-                return True  # RCON refused/failed -> server is down
+                with socket.create_connection(
+                        (self.config.rcon_host, self.config.rcon_port),
+                        timeout=2):
+                    pass  # port still accepting -> server still up
+            except OSError:
+                return True  # refused / unreachable -> server is down
             time.sleep(1)
         return False
 
