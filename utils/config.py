@@ -86,6 +86,13 @@ class ServerConfig:
     # the backup zip path (e.g. "rsync -az {file} user@nas:/backups/"). Empty
     # disables the copy step.
     backup_copy_cmd: str = ""
+    # World-restore (/restore): take a fresh full backup of the CURRENT world
+    # before wiping it (a recoverable pre-restore snapshot). Off by default
+    # (faster, less disk); when off, /restore is a direct stop -> wipe -> extract.
+    pre_restore_backup: bool = False
+    # Seconds of in-game "server restoring, you'll be disconnected" warning before
+    # /restore stops the server.
+    restore_warning_seconds: int = 15
 
     @property
     def log_path(self) -> Path:
@@ -186,6 +193,8 @@ def _server_from_dict(d: dict) -> ServerConfig:
         backup_hour=int(backup.get("hour") or 4),
         backup_schedule=(backup.get("schedule") or "daily").lower(),
         backup_copy_cmd=(backup.get("copy_cmd") or "").strip(),
+        pre_restore_backup=bool(backup.get("pre_restore_backup", False)),
+        restore_warning_seconds=int(backup.get("restore_warning_seconds") or 15),
     )
 
 
@@ -457,6 +466,16 @@ def load_config() -> AppConfig:
         if s.edition == EDITION_JAVA and not s.rcon_password:
             print(f"Warning: server '{s.name}' has no rcon.password — "
                   "commands and backups that need RCON will be unavailable.",
+                  file=sys.stderr)
+        # World restore (/restore) needs BOTH a mux session and a start command
+        # to restart the server; one without the other can't restart it. (Bedrock
+        # synthesizes a start_cmd and may auto-detect the session, so this only
+        # meaningfully applies to Java, where both are operator-provided.)
+        if s.edition == EDITION_JAVA and bool(s.mux_session) != bool(s.mux_start_cmd):
+            missing = "mux.start_cmd" if s.mux_session else "mux.session"
+            print(f"Warning: server '{s.name}' sets one of mux.session/"
+                  f"mux.start_cmd but not the other ({missing} is empty) — "
+                  "/restore can't restart this server until both are set.",
                   file=sys.stderr)
     return app
 
