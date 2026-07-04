@@ -18,27 +18,31 @@ With the **server stopped**, from the repo root:
 python install_bedrock_pack.py
 ```
 
-It reads `MINECRAFT_DIR` from your `.env` and the world's `level-name` from
-`server.properties`, then: copies the pack into `behavior_packs/`, activates it in
-the world's `world_behavior_packs.json`, sets
-`content-log-console-output-enabled=true` in `server.properties`, verifies the
-server isn't running and enables the **Beta APIs** experiment in `level.dat`, and
-sets `BEDROCK_SCRIPT_EVENTS=true` + `CHAT_RELAY=true` in `.env`. Flags:
+It reads the Bedrock server(s) from `diamondsign.json` (if more than one, it
+lists them and asks which — or pass `--server <name>`), takes the world's
+`level-name` from that server's `server.properties`, then: copies the pack into
+`behavior_packs/diamondsign_events/`, activates it in the world's
+`world_behavior_packs.json`, sets `content-log-console-output-enabled=true` in
+`server.properties`, verifies the server isn't running and enables the **Beta
+APIs** experiment in `level.dat`, and sets that server's
+`bedrock_script_events: true` + `chat_relay: true` in `diamondsign.json`.
 
 It first confirms the server is a Bedrock server and prompts you to confirm it's
 stopped (the install edits the world and irreversibly enables an experiment).
 Flags:
 
+- `--server <name>` — which Bedrock server (name/key from `diamondsign.json`) to
+  act on; if omitted and several exist, you're prompted.
 - `--uninstall` — reverse it: remove the pack, deactivate it in
   `world_behavior_packs.json` (preserving other packs), turn
-  `content-log-console-output-enabled` and the two `.env` flags back off. The Beta
+  `content-log-console-output-enabled` and the two config flags back off. The Beta
   APIs experiment is **not** undone — Bedrock can't disable an experiment once a
   world has used it, so `level.dat` is left as-is (harmless with the pack gone).
 - `--deaths-only` — skip the experiment (deaths only; no chat, no amulet libs, sets
-  only `BEDROCK_SCRIPT_EVENTS`).
+  only `bedrock_script_events`).
 - `--yes` / `-y` — skip the "is the server stopped?" prompt (non-interactive use).
 - `--force` — skip the automated "server not running" lock check (implies `--yes`).
-- `--no-env` — don't modify `.env`.
+- `--no-config` — don't modify `diamondsign.json`.
 
 The experiment step needs `amulet-nbt`/`amulet-leveldb`
 (`requirements-bedrock-restore.txt`). After it finishes, just restart the server
@@ -119,15 +123,15 @@ Common startup errors:
 
 ## 5. Turn it on in the bot
 
-In the bot's `.env`:
+On this server's entry in `diamondsign.json`:
 
-```
-BEDROCK_SCRIPT_EVENTS=true   # ingest death markers; enables /deaths, /death_summary
-CHAT_RELAY=true              # relay in-game chat to the chat platforms
+```jsonc
+"bedrock_script_events": true,   // ingest death markers; enables /deaths, /death_summary
+"chat_relay": true               // relay in-game chat to the chat platforms
 ```
 
 Restart the bot. Deaths now announce + record (like Java); chat is relayed to
-every authorized chat as `💬 <player>: <message>`.
+every authorized chat bound to this server as `💬 <player>: <message>`.
 
 ## Deaths only (no experiment)
 
@@ -135,4 +139,4 @@ If you only want death notifications and don't want the irreversible Beta APIs
 experiment, edit `manifest.json` and change the dependency `"version": "beta"` to
 a **stable** version your server provides (e.g. `"2.7.0"`). The pack then loads
 without the experiment; deaths work, chat does not (the script logs
-`chatSend unavailable` and carries on). Set only `BEDROCK_SCRIPT_EVENTS=true`.
+`chatSend unavailable` and carries on). Set only `bedrock_script_events: true`.

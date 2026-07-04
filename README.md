@@ -651,23 +651,19 @@ Java.
 python install_bedrock_pack.py
 ```
 
-It confirms the server is Bedrock and stopped, then reads `MINECRAFT_DIR` (from a
-`.env` file next to `bot.py`) and the world's `level-name` from
-`server.properties`, copies the pack into `behavior_packs/diamondsign_events/`,
-activates it in the world's `world_behavior_packs.json`, sets
-`content-log-console-output-enabled=true` in `server.properties`, and enables the
-**Beta APIs** experiment in `level.dat` — then you just set the server's
+It reads the Bedrock server(s) from `diamondsign.json` (if you have more than
+one, it lists them and asks which — or pass `--server <name>`), confirms it's
+Bedrock and stopped, takes the world's `level-name` from `server.properties`,
+copies the pack into `behavior_packs/diamondsign_events/`, activates it in the
+world's `world_behavior_packs.json`, sets
+`content-log-console-output-enabled=true` in `server.properties`, enables the
+**Beta APIs** experiment in `level.dat`, and sets that server's
 `bedrock_script_events: true` (and `chat_relay: true` for chat) in
-`diamondsign.json`, and restart the server and bot. Use `--deaths-only` to skip
-the experiment (deaths only, no chat), or `--uninstall` to reverse it (the Beta
-APIs experiment can't be undone — Bedrock flags a world permanently once used).
-Full details and the manual steps are in
+`diamondsign.json` — then you just restart the server and bot. Use `--deaths-only`
+to skip the experiment (deaths only, no chat), or `--uninstall` to reverse it (the
+Beta APIs experiment can't be undone — Bedrock flags a world permanently once
+used). Full details and the manual steps are in
 [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
-
-> The installer currently reads `MINECRAFT_DIR` from a `.env` file (not
-> `diamondsign.json`). For a JSON-only install, either drop a one-line
-> `MINECRAFT_DIR=/path/to/server` `.env` beside `bot.py` before running it, or
-> follow the manual steps in `bedrock_pack/INSTALL.md`.
 
 Caveats: the pack uses the Script API, so it tracks Minecraft's update cadence;
 and enabling an experiment is **irreversible** for that world (and disables

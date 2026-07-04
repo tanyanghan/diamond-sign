@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """One-line installer for the Diamond Sign Bedrock events behavior pack.
 
-Reads the server location from the bot's ``.env`` (``MINECRAFT_DIR``), then:
-  1. copies the pack into ``<MINECRAFT_DIR>/behavior_packs/diamondsign_events/``,
+Reads the server(s) from ``diamondsign.json``. If more than one Bedrock server
+is configured, it lists them and asks which to act on (or pass ``--server
+<name>``). Then, for the chosen server:
+  1. copies the pack into ``<minecraft_dir>/behavior_packs/diamondsign_events/``,
   2. activates it in the world's ``world_behavior_packs.json`` (create/append by
      the pack's header UUID, never clobbering other packs),
   3. (unless ``--deaths-only``) enables the Beta APIs / GameTest experiment in
      ``level.dat`` — but only after confirming the **server is not running**
      (the world LevelDB must be unlocked).
 
-It also enables the Bedrock **Beta APIs** experiment in ``level.dat`` for chat
-(deaths don't need it). The experiment toggle lives in ``level.dat`` — a
-little-endian NBT file with an 8-byte header — so this uses ``amulet-nbt`` (from
+The experiment toggle lives in ``level.dat`` — a little-endian NBT file with an
+8-byte header — so this uses ``amulet-nbt`` (from
 ``requirements-bedrock-restore.txt``), not the LevelDB.
 
 Run it with the server stopped:
 
-    python install_bedrock_pack.py                # pack + activate + experiment (chat & deaths)
-    python install_bedrock_pack.py --deaths-only  # skip the experiment (deaths only; no amulet libs)
-    python install_bedrock_pack.py --force        # bypass the running check (you stopped it yourself)
-    python install_bedrock_pack.py --uninstall    # reverse it (the experiment can't be undone)
+    python install_bedrock_pack.py                     # pick a server if >1, then install
+    python install_bedrock_pack.py --server square     # act on a specific server
+    python install_bedrock_pack.py --deaths-only       # skip the experiment (deaths only)
+    python install_bedrock_pack.py --force             # bypass the running check
+    python install_bedrock_pack.py --uninstall         # reverse it (the experiment can't be undone)
 
-It sets ``content-log-console-output-enabled=true`` in server.properties and
-``BEDROCK_SCRIPT_EVENTS=true`` (and ``CHAT_RELAY=true``) in ``.env`` for you; then
-start the server and restart the bot. See bedrock_pack/INSTALL.md for details.
+It sets ``content-log-console-output-enabled=true`` in server.properties and the
+chosen server's ``bedrock_script_events: true`` (and ``chat_relay: true``) in
+``diamondsign.json`` for you; then start the server and restart the bot. See
+bedrock_pack/INSTALL.md for details.
 """
 
 import argparse
@@ -62,21 +65,49 @@ def _confirm_stopped(assume_yes: bool):
         _fail("aborted — stop the server, then re-run")
 
 
-def _load_env():
-    """Return (minecraft_dir: Path, edition: str) from the bot's .env."""
+def _select_server(server_name):
+    """Return the chosen Bedrock ``ServerConfig`` from diamondsign.json.
+
+    With one Bedrock server it's used directly; with several, ``--server <name>``
+    picks one, else the user is shown a numbered list and prompted."""
+    sys.path.insert(0, str(_REPO_ROOT))
+    from utils.config import load_config, ConfigError, EDITION_BEDROCK
     try:
-        from dotenv import load_dotenv
-    except Exception:
-        _fail("python-dotenv is required (pip install -r requirements.txt)")
-    load_dotenv(_REPO_ROOT / ".env")
-    mc = os.environ.get("MINECRAFT_DIR", "").strip()
-    if not mc:
-        _fail("MINECRAFT_DIR is not set in .env")
-    mc_dir = Path(os.path.expanduser(mc))
-    if not mc_dir.is_dir():
-        _fail(f"MINECRAFT_DIR does not exist: {mc_dir}")
-    edition = os.environ.get("SERVER_EDITION", "java").strip().lower()
-    return mc_dir, edition
+        app = load_config()
+    except ConfigError as e:
+        _fail(str(e))
+    bedrock = [s for s in app.all_servers() if s.edition == EDITION_BEDROCK]
+    if not bedrock:
+        _fail("no Bedrock servers configured in diamondsign.json "
+              "(this pack is Bedrock-only)")
+
+    if server_name:
+        matches = [s for s in bedrock
+                   if server_name in (s.name, s.key)]
+        if not matches:
+            names = ", ".join(s.name for s in bedrock)
+            _fail(f"no Bedrock server named '{server_name}'. "
+                  f"Bedrock servers: {names}")
+        return matches[0]
+
+    if len(bedrock) == 1:
+        return bedrock[0]
+
+    print("Multiple Bedrock servers are configured:")
+    for i, s in enumerate(bedrock, 1):
+        print(f"  {i}. {s.name}   ({s.minecraft_dir})")
+    try:
+        raw = input(f"Choose a server [1-{len(bedrock)}]: ").strip()
+    except EOFError:
+        _fail("multiple Bedrock servers — pass --server <name> in a "
+              "non-interactive shell")
+    try:
+        idx = int(raw)
+        if not (1 <= idx <= len(bedrock)):
+            raise ValueError
+    except ValueError:
+        _fail(f"invalid choice: '{raw}'")
+    return bedrock[idx - 1]
 
 
 def _read_manifest():
@@ -105,8 +136,35 @@ def _set_kv(path: Path, key: str, value: str) -> bool:
     return changed
 
 
-def _set_env_var(key: str, value: str):
-    _set_kv(_REPO_ROOT / ".env", key, value)
+def _set_server_flags(server, **flags) -> bool:
+    """Set boolean fields on ``server``'s entry in diamondsign.json, in place.
+
+    The entry is matched by its resolved ``minecraft_dir`` (unique per server),
+    so it works whether or not the entry has an explicit ``name``. Other fields
+    and formatting of siblings are preserved (json re-dumped with indent=2).
+    Returns True if anything changed."""
+    cfg_path = _REPO_ROOT / "diamondsign.json"
+    if not cfg_path.exists():
+        print(f"warning: {cfg_path.name} not found; set "
+              + ", ".join(f"{k}={str(v).lower()}" for k, v in flags.items())
+              + " on this server yourself")
+        return False
+    target = server.minecraft_dir.resolve()
+    doc = json.loads(cfg_path.read_text())
+    changed = False
+    for bot in doc.get("bots", []):
+        for s in bot.get("servers", []):
+            raw_dir = (s.get("minecraft_dir") or "").strip()
+            if not raw_dir:
+                continue
+            if Path(os.path.expanduser(raw_dir)).resolve() == target:
+                for k, v in flags.items():
+                    if s.get(k) != v:
+                        s[k] = v
+                        changed = True
+    if changed:
+        cfg_path.write_text(json.dumps(doc, indent=2) + "\n")
+    return changed
 
 
 def _copy_pack(mc_dir: Path) -> Path:
@@ -231,7 +289,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--uninstall", action="store_true",
                     help="reverse the install: remove the pack, deactivate it, "
-                         "turn the content-log + .env flags back off (the Beta "
+                         "turn the content-log + config flags back off (the Beta "
                          "APIs experiment can't be undone — see the note)")
     ap.add_argument("--deaths-only", action="store_true",
                     help="install the pack but skip the Beta APIs experiment "
@@ -239,27 +297,30 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="skip the 'server not running' check before editing "
                          "level.dat (only if you have already stopped it)")
-    ap.add_argument("--no-env", action="store_true",
-                    help="don't touch .env (otherwise BEDROCK_SCRIPT_EVENTS, and "
-                         "CHAT_RELAY unless --deaths-only, are set to true)")
+    ap.add_argument("--server", metavar="NAME",
+                    help="which Bedrock server (name/key from diamondsign.json) "
+                         "to act on; if omitted and several exist, you're prompted")
+    ap.add_argument("--no-config", action="store_true",
+                    help="don't touch diamondsign.json (otherwise the chosen "
+                         "server's bedrock_script_events, and chat_relay unless "
+                         "--deaths-only, are set to true)")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="skip the interactive 'server stopped?' confirmation "
                          "(for non-interactive use)")
     args = ap.parse_args()
 
-    mc_dir, edition = _load_env()
-    # Confirm this is a Bedrock server two ways: the configured edition, and the
-    # directory layout (a bedrock_server binary or a worlds/ folder). The pack and
-    # the experiment edit are Bedrock-only and would be meaningless on Java.
-    if edition != "bedrock":
-        _fail(f"SERVER_EDITION is '{edition}', not 'bedrock' — set it to bedrock; "
-              "this pack is Bedrock-only")
+    server = _select_server(args.server)
+    mc_dir = server.minecraft_dir
+    if not mc_dir.is_dir():
+        _fail(f"minecraft_dir does not exist: {mc_dir}")
+    # Sanity-check the directory layout (edition is already 'bedrock' from config).
     looks_bedrock = ((mc_dir / "bedrock_server").exists()
                      or (mc_dir / "bedrock_server.exe").exists()
                      or (mc_dir / "worlds").is_dir())
     if not looks_bedrock:
         _fail(f"{mc_dir} doesn't look like a Bedrock server (no bedrock_server "
-              "binary or worlds/ directory). Check MINECRAFT_DIR.")
+              "binary or worlds/ directory). Check minecraft_dir for "
+              f"'{server.name}'.")
 
     # Level name comes from server.properties (get_level_name), so no path arg.
     sys.path.insert(0, str(_REPO_ROOT))
@@ -271,7 +332,7 @@ def main():
               f"(level-name from server.properties: '{level_name}')")
 
     uuid, version = _read_manifest()
-    print(f"Server:  {mc_dir}")
+    print(f"Server:  {server.name}  ({mc_dir})")
     print(f"World:   {world_dir}")
 
     # The server should be stopped: this edits world/server files (and install
@@ -279,12 +340,12 @@ def main():
     _confirm_stopped(args.yes or args.force)
 
     if args.uninstall:
-        _do_uninstall(mc_dir, world_dir, uuid, args)
+        _do_uninstall(server, mc_dir, world_dir, uuid, args)
     else:
-        _do_install(mc_dir, world_dir, uuid, version, args)
+        _do_install(server, mc_dir, world_dir, uuid, version, args)
 
 
-def _do_install(mc_dir, world_dir, uuid, version, args):
+def _do_install(server, mc_dir, world_dir, uuid, version, args):
     dest = _copy_pack(mc_dir)
     print(f"Copied:  {dest}")
 
@@ -323,22 +384,23 @@ def _do_install(mc_dir, world_dir, uuid, version, args):
         print("Enabling Beta APIs experiment (chat)...")
         _enable_experiment(world_dir)
 
-    # Turn on the bot-side flags so the events are actually ingested.
-    if args.no_env:
-        print("Left .env untouched (--no-env). Set BEDROCK_SCRIPT_EVENTS=true"
-              + ("" if args.deaths_only else " and CHAT_RELAY=true") + " yourself.")
+    # Turn on the per-server flags so the events are actually ingested.
+    if args.no_config:
+        print("Left diamondsign.json untouched (--no-config). Set this server's "
+              "bedrock_script_events: true"
+              + ("" if args.deaths_only else " and chat_relay: true") + " yourself.")
     else:
-        _set_env_var("BEDROCK_SCRIPT_EVENTS", "true")
-        flags = "BEDROCK_SCRIPT_EVENTS=true"
+        flags = {"bedrock_script_events": True}
         if not args.deaths_only:
-            _set_env_var("CHAT_RELAY", "true")
-            flags += ", CHAT_RELAY=true"
-        print(f".env updated: {flags}")
+            flags["chat_relay"] = True
+        _set_server_flags(server, **flags)
+        shown = ", ".join(f"{k}: true" for k in flags)
+        print(f"diamondsign.json updated for '{server.name}': {shown}")
 
     print("\nDone. Start the server, then restart the bot.")
 
 
-def _do_uninstall(mc_dir, world_dir, uuid, args):
+def _do_uninstall(server, mc_dir, world_dir, uuid, args):
     removed = _remove_pack(mc_dir)
     print(f"Removed pack: {'yes' if removed else 'not present'}")
 
@@ -352,13 +414,13 @@ def _do_uninstall(mc_dir, world_dir, uuid, args):
         print("server.properties: content-log-console-output-enabled=false "
               f"({'set' if ch else 'already false'})")
 
-    if args.no_env:
-        print("Left .env untouched (--no-env). Set BEDROCK_SCRIPT_EVENTS=false "
-              "and CHAT_RELAY=false yourself.")
+    if args.no_config:
+        print("Left diamondsign.json untouched (--no-config). Set this server's "
+              "bedrock_script_events: false and chat_relay: false yourself.")
     else:
-        _set_env_var("BEDROCK_SCRIPT_EVENTS", "false")
-        _set_env_var("CHAT_RELAY", "false")
-        print(".env updated: BEDROCK_SCRIPT_EVENTS=false, CHAT_RELAY=false")
+        _set_server_flags(server, bedrock_script_events=False, chat_relay=False)
+        print(f"diamondsign.json updated for '{server.name}': "
+              "bedrock_script_events: false, chat_relay: false")
 
     # The Beta APIs experiment is intentionally left on: Bedrock permanently
     # flags a world once an experiment is used, so it can't be cleanly disabled.
