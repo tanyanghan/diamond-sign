@@ -314,14 +314,43 @@ class BedrockBackend(ServerBackend):
         return ok
 
     def wait_until_stopped(self, timeout: float = 120) -> bool:
-        """Poll until the world db LevelDB lock is released (server fully down)."""
-        from utils import bedrock_player
-        db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
+        """Wait until BDS has fully exited — safe to edit the world db.
+
+        Deliberately does NOT use the LevelDB lock: amulet-leveldb's lock
+        detection is unreliable across BDS builds (on some servers it opens a
+        *running* world's db, which would make the lock look free while the
+        server is up — dangerous for the callers that edit the db next). Instead
+        detect a clean exit from two independent signals:
+          - the server no longer answers a console ``list`` (is_online), AND
+          - ``console.log`` has stopped growing (BDS wrote its shutdown/flush
+            lines and the process exited, closing the tee pipe).
+        Both are required so a mid-shutdown lull, or an idle-but-still-running
+        server, isn't mistaken for a clean exit (the log-growth check also keeps
+        us waiting through the final world flush before a caller touches the db).
+        """
+        log_path = self.config.log_path
+
+        def size():
+            try:
+                return log_path.stat().st_size
+            except OSError:
+                return -1
+
         deadline = time.time() + timeout
+        prev_size = size()
+        misses = 0  # consecutive probes with no console response and no log growth
         while time.time() < deadline:
-            if not bedrock_player.is_db_locked(db_path):
-                return True
-            time.sleep(1)
+            responding = self.is_online()   # sends `list`; grows the log if up
+            cur = size()
+            grew = cur != prev_size
+            prev_size = cur
+            if responding or grew:
+                misses = 0                  # still answering, or still flushing
+            else:
+                misses += 1
+                if misses >= 3:
+                    return True             # quiet + unresponsive -> fully down
+            time.sleep(2)
         return False
 
     def relaunch(self, log_fn=None) -> bool:
