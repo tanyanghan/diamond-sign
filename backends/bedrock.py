@@ -171,12 +171,16 @@ class BedrockBackend(ServerBackend):
         return ok
 
     def is_online(self) -> bool:
-        """True if BDS holds the world LevelDB lock — i.e. the server process is
-        running. A cheap filesystem check (no console round-trip)."""
-        from utils import bedrock_player
+        """True if the server is running and responding on the console.
+
+        Sends ``list`` and checks whether BDS echoed anything into console.log —
+        a running server always responds (even with zero players); a stopped one
+        produces nothing. This is authoritative and side-effect-free, unlike
+        probing the world LevelDB lock (whose behaviour is BDS-version-dependent,
+        depends on the level-name path resolving to the *running* world, and is
+        unsafe to open read-write against a live server)."""
         try:
-            return bedrock_player.is_db_locked(
-                bedrock_player.world_db_path(self.config.minecraft_dir))
+            return bool(self.capture_command("list", timeout=3.0).strip())
         except Exception:
             return False
 
