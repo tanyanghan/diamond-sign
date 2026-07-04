@@ -16,7 +16,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from utils.backup_utils import (
-    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, META_FILES,
+    CHAIN_MARKER_NAME, META_FILES,
     build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
 )
 from utils.config import (
@@ -248,8 +248,6 @@ class Server:
         self.backup_exclude_names = frozenset(backup_exclude_names(config))
         self.manifest_path = self._data_path("backup_manifest.json")
         self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
-        self.chain_marker_path_legacy = (self.config.minecraft_dir
-                                         / CHAIN_MARKER_NAME_LEGACY)
         # Bedrock per-player restore reads player data from a sidecar embedded in
         # each backup zip (the live LevelDB is locked while the server runs).
         # Dedup state of {player_server_key: sha256} so incrementals only carry
@@ -335,29 +333,22 @@ class Server:
         This marker file lets the bot detect on startup if the server state
         was replaced while it was offline (e.g., manual restore). If the marker
         doesn't match the manifest's chain_id, the chain is considered invalid.
-        A leftover legacy marker is removed so only one marker remains.
         """
         try:
             with open(self.chain_marker_path, "w") as f:
                 f.write(chain_id)
-            if self.chain_marker_path_legacy.exists():
-                self.chain_marker_path_legacy.unlink()
         except Exception:
             self.log.exception("Failed to write chain marker")
 
     def read_chain_marker(self) -> str:
-        """Read the chain ID from the chain marker, falling back to the legacy
-        (.mcnotifier_chain) name so pre-rename installs keep their chain. '' if
-        neither exists."""
-        for path in (self.chain_marker_path, self.chain_marker_path_legacy):
-            try:
-                return path.read_text().strip()
-            except FileNotFoundError:
-                continue
-            except Exception:
-                self.log.exception("Failed to read chain marker")
-                return ""
-        return ""
+        """Read the chain ID from the chain marker; '' if it doesn't exist."""
+        try:
+            return self.chain_marker_path.read_text().strip()
+        except FileNotFoundError:
+            return ""
+        except Exception:
+            self.log.exception("Failed to read chain marker")
+            return ""
 
     # --- Bedrock per-player sidecar / identity learning ---------------------
 
@@ -524,13 +515,12 @@ class Server:
                     except ValueError:
                         pass
                     for fn in filenames:
-                        # Chain marker (new + legacy), backup-format entries
-                        # (META_FILES — the sidecar/meta/deletions the bot writes
-                        # into the zip itself), and bot infrastructure are not
-                        # server data. Skipping META_FILES avoids a "Duplicate
-                        # name" if a copy lingers in the world dir (e.g. from a
-                        # restore extraction).
-                        if fn in (CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY) \
+                        # Chain marker, backup-format entries (META_FILES — the
+                        # sidecar/meta/deletions the bot writes into the zip
+                        # itself), and bot infrastructure are not server data.
+                        # Skipping META_FILES avoids a "Duplicate name" if a copy
+                        # lingers in the world dir (e.g. from a restore extraction).
+                        if fn == CHAIN_MARKER_NAME \
                                 or fn in META_FILES \
                                 or fn in self.backup_exclude_names:
                             continue
@@ -1177,13 +1167,13 @@ def _parse_line_java(line: str, server) -> tuple:
 # Bedrock Dedicated Server console lines (terser than Java's log). Names may
 # contain spaces, so capture up to the ", xuid:" delimiter. BDS's own console
 # reports only join/leave; death and chat come from the bedrock_pack behavior
-# pack as `MCNOTIFIER {json}` marker lines (see below).
+# pack as `DIAMONDSIGN {json}` marker lines (see below).
 RE_BEDROCK_CONNECT = re.compile(r'Player connected:\s*(.+?),\s*xuid:\s*(\d+)')
 RE_BEDROCK_DISCONNECT = re.compile(r'Player disconnected:\s*(.+?),\s*xuid:\s*(\d+)')
 
 # Behavior-pack event marker, e.g.
-#   [<ts> WARN] [Scripting] MCNOTIFIER {"t":"death","player":"X","cause":"lava"}
-_BEDROCK_MARKER = "MCNOTIFIER "
+#   [<ts> WARN] [Scripting] DIAMONDSIGN {"t":"death","player":"X","cause":"lava"}
+_BEDROCK_MARKER = "DIAMONDSIGN "
 
 # Bedrock damage cause -> death phrase, worded to mirror Java so the same
 # _categorize_death / _DEATH_CATEGORIES logic works for /death_summary. "{by}"
@@ -1238,7 +1228,7 @@ def _parse_line_bedrock(line: str, server) -> tuple:
     """Return (event_type, payload) or (None, None) for a Bedrock console line.
 
     Join/leave come from BDS itself; death/chat come from the bedrock_pack
-    behavior pack's MCNOTIFIER marker lines (gated by config). The player's xuid
+    behavior pack's DIAMONDSIGN marker lines (gated by config). The player's xuid
     is the registry key (Bedrock has no per-player UUID file).
     """
     line = line.strip()

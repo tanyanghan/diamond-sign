@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""One-line installer for the mcnotifier Bedrock events behavior pack.
+"""One-line installer for the Diamond Sign Bedrock events behavior pack.
 
 Reads the server location from the bot's ``.env`` (``MINECRAFT_DIR``), then:
-  1. copies the pack into ``<MINECRAFT_DIR>/behavior_packs/mcnotifier_events/``,
+  1. copies the pack into ``<MINECRAFT_DIR>/behavior_packs/diamondsign_events/``,
   2. activates it in the world's ``world_behavior_packs.json`` (create/append by
      the pack's header UUID, never clobbering other packs),
   3. (unless ``--deaths-only``) enables the Beta APIs / GameTest experiment in
@@ -38,7 +38,7 @@ _REPO_ROOT = Path(__file__).resolve().parent         # repo root (this file's di
 _PACK_DIR = _REPO_ROOT / "bedrock_pack"
 # Pack files that belong in the world (everything else there is tooling/docs).
 _PACK_CONTENTS = ("manifest.json", "scripts")
-_INSTALLED_NAME = "mcnotifier_events"
+_INSTALLED_NAME = "diamondsign_events"
 
 
 def _fail(msg: str):

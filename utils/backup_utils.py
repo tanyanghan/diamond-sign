@@ -26,8 +26,8 @@ chains, new incremental backups would be mixed with old ones from before the
 restore, and the restore tool couldn't tell them apart. The chain ID makes each
 sequence of full + incrementals uniquely identifiable.
 
-Chain Marker (.mcnotifier_chain)
---------------------------------
+Chain Marker (.diamondsign_chain)
+---------------------------------
 A small file placed in the Minecraft server directory containing the current
 chain ID. On startup, the bot compares this marker against the manifest to
 detect if the server state was replaced while the bot was offline (e.g., manual
@@ -52,11 +52,8 @@ from pathlib import Path
 
 # Name of the chain marker file placed in the Minecraft server directory.
 # This file is excluded from all backup zips — it's metadata about the
-# backup process, not part of the server data. The legacy name is still
-# recognised (read + excluded) so installs that predate the Diamond Sign
-# rename keep their existing chains valid.
+# backup process, not part of the server data.
 CHAIN_MARKER_NAME = ".diamondsign_chain"
-CHAIN_MARKER_NAME_LEGACY = ".mcnotifier_chain"
 
 # Internal metadata files stored inside incremental backup zips.
 # These are skipped when extracting files during restore.
@@ -126,8 +123,7 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None,
     - Anything under backup_dir: if the backup output directory happens to
       be inside the server directory, we don't want to back up backups
     """
-    skip = ({CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY} | META_FILES
-            | (exclude_names or set()))
+    skip = {CHAIN_MARKER_NAME} | META_FILES | (exclude_names or set())
     backup_dir_resolved = backup_dir.resolve() if backup_dir else None
     files = {}
     for dirpath, _dirnames, filenames in os.walk(root_dir):

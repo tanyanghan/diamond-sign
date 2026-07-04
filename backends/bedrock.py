@@ -136,7 +136,7 @@ def _format_console_response(text: str) -> str:
         stripped = _strip_prefix(ln)
         if stripped in ("###*", "*###") or not stripped:
             continue
-        if "MCNOTIFIER " in stripped:
+        if "DIAMONDSIGN " in stripped:
             continue  # behavior-pack event marker (async; not command output)
         lines.append(stripped)
     return "\n".join(lines)

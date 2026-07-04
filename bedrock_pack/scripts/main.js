@@ -1,9 +1,9 @@
 /*
- * mcnotifier events behavior pack.
+ * Diamond Sign events behavior pack.
  *
  * Emits player chat and death events to the server console as marker lines:
- *   MCNOTIFIER {"t":"death",...}
- *   MCNOTIFIER {"t":"chat",...}
+ *   DIAMONDSIGN {"t":"death",...}
+ *   DIAMONDSIGN {"t":"chat",...}
  *
  * console.warn() goes to the dedicated server's stdout, which (with
  * content-log-console-output-enabled=true in server.properties) is captured to
@@ -16,7 +16,7 @@
 import { world } from "@minecraft/server";
 
 function emit(obj) {
-  console.warn("MCNOTIFIER " + JSON.stringify(obj));
+  console.warn("DIAMONDSIGN " + JSON.stringify(obj));
 }
 
 // --- Deaths (stable) ---
@@ -41,5 +41,5 @@ try {
     emit({ t: "chat", player: e.sender ? e.sender.name : "?", msg: e.message });
   });
 } catch (err) {
-  console.warn("MCNOTIFIER chatSend unavailable (enable Beta APIs for chat): " + err);
+  console.warn("DIAMONDSIGN chatSend unavailable (enable Beta APIs for chat): " + err);
 }

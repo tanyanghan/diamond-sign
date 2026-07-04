@@ -526,7 +526,7 @@ playtime from console join/leave events:
 
 BDS's console doesn't report deaths or chat, so an optional **behavior pack**
 (`bedrock_pack/`) supplies them via the Script API. It emits `console.warn` marker
-lines (`MCNOTIFIER {…}`) which — with `content-log-console-output-enabled=true` —
+lines (`DIAMONDSIGN {…}`) which — with `content-log-console-output-enabled=true` —
 land in the same `console.log` the bot already tails, so no HTTP endpoint or
 network permission is needed. The bot feeds these into the normal notify pipeline:
 deaths announce + record (`/deaths`, `/death_summary` work, with a Bedrock

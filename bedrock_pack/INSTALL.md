@@ -1,7 +1,7 @@
-# mcnotifier events — Bedrock behavior pack
+# Diamond Sign events — Bedrock behavior pack
 
 This optional behavior pack makes a Bedrock server emit **player chat** and
-**death** events to the console so mcnotifier can relay them (Bedrock's console
+**death** events to the console so Diamond Sign can relay them (Bedrock's console
 otherwise reports only join/leave). It uses the Script API and emits marker lines
 via `console.warn`, which the bot reads from the same `console.log` it already
 tails — no HTTP endpoint or `@minecraft/server-net` permission required.
@@ -67,7 +67,7 @@ server-root `behavior_packs/` (the global pool) and
 conventional and usually already present:
 
 ```
-behavior_packs/mcnotifier_events/        # copy this bedrock_pack/ folder here
+behavior_packs/diamondsign_events/        # copy this bedrock_pack/ folder here
 ```
 
 Then activate it for your world by adding the pack's **header** UUID — the
@@ -103,12 +103,12 @@ On startup, success looks like:
 
 ```
 Experiment(s) active: gtst
-Pack Stack - [00] mcnotifier events (id: dd12725f-…) @ behavior_packs/mcnotifier_events
+Pack Stack - [00] Diamond Sign events (id: dd12725f-…) @ behavior_packs/diamondsign_events
 ```
 
 with **no** `[Scripting] ... chatSend unavailable` error. Then:
-- A player **dies** → `[… WARN] [Scripting] MCNOTIFIER {"t":"death",…}`
-- A player **chats** → `[… WARN] [Scripting] MCNOTIFIER {"t":"chat",…}`
+- A player **dies** → `[… WARN] [Scripting] DIAMONDSIGN {"t":"death",…}`
+- A player **chats** → `[… WARN] [Scripting] DIAMONDSIGN {"t":"chat",…}`
 
 Common startup errors:
 - `requesting dependency on beta APIs … but the Beta APIs experiment is not

@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 from .backup_utils import (
-    CHAIN_MARKER_NAME, CHAIN_MARKER_NAME_LEGACY, META_FILES, RE_FULL, RE_INCR,
+    CHAIN_MARKER_NAME, META_FILES, RE_FULL, RE_INCR,
     build_file_manifest, new_chain_id, run_copy_command,
 )
 
@@ -337,13 +337,10 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
                     "chain_id": chain_id, "base_full": full_zip.name}))
             run_copy_command(merged_path, copy_cmd, log_fn=log_fn)
 
-        # Chain marker in the world dir (new name; drop a stale legacy marker).
+        # Chain marker in the world dir.
         marker_root = marker_dir or target_dir
         try:
             (marker_root / CHAIN_MARKER_NAME).write_text(chain_id)
-            legacy = marker_root / CHAIN_MARKER_NAME_LEGACY
-            if legacy.exists():
-                legacy.unlink()
         except OSError:
             log("Warning: could not write chain marker")
 
