@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Serialise all injections process-wide: two senders interleaving keystrokes into
 # the same pane is what corrupted "save hold" into "ave" in the wild. A short

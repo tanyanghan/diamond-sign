@@ -1,4 +1,4 @@
-# mcnotifier
+# Diamond Sign
 
 A chat bot that watches your Minecraft server and keeps you in the loop from
 **Telegram** and/or **Slack** — player join/leave, deaths, in-game chat, stats,
@@ -116,11 +116,11 @@ both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
 ```json
 {
   "display_information": {
-    "name": "mcnotifier"
+    "name": "Diamond Sign"
   },
   "features": {
     "bot_user": {
-      "display_name": "mcnotifier",
+      "display_name": "Diamond Sign",
       "always_online": true
     },
     "slash_commands": [
@@ -358,7 +358,7 @@ On **Bedrock** the freeze sequence is `save hold` → `save query` → `save res
 copying each file truncated to the snapshot length `save query` reports;
 everything else (scheduling, chains, off-server copy, restore) is identical. Bot
 infrastructure that lives in the server directory is excluded from every zip (the
-`.mcnotifier_chain` marker on both editions, and the Bedrock `console.log`), and
+`.diamondsign_chain` marker on both editions, and the Bedrock `console.log`), and
 Unix file permissions (e.g. the executable bit on the Bedrock server binary) are
 preserved through backup and restore.
 
@@ -405,7 +405,7 @@ the last backup while players are active — far smaller than repeated full back
 
 **Chains.** Each full backup starts a new chain (an 8-char hex ID embedded in
 incremental filenames and contents) so that after a restore, new incrementals are
-never confused with old ones. A `.mcnotifier_chain` marker in the server directory
+never confused with old ones. A `.diamondsign_chain` marker in the server directory
 lets the bot detect if the server state was replaced while it was offline; if the
 marker doesn't match the manifest on startup, incrementals pause until the next
 full backup. File naming:
@@ -606,12 +606,12 @@ The bot writes these at runtime (all git-ignored):
   `player_names.json` on Bedrock)
 - `statistics.json` — *(Bedrock)* accumulated online time + session counts;
   per-server, not portable
-- `<MINECRAFT_DIR>/.mcnotifier_chain` — chain-validity marker in the server dir
+- `<MINECRAFT_DIR>/.diamondsign_chain` — chain-validity marker in the server dir
 - `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file per bot start
 
 To reset the bot to a fresh state, delete `auth.json`, `player_names.json`,
 `player_achievements.json`, and `player_deaths.json`. To force a fresh backup
-chain, delete `backup_manifest.json` and `.mcnotifier_chain`.
+chain, delete `backup_manifest.json` and `.diamondsign_chain`.
 
 ### Source layout
 

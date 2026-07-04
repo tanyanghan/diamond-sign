@@ -30,7 +30,7 @@ from .base import (
 )
 from .mux import detect
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Portable player list / name registry. xuid -> {name, identities:[MsaId,
 # SelfSignedId], first_seen, last_seen}. Identities are account-stable (the data

@@ -1,6 +1,6 @@
 """Java server backend: RCON transport, verbose latest.log, per-player .dat.
 
-This wraps the behaviour mcnotifier shipped before edition support was added,
+This wraps the behaviour Diamond Sign shipped before edition support was added,
 behind the ``ServerBackend`` interface. Functionally it is the original RCON
 code path (``rcon_command``, the save-off/save-all/save-on dance,
 ``_wait_for_rcon_ready``, ``_validate_server_properties``, the ``list`` parsing)
@@ -45,7 +45,7 @@ from .base import (
 )
 from .mux import detect
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Response to the `list` command: "There are X of a max of Y players online: a, b"
 _RE_LIST = re.compile(r'There are \d+ of a max of \d+ players online:(.*)')

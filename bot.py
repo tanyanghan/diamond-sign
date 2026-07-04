@@ -56,7 +56,7 @@ except ConfigError as e:
 # ---------------------------------------------------------------------------
 # Logging setup (configured in main, used everywhere via module-level logger)
 # ---------------------------------------------------------------------------
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 
 def setup_logging(logs_dir: Path) -> None:

@@ -15,7 +15,7 @@ import telebot
 
 from .base import ChatAdapter, Context, chunk_text
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 _MAX_LEN = 4096
 
@@ -109,8 +109,8 @@ class _NetworkErrorFilter(logging.Filter):
                     logger.warning(
                         "Polling: getUpdates 409 conflict is persisting (%d in the "
                         "last %d min) - another process is polling this bot token; "
-                        "check for a second mcnotifier instance using the same "
-                        "BOT_TOKEN.", count, self._health.WINDOW_SECONDS // 60)
+                        "check for a second Diamond Sign instance using the same "
+                        "bot token.", count, self._health.WINDOW_SECONDS // 60)
                 else:
                     logger.warning("Polling: getUpdates conflict (transient, "
                                    "self-resolving), retrying...")

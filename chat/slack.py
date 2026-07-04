@@ -15,7 +15,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .base import ChatAdapter, Context, chunk_text
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Slack hard limit is 40k chars; keep well under for readable, un-truncated posts.
 _MAX_LEN = 3500
@@ -59,7 +59,7 @@ class _SlackNetworkErrorFilter(logging.Filter):
     def install(cls) -> None:
         """Route the slack_sdk / slack_bolt loggers through the bot's handlers
         with this filter attached. Idempotent; safe to call once per adapter."""
-        mc_handlers = logging.getLogger("mcnotifier").handlers
+        mc_handlers = logging.getLogger("diamondsign").handlers
         if not mc_handlers:
             return  # logging not set up yet; nothing to attach to
         filt = cls()
