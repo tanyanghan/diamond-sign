@@ -10,8 +10,7 @@ The rest of the code receives an ``AppConfig`` (``.bots`` -> ``BotConfig`` ->
 dir, rcon/mux, backups) and owns its ``data_dir`` (``data/<server-name>/``);
 chat tokens live on ``BotConfig``.
 
-A legacy flat ``.env`` install is auto-migrated to ``diamondsign.json`` on first
-start. Also hosts the world-layout helpers (``read_server_properties``,
+Also hosts the world-layout helpers (``read_server_properties``,
 ``get_level_name``) shared by ``bot.py`` and the backends.
 """
 
@@ -23,8 +22,6 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 # Recognised server editions.
 EDITION_JAVA = "java"
 EDITION_BEDROCK = "bedrock"
@@ -35,7 +32,6 @@ _KNOWN_PLATFORMS = ("telegram", "slack")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_PATH = _REPO_ROOT / "diamondsign.json"
 _EXAMPLE_PATH = _REPO_ROOT / "diamondsign.example.json"
-_ENV_PATH = _REPO_ROOT / ".env"            # legacy; migrated to JSON on first start
 _DATA_DIR = _REPO_ROOT / "data"            # per-server state lives in data/<key>/
 
 
@@ -288,63 +284,6 @@ def validate_config(app: AppConfig) -> list:
     return problems
 
 
-# ---------------------------------------------------------------------------
-# Legacy .env -> JSON migration
-# ---------------------------------------------------------------------------
-def _env_bool(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
-
-
-def _env_to_doc() -> dict:
-    """Build a one-bot/one-server config doc from a legacy flat ``.env``."""
-    load_dotenv(_ENV_PATH)
-    edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
-    mc_dir = os.environ.get("MINECRAFT_DIR", "").strip()
-    platforms = [p.strip().lower()
-                 for p in os.environ.get("CHAT_PLATFORMS", "telegram").split(",")
-                 if p.strip()] or ["telegram"]
-    name = (_slug(get_level_name(Path(os.path.expanduser(mc_dir))))
-            if mc_dir else "")
-
-    server = {
-        "name": name,
-        "edition": edition,
-        "minecraft_dir": mc_dir,
-        "rcon": {
-            "password": os.environ.get("RCON_PASSWORD", ""),
-            "host": os.environ.get("RCON_HOST", "localhost"),
-            "port": int(os.environ.get("RCON_PORT", "25575") or 25575),
-        },
-        "mux": {
-            "session": os.environ.get("MUX_SESSION", "").strip(),
-            "start_cmd": os.environ.get("MUX_START_CMD", "").strip(),
-        },
-        "console_log": os.environ.get("CONSOLE_LOG", "").strip() or None,
-        "bedrock_script_events": _env_bool("BEDROCK_SCRIPT_EVENTS"),
-        "chat_relay": _env_bool("CHAT_RELAY"),
-        "backup": {
-            "dir": os.environ.get("BACKUP_DIR", "~/minecraft_backup"),
-            "schedule": os.environ.get("BACKUP_SCHEDULE", "daily"),
-            "hour": int(os.environ.get("BACKUP_HOUR", "4") or 4),
-            "copy_cmd": os.environ.get("BACKUP_COPY_CMD", "").strip(),
-            "incremental": {
-                "enabled": _env_bool("INCREMENTAL_BACKUP_ENABLED"),
-                "interval_minutes": int(
-                    os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15") or 15),
-            },
-        },
-    }
-    bot = {
-        "name": "default",
-        "platforms": platforms,
-        "telegram": {"bot_token": os.environ.get("BOT_TOKEN", "").strip()},
-        "slack": {"bot_token": os.environ.get("SLACK_BOT_TOKEN", "").strip(),
-                  "app_token": os.environ.get("SLACK_APP_TOKEN", "").strip()},
-        "servers": [server],
-    }
-    return {"version": 1, "bots": [bot]}
-
-
 def _write_doc(path: Path, doc: dict) -> None:
     path.write_text(json.dumps(doc, indent=2) + "\n")
 
@@ -414,35 +353,17 @@ def _wizard_doc() -> dict:
 def load_config() -> AppConfig:
     """Load and validate the Diamond Sign config.
 
-    Order of precedence: an existing ``diamondsign.json``; else auto-migrate a
-    legacy ``.env`` (writing the JSON and continuing); else a first-run wizard
-    (interactive) or an emitted example + ``ConfigError`` (non-interactive). All
-    problems are collected and raised together as one ``ConfigError``.
+    Order of precedence: an existing ``diamondsign.json``; else a first-run
+    wizard (interactive) or an emitted example + ``ConfigError``
+    (non-interactive). All problems are collected and raised together as one
+    ``ConfigError``.
     """
-    migrated = False
     if _CONFIG_PATH.exists():
         try:
             doc = json.loads(_CONFIG_PATH.read_text())
         except (OSError, json.JSONDecodeError) as e:
             raise ConfigError(f"Could not read {_CONFIG_PATH}: {e}")
         app = _app_from_dict(doc)
-        # The .env -> JSON migration is one-time (it runs only when no
-        # diamondsign.json exists), so a leftover .env is now ignored. Warn, in
-        # case the user is still editing .env expecting it to take effect — new
-        # settings must be added to diamondsign.json.
-        if _ENV_PATH.exists():
-            print(f"Note: {_CONFIG_PATH.name} is in use; {_ENV_PATH.name} is no "
-                  "longer read (migration is one-time). Put config changes in "
-                  f"{_CONFIG_PATH.name}.", file=sys.stderr)
-    elif _ENV_PATH.exists():
-        doc = _env_to_doc()
-        app = _app_from_dict(doc)
-        try:
-            _write_doc(_CONFIG_PATH, doc)
-            print(f"Migrated legacy .env -> {_CONFIG_PATH.name}", file=sys.stderr)
-            migrated = True
-        except OSError:
-            pass
     elif _interactive():
         try:
             doc = _wizard_doc()
@@ -465,9 +386,9 @@ def load_config() -> AppConfig:
 
     problems = validate_config(app)
     if problems:
-        where = _CONFIG_PATH if not migrated else f"{_CONFIG_PATH} (migrated from .env)"
         raise ConfigError("Diamond Sign cannot start - fix the following in "
-                          f"{where}:\n" + "\n".join(f"  - {p}" for p in problems))
+                          f"{_CONFIG_PATH}:\n"
+                          + "\n".join(f"  - {p}" for p in problems))
     # Non-fatal: a Java server without an RCON password still gets log-driven
     # notifications, but /status, /backup save-flush, and /allowlist need RCON.
     for s in app.all_servers():

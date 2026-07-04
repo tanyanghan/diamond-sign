@@ -33,9 +33,9 @@ from chat import make_adapters, CommandRouter
 # 1. Config
 # ---------------------------------------------------------------------------
 # All config reading lives in config.load_config(), which returns an AppConfig
-# (bots -> servers). load_config() reads diamondsign.json, migrates a legacy
-# .env, or runs a first-run wizard; on a misconfiguration it raises ConfigError,
-# which we surface cleanly and stop.
+# (bots -> servers). load_config() reads diamondsign.json or runs a first-run
+# wizard; on a misconfiguration it raises ConfigError, which we surface cleanly
+# and stop.
 try:
     APP_CONFIG = load_config()
 except ConfigError as e:

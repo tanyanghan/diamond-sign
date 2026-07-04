@@ -81,11 +81,6 @@ run **multiple bots** at once.
    See [Configuration](#configuration) for every field, and
    [Multiple servers & bots](#multiple-servers--bots) for multi-server setups.
 
-   > **Upgrading from a `.env` install?** On first start, a legacy flat `.env` is
-   > automatically migrated to `diamondsign.json` (your values are carried over,
-   > and `.env` is left in place). After that, **edit `diamondsign.json`** — the
-   > `.env` is no longer read, and the bot prints a note if it sees one lingering.
-
 3. **Run**
    ```bash
    python bot.py                # run every configured bot
@@ -750,7 +745,7 @@ Packages and helpers (imported):
 |------|-------------|
 | `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base`, `java` (RCON), `bedrock` (tmux/screen), `mux` |
-| `utils/` | Imported helpers: `config` (`AppConfig`/`BotConfig`/`ServerConfig` + JSON loader + `.env` migration), `backup_utils` (chain/manifest), `restore_core` (headless restore, shared by the bot + `restore.py`), `bedrock_player` (world-LevelDB + sidecar) |
+| `utils/` | Imported helpers: `config` (`AppConfig`/`BotConfig`/`ServerConfig` + JSON loader), `backup_utils` (chain/manifest), `restore_core` (headless restore, shared by the bot + `restore.py`), `bedrock_player` (world-LevelDB + sidecar) |
 | `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events (Script API) |
 | `requirements.txt` | Python dependencies |
 | `requirements-bedrock-restore.txt` | Optional deps for Bedrock per-player restore |
