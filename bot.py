@@ -2423,7 +2423,8 @@ def register_commands(router, auth: dict) -> None:
                 ctx.adapter.send(ctx.chat_id, f"{verb} command failed: {e}")
                 return
             ctx.adapter.send(ctx.chat_id,
-                             resp.strip() or "(server returned no output)")
+                             resp.strip() or "(server returned no output)",
+                             monospace=True)
 
         threading.Thread(target=run, daemon=True).start()
     router.register("allowlist", cmd_allowlist, private_only=True,
