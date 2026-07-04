@@ -947,36 +947,52 @@ class Bot:
         sel = (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id)
         return self.by_key.get(sel)
 
+    def _server_menu(self, current=None) -> str:
+        """Numbered server list for /use and the disambiguation prompt. The
+        numbers are 1-based over ``self.servers`` (stable order) so a user can
+        pick with ``/use <number>``. ``current`` (a Server or None) is marked."""
+        lines = []
+        for i, s in enumerate(self.servers, 1):
+            mark = "*" if s is current else " "
+            lines.append(f" {mark} {i}. {s.config.name}")
+        return "\n".join(lines)
+
+    def _resolve_use_token(self, token: str):
+        """Resolve a /use argument to a Server: a 1-based list number (as shown
+        by ``_server_menu``), or a server name/key. Returns None if it matches
+        neither. A numeric token is always read as a list index — server names
+        are never bare numbers (config rejects unsafe names)."""
+        token = (token or "").strip()
+        if token.isdigit():
+            i = int(token)
+            return self.servers[i - 1] if 1 <= i <= len(self.servers) else None
+        return self.find_server(token)
+
     def resolve_command(self, ctx) -> bool:
         """CommandRouter resolve hook: set ctx.server, or reply with a
         disambiguation message and return False."""
         server = self.resolve_target_server(ctx)
         if server is None:
-            names = ", ".join(sorted(self.by_name)) or "(none)"
             ctx.reply("This bot serves multiple servers. Pick one with "
-                      f"/use <server> first.\nServers: {names}")
+                      "/use <number> (or /use <name>):\n" + self._server_menu())
             return False
         ctx.server = server
         return True
 
     def set_use(self, ctx) -> None:
-        """Handle /use: bare form lists servers + current selection; /use
-        <server> sets this admin's session target for subsequent commands."""
+        """Handle /use: bare form lists servers (numbered) + current selection;
+        /use <number> or /use <server> sets this admin's session target for
+        subsequent commands."""
         current = (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id)
+        cur = self.by_key.get(current)
         if not ctx.args:
-            cur = self.by_key.get(current)
-            lines = ["Servers:"]
-            for s in self.servers:
-                mark = "  * " if s is cur else "    "
-                lines.append(f"{mark}{s.config.name}")
-            lines.append("")
-            lines.append(f"Current: {cur.config.name if cur else '(none — /use <server>)'}")
-            ctx.reply("\n".join(lines))
+            ctx.reply("Servers (pick with /use <number> or /use <name>):\n"
+                      + self._server_menu(cur)
+                      + f"\n\nCurrent: {cur.config.name if cur else '(none)'}")
             return
-        target = self.find_server(ctx.args[0])
+        target = self._resolve_use_token(ctx.args[0])
         if target is None:
-            names = ", ".join(sorted(self.by_name)) or "(none)"
-            ctx.reply(f"Unknown server '{ctx.args[0]}'.\nServers: {names}")
+            ctx.reply(f"Unknown server '{ctx.args[0]}'.\n" + self._server_menu(cur))
             return
         self._admin_session.setdefault(ctx.platform, {})[ctx.user_id] = target.config.key
         ctx.reply(f"Now using {target.config.name} for your commands.")
@@ -2107,7 +2123,7 @@ def register_commands(router, auth: dict) -> None:
         lines.append("/chat_id — show this chat's ID")
         if ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth):
             if len(ctx.bot.servers) > 1:
-                lines.append("/use <server> — pick the server your commands act on")
+                lines.append("/use [number|server] — list/pick the server your commands act on")
             lines += [
                 "/authorize <chat_id> — whitelist a chat",
                 "/revoke <chat_id> — remove a chat from whitelist",
