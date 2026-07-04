@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import threading
 import time
@@ -206,16 +205,12 @@ class Server:
     aliases below keep existing call sites working in the meantime.
     """
 
-    def __init__(self, config, migrate_legacy=False):
+    def __init__(self, config):
         self.config = config
         self.log = _TagLogAdapter(logger, {"tag": config.name})
         self.backend = None  # set in main() after make_backend
         self.watcher = None  # LogWatcher, set when the server is brought up
         self.observer = None  # watchdog Observer, stopped on shutdown
-        # Only the historical single-server install has state at the repo root;
-        # that server migrates it into data/<key>/ once. Additional servers in a
-        # multi-server config start clean and never pull from the root.
-        self._migrate_legacy = migrate_legacy
         self.data_dir = config.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -264,19 +259,8 @@ class Server:
         self.deaths: dict = {}
 
     def _data_path(self, filename: str) -> Path:
-        """Resolve a per-server state file under data/<key>/. For the migrated
-        single-server install (migrate_legacy=True), a legacy repo-root copy is
-        moved into place once so its data survives the relocation."""
-        target = self.data_dir / filename
-        if self._migrate_legacy:
-            legacy = Path(__file__).parent / filename
-            if not target.exists() and legacy.exists():
-                try:
-                    shutil.move(str(legacy), str(target))
-                except OSError:
-                    self.log.warning("Could not migrate %s into %s",
-                                   filename, self.data_dir)
-        return target
+        """Resolve a per-server state file under data/<key>/."""
+        return self.data_dir / filename
 
     def load_state(self) -> None:
         """Load this server's player registry, achievements, and deaths. Called
@@ -2000,20 +1984,15 @@ def _normalize_ns(ns: dict) -> dict:
 def load_auth(path: Path, bots: list) -> dict:
     """Load the whole bot-namespaced auth doc for the configured ``bots`` (a list
     of BotConfig):
-    ``{bot_name: {platform: {admin_user_id, authorized_chat_ids, chat_servers}}}``.
+    ``{bot_name: {platform: {admin_user_id, authorized_chat_ids, chat_servers,
+    chat_names}}}``.
 
-    Chains the legacy migrations so any older on-disk shape upgrades in place:
-      1. flat ``{admin_user_id, authorized_chat_ids}`` -> ``{telegram: …}``
-         (pre-multi-platform installs);
-      2. platform-level ``{platform: ns}`` -> ``{<first bot>: {platform: ns}}``
-         (pre-multi-bot installs — the legacy doc belonged to the sole bot, so
-         it's folded under the first configured bot's name);
-      3. every configured bot gets a namespace, and any bot that fronts exactly
-         one server has its existing authorized chats bound to that server's key
-         so a later multi-server config keeps delivering to them.
-
-    Migration is in-memory only; the new shape is persisted on the next auth
-    mutation (admin claim / authorize / revoke).
+    Every configured bot gets a namespace (so ``_AUTH_DOC[bot.name]`` always
+    resolves) and each namespace is normalized (defaults filled, ids
+    stringified). Any bot namespaces already on disk for bots not in this run
+    are carried through untouched. Top-level or platform entries that aren't the
+    expected ``{bot: {platform: ns}}`` shape are ignored rather than crashing
+    startup (there is no migration of older on-disk shapes).
     """
     data = {}
     if path.exists():
@@ -2022,31 +2001,13 @@ def load_auth(path: Path, bots: list) -> dict:
                 data = json.load(f)
         except Exception:
             logger.exception("Failed to load auth.json")
-    # 1. flat -> telegram namespace
-    if "admin_user_id" in data or "authorized_chat_ids" in data:
-        data = {"telegram": data}
-    # 2. platform-level -> bot-namespaced. A platform-level doc has ns dicts
-    #    (with admin_user_id/authorized_chat_ids) as its top-level values; a
-    #    bot-namespaced doc has platform maps there instead. Fold a legacy
-    #    platform-level doc under the first configured bot (the historical one).
-    if any(isinstance(v, dict)
-           and ("admin_user_id" in v or "authorized_chat_ids" in v)
-           for v in data.values()):
-        data = {bots[0].name: data}
-    # Ensure every configured bot has a namespace and normalize all of them.
+    if not isinstance(data, dict):
+        data = {}
     for b in bots:
         data.setdefault(b.name, {})
-    out = {bname: {p: _normalize_ns(ns) for p, ns in bns.items()}
-           for bname, bns in data.items()}
-    # 3. bind pre-existing authorized chats to the sole server (per single-server
-    #    bot), so an eventual multi-server upgrade keeps delivering to them.
-    for b in bots:
-        if len(b.servers) == 1:
-            key = b.servers[0].key
-            for ns in out[b.name].values():
-                for cid in ns["authorized_chat_ids"]:
-                    ns["chat_servers"].setdefault(cid, key)
-    return out
+    return {bname: {p: _normalize_ns(ns) for p, ns in bns.items()
+                    if isinstance(ns, dict)}
+            for bname, bns in data.items() if isinstance(bns, dict)}
 
 
 def save_auth(auth: dict, path: Path) -> None:
@@ -2947,8 +2908,7 @@ def _bring_up_server(server, bot) -> bool:
     True on success; on backend failure alerts the bot's admins and returns False
     (the caller drops the server so the bot skips it)."""
     try:
-        server.backend = make_backend(server.config,
-                                      migrate_legacy=server._migrate_legacy)
+        server.backend = make_backend(server.config)
     except BackendUnavailable as e:
         logger.error("[%s] Cannot start backend (edition '%s'): %s",
                      server.config.name, server.config.edition, e)
@@ -3084,21 +3044,15 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
 
-    # Legacy repo-root state is migrated into data/<key>/ only for the classic
-    # single-server install; a multi-server config can't unambiguously claim it.
-    migrate_legacy = len(APP_CONFIG.all_servers()) == 1
-
     # One auth.json for the whole process; each bot operates on its own slice
     # (shared dict objects, so save_auth(_AUTH_DOC) persists in-place mutations).
-    # Always pass the FULL bot list (not the --only-filtered one): load_auth
-    # folds a legacy platform-level doc under the first bot, and filtering could
-    # misattribute the historical admin/chats to whichever bot --only selected.
+    # Pass the FULL bot list (not the --only-filtered one) so every configured
+    # bot gets a normalized namespace regardless of which one --only selected.
     _AUTH_DOC = load_auth(_AUTH_PATH, APP_CONFIG.bots)
 
     bots = []
     for bcfg in bots_cfg:
-        servers = [Server(scfg, migrate_legacy=migrate_legacy)
-                   for scfg in bcfg.servers]
+        servers = [Server(scfg) for scfg in bcfg.servers]
         bot = Bot(bcfg, servers)
         bot.auth_doc = _AUTH_DOC
         bot.auth = _AUTH_DOC[bcfg.name]

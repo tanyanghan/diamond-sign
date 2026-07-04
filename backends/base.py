@@ -15,12 +15,9 @@ command transport, the save/flush sequence, and server-side queries.
 """
 
 import re
-import shutil
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Minecraft formatting codes: the section sign (§, U+00A7) followed by one
 # color/style char. They render as garbage in a chat message, so strip them
@@ -61,32 +58,17 @@ class ServerBackend(ABC):
     # Set of capability/event strings this backend supports. Subclasses override.
     CAPABILITIES: set[str] = set()
 
-    def __init__(self, config, migrate_legacy=False):
+    def __init__(self, config):
         self.config = config
         # Per-server state lives under data/<server-name>/ (config.data_dir),
         # so two servers in one process never share a state file.
         self.data_dir = config.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        # Only the historical single-server install may claim repo-root state
-        # files; in a multi-server config no server can unambiguously own them
-        # (mirrors bot.Server._data_path).
-        self._migrate_legacy = migrate_legacy
         self._watcher = None  # LogWatcher, attached after construction
 
     def _data_path(self, filename: str) -> Path:
-        """Resolve a per-server state file under ``data/<key>/``. For the
-        migrated single-server install (migrate_legacy=True), a legacy
-        repo-root copy is moved into place once so its data survives the
-        relocation."""
-        target = self.data_dir / filename
-        if self._migrate_legacy:
-            legacy = _REPO_ROOT / filename
-            if not target.exists() and legacy.exists():
-                try:
-                    shutil.move(str(legacy), str(target))
-                except OSError:
-                    pass
-        return target
+        """Resolve a per-server state file under ``data/<key>/``."""
+        return self.data_dir / filename
 
     def attach_watcher(self, watcher) -> None:
         """Give the backend the LogWatcher it uses to await server log lines.
