@@ -41,10 +41,18 @@ Flags:
 - `--deaths-only` — skip the experiment (deaths only; no chat, no amulet libs, sets
   only `bedrock_script_events`).
 - `--yes` / `-y` — skip the "is the server stopped?" prompt (non-interactive use).
-- `--force` — skip the automated "server not running" lock check (implies `--yes`).
+- `--force` — skip the automated "server not running" probe (implies `--yes`).
 - `--no-config` — don't modify `diamondsign.json`.
 
-The experiment step needs `amulet-nbt`/`amulet-leveldb`
+Before enabling the experiment the installer checks the server is really down by
+sending `list` on its console (via the tmux/screen `mux.session`) and seeing
+whether it answers — it does **not** use the world LevelDB lock, because BDS
+doesn't lock the world db (there's no `LOCK` file even while it runs), so a lock
+check would both misread a running server as stopped and open the live world db.
+If no mux session is configured/found it can't probe and falls back to your
+"stopped?" confirmation.
+
+The experiment step needs `amulet-nbt`
 (`requirements-bedrock-restore.txt`). After it finishes, just restart the server
 and the bot. The manual steps below document what the installer does.
 

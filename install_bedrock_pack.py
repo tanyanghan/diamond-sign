@@ -9,11 +9,12 @@ is configured, it lists them and asks which to act on (or pass ``--server
      the pack's header UUID, never clobbering other packs),
   3. (unless ``--deaths-only``) enables the Beta APIs / GameTest experiment in
      ``level.dat`` — but only after confirming the **server is not running**
-     (the world LevelDB must be unlocked).
+     (a console ``list`` probe over the server's tmux/screen session; a live
+     server answers into console.log).
 
 The experiment toggle lives in ``level.dat`` — a little-endian NBT file with an
 8-byte header — so this uses ``amulet-nbt`` (from
-``requirements-bedrock-restore.txt``), not the LevelDB.
+``requirements-bedrock-restore.txt``). It does not touch the world LevelDB.
 
 Run it with the server stopped:
 
@@ -46,6 +47,42 @@ _INSTALLED_NAME = "diamondsign_events"
 
 def _fail(msg: str):
     sys.exit(f"error: {msg}")
+
+
+def _server_running(server) -> "bool | None":
+    """Best-effort, LevelDB-free check for a live BDS before we edit its world.
+
+    Sends ``list`` on the server's console (via its tmux/screen session) and
+    watches whether the server answers into ``console.log``. Returns True
+    (responded -> running), False (silent -> looks stopped), or None (couldn't
+    probe -- no matching mux session).
+
+    Deliberately NOT the world LevelDB lock: this BDS build never takes an fcntl
+    lock on the world db (there isn't even a ``LOCK`` file while it runs), so a
+    lock check both misreports a running server as stopped AND opens the live
+    world db (a second LevelDB instance against a db the server is writing) to
+    find out -- the exact corruption this guard exists to prevent.
+    """
+    import time
+    if not server.mux_session:
+        return None            # no explicit session -> don't guess a pane
+    sys.path.insert(0, str(_REPO_ROOT))
+    from backends.mux import detect
+    mux = detect(server.mux_session)
+    if mux is None:
+        return None
+    log_path = server.log_path
+
+    def size():
+        try:
+            return log_path.stat().st_size
+        except OSError:
+            return -1
+
+    before = size()
+    mux.send("list")            # a running server echoes an online-count line
+    time.sleep(2.0)             # mux settle (~0.3s) + server response margin
+    return size() != before
 
 
 def _confirm_stopped(assume_yes: bool):
@@ -368,19 +405,20 @@ def _do_install(server, mc_dir, world_dir, uuid, version, args):
         print("Skipped the Beta APIs experiment (--deaths-only); chat disabled.")
     else:
         if not args.force:
-            # Probe the LevelDB lib directly so a missing dependency isn't
-            # mistaken for "server running" (is_db_locked treats any open
-            # failure — lock, absent, or ImportError — as locked).
-            try:
-                import leveldb  # noqa: F401  (amulet-leveldb)
-            except Exception as e:
-                _fail("amulet-leveldb is needed to verify the server is stopped "
-                      "(pip install -r requirements-bedrock-restore.txt), or pass "
-                      f"--force after stopping the server yourself. ({e})")
-            from utils import bedrock_player
-            if bedrock_player.is_db_locked(bedrock_player.world_db_path(mc_dir)):
-                _fail("the world database is locked — the server appears to be "
-                      "running (or another tool has it open). Stop it and re-run.")
+            # Confirm the server is really down before editing level.dat. A
+            # console `list` probe (not the LevelDB lock — see _server_running):
+            # a live server answers, closing the false-negative the lock check
+            # has on this BDS build without opening the live world db.
+            running = _server_running(server)
+            if running is True:
+                _fail("the server answered a console command — it's still "
+                      "running. Stop it and re-run (or --force after stopping "
+                      "it yourself).")
+            elif running is None:
+                print("warning: couldn't probe the server (no tmux/screen "
+                      "session matched this server's mux.session) — proceeding "
+                      "on your confirmation that it's stopped. Pass --force to "
+                      "silence this.")
         print("Enabling Beta APIs experiment (chat)...")
         _enable_experiment(world_dir)
 
