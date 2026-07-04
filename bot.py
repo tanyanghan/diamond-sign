@@ -2601,6 +2601,9 @@ def register_commands(router, auth: dict) -> None:
 
         if not confirm:
             _set_pending_world_restore(pkey, stage="selected", selected_n=n)
+            server.log.info("Restore: [%s] on [%s] selected point %d ([%s] %s)",
+                            ctx.sender_label, ctx.chat_label, n,
+                            point["kind"], point["pretty_ts"])
             pre = ("A fresh full backup of the current world will be taken first."
                    if server.config.pre_restore_backup
                    else "No pre-restore backup will be taken (backup.pre_restore_"
@@ -2729,17 +2732,16 @@ def register_commands(router, auth: dict) -> None:
         target_id = str(ctx.args[0]).strip()
         with _auth_lock:
             ns = _auth_ns(auth, ctx.platform)
+            display = ctx.bot.chat_display(ctx.platform, target_id)
             was_bound = ns["chat_servers"].pop(target_id, None) is not None
-            if target_id in ns["authorized_chat_ids"]:
-                display = ctx.bot.chat_display(ctx.platform, target_id)
+            was_authed = target_id in ns["authorized_chat_ids"]
+            if was_authed:
                 ns["authorized_chat_ids"].remove(target_id)
                 ns.get("chat_names", {}).pop(target_id, None)
+            if was_authed or was_bound:
                 save_auth(_AUTH_DOC, _AUTH_PATH)
                 ctx.bot.log.info("Revoke: chat %s by [%s] on [%s]",
                                  display, ctx.sender_label, ctx.chat_label)
-                ctx.reply(f"Chat {target_id} has been revoked.")
-            elif was_bound:
-                save_auth(_AUTH_DOC, _AUTH_PATH)
                 ctx.reply(f"Chat {target_id} has been revoked.")
             else:
                 ctx.reply(f"Chat {target_id} was not authorized.")
