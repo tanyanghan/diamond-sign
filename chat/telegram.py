@@ -6,6 +6,7 @@ its own thread (started by ``bot.main``). Monospace blocks use Telegram's HTML
 """
 
 import collections
+import html
 import logging
 import threading
 import time
@@ -184,7 +185,11 @@ class TelegramAdapter(ChatAdapter):
         parse_mode = "HTML" if monospace else None
         limit = _MAX_LEN - 11 if monospace else _MAX_LEN
         for chunk in chunk_text(text, limit):
-            body = f"<pre>{chunk}</pre>" if monospace else chunk
+            # In monospace we send HTML, so the content must be escaped — a raw
+            # '<', '>' or '&' in server output (e.g. an RCON response) would
+            # otherwise make Telegram reject the whole message ("can't parse
+            # entities") and it would silently never arrive.
+            body = f"<pre>{html.escape(chunk)}</pre>" if monospace else chunk
             params = {}
             if reply_to is not None:
                 params["reply_parameters"] = telebot.types.ReplyParameters(

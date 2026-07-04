@@ -14,12 +14,22 @@ Line parsing and the shared player-state bookkeeping deliberately stay in
 command transport, the save/flush sequence, and server-side queries.
 """
 
+import re
 import shutil
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Minecraft formatting codes: the section sign (§, U+00A7) followed by one
+# color/style char. They render as garbage in a chat message, so strip them
+# from anything shown to the user.
+_RE_MC_FORMAT = re.compile("§.")
+
+
+def strip_minecraft_formatting(text: str) -> str:
+    return _RE_MC_FORMAT.sub("", text)
 
 # Normalized event types yielded by line parsing.
 EVENT_JOIN = "join"
@@ -172,7 +182,9 @@ class ServerBackend(ABC):
         cmd = self.ALLOWLIST_VERB
         if args:
             cmd += " " + " ".join(args)
-        return self.capture_command(cmd, timeout=timeout)
+        # Java RCON responses carry § colour codes; strip them so the chat reply
+        # is clean (Bedrock's captured output is already plain).
+        return strip_minecraft_formatting(self.capture_command(cmd, timeout=timeout))
 
     def broadcast(self, message: str) -> None:
         """Announce ``message`` to all players in-game via the console ``say``
