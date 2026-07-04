@@ -1,9 +1,10 @@
 # Diamond Sign
 
-A chat bot that watches your Minecraft server and keeps you in the loop from
+A chat bot that watches your Minecraft server(s) and keeps you in the loop from
 **Telegram** and/or **Slack** — player join/leave, deaths, in-game chat, stats,
 and automated backups with point-in-time restore. Works with **Java** and
-**Bedrock** dedicated servers.
+**Bedrock** dedicated servers, and one process can front **multiple servers** and
+run **multiple bots** at once.
 
 **Highlights**
 
@@ -12,11 +13,12 @@ and automated backups with point-in-time restore. Works with **Java** and
 - **Player stats & playtime** leaderboards, and a known-player list.
 - **Backups** — scheduled full backups plus space-efficient incrementals while
   players are online, with optional off-server copy.
-- **Restore** — roll back the whole world to any backup point, or restore a
-  **single player** without touching anyone else.
+- **Restore** — roll back the whole world to any backup point (the bot stops and
+  restarts the server for you), or restore a **single player** without touching
+  anyone else.
 - **`/allowlist`** — manage the server's whitelist/allowlist from chat.
-- One process serves all your chat platforms; commands are answered where they're
-  sent, announcements broadcast everywhere.
+- **Multi-tenant** — one process serves any mix of bots × servers; commands are
+  answered where they're sent, announcements go to the chats bound to each server.
 
 ### What works on each edition
 
@@ -25,17 +27,17 @@ and automated backups with point-in-time restore. Works with **Java** and
 | Join / leave notifications | ✓ | ✓ |
 | Player stats & `/playtime` | ✓ | ✓ |
 | Full + incremental backups | ✓ | ✓ |
-| Whole-world restore | ✓ | ✓ |
+| Whole-world restore | ✓ — needs `mux` set (below) | ✓ |
 | Per-player restore | ✓ | ✓ |
 | `/allowlist` | ✓ | ✓ |
 | Death notifications | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
 | In-game chat relay | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
 | Achievements | ✓ | ✗ — Xbox-bound, not exposed to servers |
 
-> **Host requirement:** the Minecraft **server** must run on **Linux**. Windows
-> file locking breaks backup zips (e.g. `session.lock`), and buffered log writes
-> make the command confirmations unreliable. The bot itself can run anywhere
-> Python + `watchdog` work, but the server it watches should be on Linux.
+> **Host requirement:** the Minecraft **server** must run on **Linux** (Windows
+> file locking breaks backup zips, e.g. `session.lock`, and buffered log writes
+> make command confirmations unreliable). The bot is developed and run on Linux
+> too; it drives servers via tmux/screen, RCON, and POSIX signals.
 
 ---
 
@@ -44,72 +46,138 @@ and automated backups with point-in-time restore. Works with **Java** and
 1. **Install**
    ```bash
    python -m venv .venv
-   source .venv/bin/activate        # Windows: .venv\Scripts\activate
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-2. **Configure** — easiest is to just **skip to step 3 and run `python bot.py`**:
-   if `.env` is missing or a required field is unset, the bot runs a short
-   interactive setup, asks for what it needs, and writes `.env` for you. On every
-   later start it also tops `.env` up with any new fields from `.env.example`
-   (your values are kept), and stops with a clear list if anything required is
-   missing in a non-interactive launch (e.g. under systemd).
-
-   To configure by hand instead, copy the template and edit it:
+2. **Configure** — the bot reads a single JSON file, **`diamondsign.json`**, next
+   to `bot.py`. The fastest way to get a template:
    ```bash
-   cp .env.example .env
+   cp diamondsign.example.json diamondsign.json    # then edit it
    ```
-   The essentials to get running:
-   | Variable | What it is |
-   |---|---|
-   | `MINECRAFT_DIR` | Absolute path to the server directory |
-   | `CHAT_PLATFORMS` | `telegram` (default), `slack`, or `telegram,slack` |
-   | `BOT_TOKEN` | Telegram bot token (if Telegram is on) — see [Telegram](#telegram) |
-   | `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | Slack tokens (if Slack is on) — see [Slack](#slack) |
-   | `SERVER_EDITION` | `java` (default) or `bedrock` |
-   | `RCON_PASSWORD` | **Java:** match `server.properties` — see [Java](#java-rcon) |
-   | `MUX_SESSION` / `CONSOLE_LOG` | **Bedrock:** see [Bedrock](#bedrock) |
+   A minimal single-bot / single-server config:
+   ```json
+   {
+     "version": 1,
+     "bots": [
+       {
+         "name": "default",
+         "platforms": ["telegram"],
+         "telegram": { "bot_token": "123456:your-telegram-token" },
+         "servers": [
+           {
+             "name": "survival",
+             "edition": "java",
+             "minecraft_dir": "/srv/survival",
+             "rcon": { "password": "your_rcon_password" },
+             "backup": { "dir": "~/backup/survival",
+                         "incremental": { "enabled": true } }
+           }
+         ]
+       }
+     ]
+   }
+   ```
+   See [Configuration](#configuration) for every field, and
+   [Multiple servers & bots](#multiple-servers--bots) for multi-server setups.
 
-   Then set up your [chat platform](#connecting-a-chat-platform) and
-   [Minecraft server](#connecting-your-minecraft-server) (the next two sections).
+   > **Upgrading from a `.env` install?** On first start, a legacy flat `.env` is
+   > automatically migrated to `diamondsign.json` (your values are carried over,
+   > and `.env` is left in place). After that, **edit `diamondsign.json`** — the
+   > `.env` is no longer read, and the bot prints a note if it sees one lingering.
 
 3. **Run**
    ```bash
-   python bot.py
+   python bot.py                # run every configured bot
+   python bot.py --only default # run just one bot (per-process isolation)
    ```
 
 4. **Claim & authorise** — DM the bot to become its admin, then whitelist a group
    to receive notifications. See [Authorising chats](#authorising-chats).
 
+Then set up your [chat platform](#connecting-a-chat-platform) and
+[Minecraft server](#connecting-your-minecraft-server) (next two sections).
+
+---
+
+## Configuration
+
+Everything lives in **`diamondsign.json`**: a list of **bots**, each a chat
+identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
+
+```jsonc
+{
+  "version": 1,
+  "bots": [
+    {
+      "name": "default",                 // unique; namespaces this bot's auth
+      "platforms": ["telegram", "slack"],// which adapters to run
+      "telegram": { "bot_token": "123:ABC" },
+      "slack":    { "bot_token": "xoxb-…", "app_token": "xapp-…" },
+      "servers": [
+        {
+          "name": "survival",            // UNIQUE across the whole file, and used
+                                         // verbatim as the data-dir key and the
+                                         // /use & /authorize argument — so it must
+                                         // be filesystem-safe: letters, digits,
+                                         // '.', '_', '-' (NO spaces). Defaults to
+                                         // the world's level-name (slugified).
+          "edition": "java",             // "java" (default) or "bedrock"
+          "minecraft_dir": "/srv/survival",
+          "rcon": { "password": "…", "host": "localhost", "port": 25575 },
+          "mux": { "session": "", "start_cmd": "" },  // see per-edition sections
+          "console_log": null,           // Bedrock: captured-stdout path
+          "bedrock_script_events": false,// Bedrock deaths/chat via behavior pack
+          "chat_relay": false,           // relay in-game chat to the chats
+          "backup": {
+            "dir": "~/backup/survival",
+            "schedule": "daily",         // daily | weekly (Mon) | monthly (1st)
+            "hour": 4,                   // 0–23, scheduled-backup hour
+            "copy_cmd": "",              // off-server copy; "{file}" → zip path
+            "pre_restore_backup": false, // /restore: back up current world first
+            "restore_warning_seconds": 15,
+            "incremental": { "enabled": true, "interval_minutes": 15 }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+The config is validated on start; it stops with a clear list of problems if
+anything required is missing or a server `name` isn't filesystem-safe. Secrets
+(`diamondsign.json`, `auth.json`, `.env`) are git-ignored.
+
 ---
 
 ## Connecting a chat platform
 
-`CHAT_PLATFORMS` (comma-separated) selects which platforms run; the bot serves
-them **all at once** from one process. Commands are answered on the platform they
-arrive on; only announcements broadcast to every platform. A `/backup` (or
-`/restore_player`) started on one platform while one is already running anywhere
-replies "already in progress" — backups are globally serialised.
+A bot's `platforms` selects which adapters run; the bot serves them **all at
+once** from one process. Commands are answered on the platform they arrive on;
+announcements go to the chats bound to the relevant server. A `/backup` (or
+restore) started while one is already running on that server replies "already in
+progress" — per-server backups are serialised.
 
 ### Telegram
 
 Long-polling — no public URL needed. Create a bot with
-[@BotFather](https://t.me/BotFather), put the token in `BOT_TOKEN`, and include
-`telegram` in `CHAT_PLATFORMS`.
+[@BotFather](https://t.me/BotFather) and put the token in the bot's
+`telegram.bot_token`, with `"telegram"` in `platforms`.
 
 ### Slack
 
 Uses **Socket Mode** (an outbound websocket), so no public URL or webhook is
-needed — it works behind NAT like Telegram. Set `CHAT_PLATFORMS=...,slack` and
-both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
+needed — it works behind NAT like Telegram. Add `"slack"` to `platforms` and set
+both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
 
 1. Create an app at <https://api.slack.com/apps> → **From an app manifest**,
    select your workspace, choose the **JSON** tab, and paste the manifest below
    (it declares every slash command and the scopes).
 2. **Basic Information → App-Level Tokens →** generate a token with the
-   `connections:write` scope → that's `SLACK_APP_TOKEN` (`xapp-…`).
+   `connections:write` scope → that's `slack.app_token` (`xapp-…`).
 3. **Install App** to your workspace → **Bot User OAuth Token** is
-   `SLACK_BOT_TOKEN` (`xoxb-…`).
+   `slack.bot_token` (`xoxb-…`).
 4. Invite the bot to each channel you want notifications in (`/invite @yourbot`).
    `chat:write.public` lets it also post to public channels it hasn't joined.
 
@@ -166,14 +234,14 @@ both `SLACK_BOT_TOKEN` (`xoxb-…`) and `SLACK_APP_TOKEN` (`xapp-…`).
 > across platforms.
 
 Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/authorize` and
-the per-platform `auth.json` handle automatically.
+`auth.json` handle automatically.
 
 ---
 
 ## Connecting your Minecraft server
 
-Set `SERVER_EDITION` to `java` or `bedrock`. The two editions differ in how the
-bot sends commands to the server.
+Each server sets `edition` to `java` or `bedrock`. The two editions differ in how
+the bot sends commands to the server.
 
 ### Java (RCON)
 
@@ -187,7 +255,21 @@ The bot drives a Java server over **RCON** (used for backups, `/list`,
    rcon.password=your_password
    ```
 2. Restart the server.
-3. Set the same password in `.env` as `RCON_PASSWORD`.
+3. Set the same password in the server's `rcon.password` (and `rcon.port`/
+   `rcon.host` if not the defaults).
+
+To also use **`/restore` and `/start`** (whole-world restore / bring-up), Java
+needs a way to *restart* the JVM — RCON can stop it but can't relaunch it. Run the
+server under tmux/screen and set the server's `mux`:
+
+```jsonc
+"mux": { "session": "0:survival",
+         "start_cmd": "cd /srv/survival && java -Xmx4G -jar server.jar nogui" }
+```
+
+The bot stops it via RCON `stop` and restarts it by typing `start_cmd` into that
+session. Without `mux`, everything else works and `/restore`/`/start` are refused
+with a clear message.
 
 #### Securing the RCON port
 
@@ -220,17 +302,17 @@ Java's. Run the server inside a terminal multiplexer (tmux or screen — byobu
 wraps either) so the bot can type commands on its stdin.
 
 **Command injection.** The bot sends commands via the tmux/screen session hosting
-the server. It auto-detects the session, or you can pin it with `MUX_SESSION`. If
-no session is found, the bot logs a clear message and exits. The bot must run as
-the **same user** that owns the session (it can only see that user's sessions).
+the server. It auto-detects the session, or you can pin it with the server's
+`mux.session`. If no session is found, the bot logs a clear message and skips that
+server. The bot must run as the **same user** that owns the session (it can only
+see that user's sessions).
 
-**Setting `MUX_SESSION`.** This is the session **name**, not the multiplexer type
-— `MUX_SESSION=tmux` is wrong. Leave it blank to auto-detect the first live
-session, or set one of:
+**Setting `mux.session`.** This is the session **name**, not the multiplexer type
+— `"tmux"` is wrong. Leave it blank to auto-detect the first live session, or set:
 
-- `MUX_SESSION=<session>` — e.g. `MUX_SESSION=1`
-- `MUX_SESSION=<session>:<window>` — pin a specific window (recommended)
-- `MUX_SESSION=<session>:<window>.<pane>` — pin a window and pane
+- `"session": "<session>"` — e.g. `"1"`
+- `"session": "<session>:<window>"` — pin a specific window (recommended)
+- `"session": "<session>:<window>.<pane>"` — pin a window and pane
 
 Pinning the window is recommended because byobu uses **grouped tmux sessions**
 (e.g. `1` and `1-8` sharing windows), where the active-window pointer shifts as
@@ -243,37 +325,68 @@ tmux list-windows -t 1             # window index + name, e.g. "0: bedrock"
 ```
 
 If BDS runs in the window named `bedrock` of session `1`, set
-`MUX_SESSION=1:bedrock` (the **name** is more robust than the index `1:0`, which
+`"session": "1:bedrock"` (the **name** is more robust than the index `1:0`, which
 shifts if windows are reordered). On startup the log shows
 `Detected tmux session for command injection: 1:bedrock`. For `screen`, the form
-is `MUX_SESSION=<session>:<window-number>`.
+is `"<session>:<window-number>"`.
 
 **Capturing output.** BDS writes to stdout, not `logs/latest.log`. Launch it so
-its output is captured to a file the bot tails (default `MINECRAFT_DIR/console.log`,
-override with `CONSOLE_LOG`), e.g. inside your tmux/screen window:
+its output is captured to a file the bot tails (default
+`minecraft_dir/console.log`, override with `console_log`), e.g. inside your
+tmux/screen window:
 ```bash
 ./bedrock_server 2>&1 | tee -a console.log
 ```
+The server's `mux.start_cmd` defaults to exactly this launch (used to relaunch BDS
+after a restore); override only for a non-standard launch.
 
 Bedrock also has a few edition-specific features and limitations — see
 [Bedrock specifics](#bedrock-specifics).
 
 ---
 
+## Multiple servers & bots
+
+One process runs **any mix of bots × servers** from `diamondsign.json`:
+
+- **One bot, many servers** — add more entries to a bot's `servers`. The bot
+  routes each server's events to the chats **bound** to that server, and
+  server-scoped commands (`/backup`, `/status`, `/restore`, …) target a server you
+  pick with **`/use <server>`** (or the channel's binding). `/authorize <chat_id>
+  <server>` binds a chat to a server.
+- **Many bots** — add more entries to `bots` (e.g. a separate Telegram bot per
+  community). Each bot has its own tokens, its own admin, and its own slice of
+  `auth.json`. All run in one process with independent pollers (N tokens = N
+  pollers, no conflict).
+- **Per-process isolation** — `python bot.py --only <bot>` runs a single bot, for
+  a systemd-unit-per-bot deployment.
+
+On a **single-server bot** none of this is visible: commands act on the only
+server implicitly and announcements fan out to every authorised chat.
+
+Per-server state never collides: each server's files live under
+`data/<name>/` (see [Runtime state](#runtime-state)).
+
+---
+
 ## Authorising chats
 
-Authorisation is **per platform** (each has its own admin and whitelist, stored
-namespaced in `auth.json`). On each platform you use:
+Authorisation is **per bot, per platform** (each has its own admin and whitelist,
+stored namespaced in `auth.json`). On each platform you use:
 
-1. Send the bot a private message / DM — the first sender becomes that platform's
-   **admin** (on Telegram, any message; on Slack, any slash command such as
-   `/status`).
+1. Send the bot a private message / DM — the first sender becomes that bot's
+   **admin** on that platform (on Telegram, any message; on Slack, any slash
+   command such as `/status`).
 2. In the group/channel you want notifications in, send `/chat_id` to get its ID
    (works even before the chat is authorised; on Slack, invite the bot first).
-3. In a private message/DM to the bot, send `/authorize <chat_id>` to whitelist it.
+3. In a DM to the bot, send `/authorize <chat_id>` to whitelist it. On a
+   **multi-server** bot, add the target server: `/authorize <chat_id> <server>` —
+   that binds the chat so it receives *that* server's announcements.
 
-The bot then broadcasts announcements (join/leave, deaths, …) to every authorised
-chat on every platform, and answers commands in whichever chat they're sent.
+The bot then broadcasts each server's announcements (join/leave, deaths, …) to the
+chats bound to it, and answers commands in whichever chat they're sent.
+`/listchats` shows the authorised chats (with names and their bound server);
+`/revoke <chat_id>` removes one.
 
 ---
 
@@ -281,7 +394,7 @@ chat on every platform, and answers commands in whichever chat they're sent.
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show currently online players |
+| `/status` | Show whether the server is online, and who's playing |
 | `/list` | List all known players |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
@@ -292,14 +405,20 @@ chat on every platform, and answers commands in whichever chat they're sent.
 | `/use [<server>]` | *(Admin)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only) |
 | `/authorize <chat_id> [<server>]` | *(Admin)* Whitelist a chat; on a multi-server bot bind it to `<server>` |
 | `/revoke <chat_id>` | *(Admin)* Remove a chat from the whitelist |
-| `/listchats` | *(Admin)* List authorised chats (and their bound server) |
+| `/listchats` | *(Admin)* List authorised chats (name + bound server) |
 | `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
 | `/backup` | *(Admin)* Trigger a server backup now |
 | `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back |
 | `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore one player's data |
 | `/restore [<N> [confirm]]` | *(Admin)* Restore the whole world to a backup point — warns players in-game, then stops, replaces, and restarts the server |
-| `/start` | *(Admin)* Start the server if it's offline (via `mux.start_cmd`). Commands that need the live server (`/backup`, `/allowlist`, `/restore_player`) are refused while it's offline |
+| `/start` | *(Admin)* Start the server if it's offline (via `mux.start_cmd`) |
+
+**Online-only commands.** `/backup`, `/allowlist`, and `/restore_player` need the
+server **running** and are refused with a clear message when it's offline (bring
+it up with `/start`). Read commands (`/list`, `/stats`, `/deaths`, …) read stored
+data/world files and work whether the server is up or down. `/restore` works
+offline (it's the recovery path).
 
 **Slack note.** Slack reserves `/status` and `/help`, so on Slack they're
 `/online` and `/commands` respectively (the bot maps them back internally). Every
@@ -308,7 +427,7 @@ other command name is the same on both platforms.
 **Edition notes.** On **Bedrock**, `/achievements` and `/scan_achievements` are
 unavailable (achievements are Xbox-bound and not exposed to servers). `/deaths`
 and `/death_summary` work only with the optional [behavior
-pack](#bedrock-chat--death-events) + `BEDROCK_SCRIPT_EVENTS=true`; the `/scan_*`
+pack](#bedrock-chat--death-events) + `bedrock_script_events: true`; the `/scan_*`
 commands stay Java-only (they scan log history, which Bedrock doesn't keep).
 `/restore_player` works on both, via different mechanisms (see
 [Per-player restore](#restoring-a-single-player)).
@@ -327,10 +446,10 @@ The bot announces player **join/leave** on both editions, and **deaths** and
 Deaths are recorded for `/deaths` and `/death_summary`; achievements for
 `/achievements`.
 
-**Chat relay** (`CHAT_RELAY=true`, off by default) mirrors in-game chat to every
-authorised chat as `💬 <player>: <message>` — one-way (chat platforms → game is
-not relayed). On **Java** this works out of the box (chat is read from
-`latest.log`); on **Bedrock** it needs the [behavior
+**Chat relay** (a server's `chat_relay: true`, off by default) mirrors in-game
+chat to that server's authorised chats as `💬 <player>: <message>` — one-way (chat
+platforms → game is not relayed). On **Java** this works out of the box (chat is
+read from `latest.log`); on **Bedrock** it needs the [behavior
 pack](#bedrock-chat--death-events).
 
 ---
@@ -346,10 +465,10 @@ are online.
 1. `save-off` (via RCON) disables auto-save.
 2. `save-all` flushes world data to disk.
 3. Wait for the filesystem to settle (no changes for 5 s).
-4. Zip the entire `MINECRAFT_DIR` (e.g. `myserver_20260401_040000.zip`) into
-   `BACKUP_DIR`.
+4. Zip the entire `minecraft_dir` (e.g. `survival_20260401_040000.zip`) into the
+   server's `backup.dir`.
 5. `save-on` re-enables auto-save (guaranteed even if the zip fails).
-6. Optionally run `BACKUP_COPY_CMD` to copy the zip off-server.
+6. Optionally run `backup.copy_cmd` to copy the zip off-server.
 
 Players don't need to be kicked — the save-off/save-all/save-on sequence ensures a
 consistent snapshot while the server stays online.
@@ -362,53 +481,51 @@ infrastructure that lives in the server directory is excluded from every zip (th
 Unix file permissions (e.g. the executable bit on the Bedrock server binary) are
 preserved through backup and restore.
 
-**Configuration:**
+**Configuration** (per server, under `backup`):
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RCON_PASSWORD` | **Java only.** Match `server.properties` `rcon.password` | *(required for Java)* |
-| `BACKUP_SCHEDULE` | `daily`, `weekly` (Monday), or `monthly` (1st) | `daily` |
-| `BACKUP_HOUR` | Hour of day (0–23) for the scheduled backup | `4` |
-| `BACKUP_DIR` | Where backup zips are saved | `~/minecraft_backup` |
-| `BACKUP_COPY_CMD` | Shell command to copy the zip off-server; `{file}` → the full zip path | *(empty — disabled)* |
+| `backup.…` key | Description | Default |
+|----------------|-------------|---------|
+| `dir` | Where backup zips are saved | `~/minecraft_backup` |
+| `schedule` | `daily`, `weekly` (Monday), or `monthly` (1st) | `daily` |
+| `hour` | Hour of day (0–23) for the scheduled backup | `4` |
+| `copy_cmd` | Shell command to copy the zip off-server; `{file}` → the full zip path | *(empty — disabled)* |
+| `pre_restore_backup` | `/restore`: take a full backup of the current world before wiping it | `false` |
+| `restore_warning_seconds` | `/restore`: in-game warning lead time before the stop | `15` |
+| `incremental.enabled` | Enable incrementals while players are online | `false` |
+| `incremental.interval_minutes` | Minutes between incrementals while players are active | `15` |
 
-**Off-server copy examples:**
+**Off-server copy examples** (`backup.copy_cmd`):
 
-```bash
-BACKUP_COPY_CMD=cp {file} /mnt/nas/minecraft_backups/                  # mounted NAS
-BACKUP_COPY_CMD=scp {file} user@backup-server:/backups/minecraft/      # SCP
-BACKUP_COPY_CMD=rsync -az {file} user@backup-server:/backups/minecraft/  # rsync
+```jsonc
+"copy_cmd": "cp {file} /mnt/nas/minecraft_backups/"                 // mounted NAS
+"copy_cmd": "scp {file} user@backup-server:/backups/minecraft/"     // SCP
+"copy_cmd": "rsync -az {file} user@backup-server:/backups/minecraft/" // rsync
 ```
 
 **Triggering:** `/backup` runs one immediately (admin, private chat); the
-scheduled backup runs at `BACKUP_HOUR` on the `BACKUP_SCHEDULE`. Progress is sent
-to the admin's chat.
+scheduled backup runs at `hour` on the `schedule`. Progress is sent to the admin's
+chat.
 
 ### Incremental backups
 
-When `INCREMENTAL_BACKUP_ENABLED=true`, the bot backs up only files changed since
-the last backup while players are active — far smaller than repeated full backups.
+When `incremental.enabled` is set, the bot backs up only files changed since the
+last backup while players are active — far smaller than repeated full backups.
 
 1. The cycle starts when the first player joins.
-2. Every `INCREMENTAL_INTERVAL_MINUTES`, the bot compares file mtimes against a
-   stored manifest, freezes the world (Java: save-off/save-all; Bedrock: save
+2. Every `interval_minutes`, the bot compares file mtimes against a stored
+   manifest, freezes the world (Java: save-off/save-all; Bedrock: save
    hold/query), waits for the filesystem to settle, and zips only changed/added
    files (plus `_deletions.json` for removed ones), then resumes saving.
 3. When the last player leaves, one final incremental runs and the cycle stops.
 4. A full backup resets the manifest, so the next incremental only captures
    changes since that full backup.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `INCREMENTAL_BACKUP_ENABLED` | Enable incrementals (`true`/`1`/`yes`) | `false` |
-| `INCREMENTAL_INTERVAL_MINUTES` | Minutes between incrementals while players are active | `15` |
-
 **Chains.** Each full backup starts a new chain (an 8-char hex ID embedded in
 incremental filenames and contents) so that after a restore, new incrementals are
-never confused with old ones. A `.diamondsign_chain` marker in the server directory
-lets the bot detect if the server state was replaced while it was offline; if the
-marker doesn't match the manifest on startup, incrementals pause until the next
-full backup. File naming:
+never confused with old ones. A `.diamondsign_chain` marker in the server
+directory lets the bot detect if the server state was replaced while it was
+offline; if the marker doesn't match the manifest on startup, incrementals pause
+until the next full backup. File naming:
 
 - Full: `servername_20260401_040000.zip`
 - Incremental: `servername_incr_a1b2c3d4_20260401_041500.zip` (includes the chain ID)
@@ -431,19 +548,14 @@ world:
    backup will run, and the in-game warning window).
 3. `/restore <N> confirm` — warns players, stops, restores, and restarts.
 
-Two `backup` config keys tune it:
-
-| `backup.…` key | Meaning | Default |
-|----------------|---------|---------|
-| `pre_restore_backup` | Take a fresh full backup of the **current** world before wiping it (a recoverable pre-restore snapshot). Off = a direct stop → wipe → extract. | `false` |
-| `restore_warning_seconds` | In-game "server restoring, you'll be disconnected" warning lead time before the stop. | `15` |
+Tune it with `backup.pre_restore_backup` (take a recoverable snapshot of the
+current world before wiping — default off) and `backup.restore_warning_seconds`.
 
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
-**Java** additionally needs `mux.session` + `mux.start_cmd` set (run the JVM under
-tmux/screen; the bot stops it via RCON `stop` and restarts it by typing the start
-command into the session — RCON can't relaunch the JVM itself). Without them,
-`/restore` is refused with a clear message; everything else keeps working.
+**Java** additionally needs `mux.session` + `mux.start_cmd` set (see
+[Java](#java-rcon)). Without them, `/restore` is refused with a clear message;
+everything else keeps working.
 
 ### Offline restore — `restore.py`
 
@@ -491,8 +603,8 @@ The mechanics differ by edition:
   supported. The previous file is kept as `<uuid>.dat.pre-restore-<timestamp>`.
 - **Bedrock** — players live in one world **LevelDB** that BDS locks while
   running, so the bot **stops the server**, overwrites that player's record,
-  writes a pre-restore undo copy to `BACKUP_DIR`, and **relaunches** via
-  `MUX_START_CMD` (the server is briefly offline). See [Per-player restore on
+  writes a pre-restore undo copy to `backup.dir`, and **relaunches** via
+  `mux.start_cmd` (the server is briefly offline). See [Per-player restore on
   Bedrock](#bedrock-per-player-restore) for the extra dependencies and setup.
 
 ---
@@ -539,16 +651,23 @@ Java.
 python install_bedrock_pack.py
 ```
 
-It confirms the server is Bedrock and stopped, then reads `MINECRAFT_DIR` from
-`.env` and the world's `level-name` from `server.properties`, copies the pack into
-`behavior_packs/`, activates it in the world's `world_behavior_packs.json`, sets
-`content-log-console-output-enabled=true` in `server.properties`, enables the
-**Beta APIs** experiment in `level.dat`, and sets `BEDROCK_SCRIPT_EVENTS=true` +
-`CHAT_RELAY=true` in `.env` — then you just restart the server and bot. Use
-`--deaths-only` to skip the experiment (deaths only, no chat), or `--uninstall` to
-reverse it (the Beta APIs experiment can't be undone — Bedrock flags a world
-permanently once used). Full details and the manual steps are in
+It confirms the server is Bedrock and stopped, then reads `MINECRAFT_DIR` (from a
+`.env` file next to `bot.py`) and the world's `level-name` from
+`server.properties`, copies the pack into `behavior_packs/diamondsign_events/`,
+activates it in the world's `world_behavior_packs.json`, sets
+`content-log-console-output-enabled=true` in `server.properties`, and enables the
+**Beta APIs** experiment in `level.dat` — then you just set the server's
+`bedrock_script_events: true` (and `chat_relay: true` for chat) in
+`diamondsign.json`, and restart the server and bot. Use `--deaths-only` to skip
+the experiment (deaths only, no chat), or `--uninstall` to reverse it (the Beta
+APIs experiment can't be undone — Bedrock flags a world permanently once used).
+Full details and the manual steps are in
 [`bedrock_pack/INSTALL.md`](bedrock_pack/INSTALL.md).
+
+> The installer currently reads `MINECRAFT_DIR` from a `.env` file (not
+> `diamondsign.json`). For a JSON-only install, either drop a one-line
+> `MINECRAFT_DIR=/path/to/server` `.env` beside `bot.py` before running it, or
+> follow the manual steps in `bedrock_pack/INSTALL.md`.
 
 Caveats: the pack uses the Script API, so it tracks Minecraft's update cadence;
 and enabling an experiment is **irreversible** for that world (and disables
@@ -573,8 +692,8 @@ only per-player restore is unavailable.
 Each backup embeds a small `_players.json` sidecar (each player's data + their
 account-stable identity), so a restore reads one zip with no chain reconstruction.
 On restore the bot stops the server, overwrites that player's record, writes a
-pre-restore undo to `BACKUP_DIR`, and relaunches via `MUX_START_CMD` (defaults to
-`cd <MINECRAFT_DIR> && ./bedrock_server 2>&1 | tee -a console.log`; override only
+pre-restore undo to `backup.dir`, and relaunches via `mux.start_cmd` (defaults to
+`cd <minecraft_dir> && ./bedrock_server 2>&1 | tee -a console.log`; override only
 for non-standard launches). If the relaunch fails, the bot prints the exact manual
 start command.
 
@@ -590,28 +709,34 @@ once.
 
 ### Runtime state
 
-The bot writes these at runtime (all git-ignored):
+Per-server state lives under **`data/<name>/`** (keyed by the server's `name`), so
+servers in one process never collide. All of it is git-ignored:
 
-- `auth.json` — per-platform admin + authorised-chat list
-  (`{telegram: {…}, slack: {…}}`; an old flat file is auto-migrated into the
-  `telegram` namespace)
-- `player_names.json` — *(Java)* UUID → username, learned from logs
-- `player_achievements.json` — achievements with timestamps, keyed by UUID
-- `player_deaths.json` — death history with timestamps, keyed by UUID
-- `backup_manifest.json` — incremental backup state (chain ID, base full backup,
-  file mtimes)
-- `bedrock_player_state.json` — *(Bedrock)* per-player data hashes, so incremental
-  sidecars only carry players that changed
-- `bedrock_players.json` — *(Bedrock)* the portable player registry (replaces
-  `player_names.json` on Bedrock)
-- `statistics.json` — *(Bedrock)* accumulated online time + session counts;
-  per-server, not portable
-- `<MINECRAFT_DIR>/.diamondsign_chain` — chain-validity marker in the server dir
-- `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file per bot start
+- `data/<name>/player_names.json` — *(Java)* UUID → username, learned from logs
+- `data/<name>/player_achievements.json` — achievements with timestamps, by UUID
+- `data/<name>/player_deaths.json` — death history with timestamps, by UUID
+- `data/<name>/backup_manifest.json` — incremental backup state (chain ID, base
+  full backup, file mtimes)
+- `data/<name>/bedrock_players.json` — *(Bedrock)* the portable player registry
+- `data/<name>/statistics.json` — *(Bedrock)* accumulated online time + session
+  counts (per-server, not portable)
+- `data/<name>/bedrock_player_state.json` — *(Bedrock)* per-player data hashes, so
+  incremental sidecars only carry players that changed
+- `<minecraft_dir>/.diamondsign_chain` — chain-validity marker, in the server dir
 
-To reset the bot to a fresh state, delete `auth.json`, `player_names.json`,
-`player_achievements.json`, and `player_deaths.json`. To force a fresh backup
-chain, delete `backup_manifest.json` and `.diamondsign_chain`.
+Process-wide state (repo root, git-ignored):
+
+- `auth.json` — bot-namespaced admin + authorised chats:
+  `{ "<bot>": { "<platform>": { "admin_user_id", "authorized_chat_ids",
+  "chat_servers", "chat_names" } } }`. An older flat / platform-level file is
+  auto-migrated on load.
+- `diamondsign.json` — your config. `.env` (if present) is legacy, read only to
+  migrate once.
+- `logs/log_<YYYYMMDD_HHMMSS>.txt` — a new log file per bot start.
+
+To reset a server to fresh state, delete its `data/<name>/` directory. To reset
+authorisation, delete `auth.json`. To force a fresh backup chain for a server,
+delete its `data/<name>/backup_manifest.json` and `<minecraft_dir>/.diamondsign_chain`.
 
 ### Source layout
 
@@ -619,7 +744,7 @@ Entry points (run directly):
 
 | File | Description |
 |------|-------------|
-| `bot.py` | Main bot — log watcher, command handlers, stats, orchestration |
+| `bot.py` | Main bot — multi-bot/server loop, log watcher, command handlers, backups, orchestration |
 | `restore.py` | Interactive CLI to restore from backup chains (offline; over `utils/restore_core`) |
 | `install_bedrock_pack.py` | One-command installer/uninstaller for the Bedrock behavior pack |
 
@@ -629,15 +754,17 @@ Packages and helpers (imported):
 |------|-------------|
 | `chat/` | Chat-platform adapters: `base` (interface + command router), `telegram`, `slack` |
 | `backends/` | Edition backends: `base`, `java` (RCON), `bedrock` (tmux/screen), `mux` |
-| `utils/` | Imported helpers: `config` (`ServerConfig` + world-layout), `backup_utils` (chain/manifest), `restore_core` (headless restore, shared by the bot + `restore.py`), `bedrock_player` (world-LevelDB + sidecar) |
+| `utils/` | Imported helpers: `config` (`AppConfig`/`BotConfig`/`ServerConfig` + JSON loader + `.env` migration), `backup_utils` (chain/manifest), `restore_core` (headless restore, shared by the bot + `restore.py`), `bedrock_player` (world-LevelDB + sidecar) |
 | `bedrock_pack/` | Optional Bedrock behavior pack for chat + death events (Script API) |
 | `requirements.txt` | Python dependencies |
 | `requirements-bedrock-restore.txt` | Optional deps for Bedrock per-player restore |
-| `.env.example` | Template for environment variables |
+| `diamondsign.example.json` | Annotated config template |
 
 ### Logging
 
-Each run writes a timestamped log under `logs/`: join/leave, death, and
-achievement notifications; every command (with the requester); admin actions
-(claim, authorise, revoke); player-registry updates; backup progress; log-rotation
-detection; and errors.
+Each run writes a timestamped log under `logs/`. Per-server lines are prefixed
+`[<server>]` and per-bot lines `[<bot>]`, so multi-server output stays
+attributable: join/leave, death, and achievement notifications; every command
+(`[<bot>] <Action>: requested by [<user>] on [<chat>]`); admin actions (claim,
+authorise, revoke); player-registry updates; backup progress; log-rotation and
+server-(re)start detection; and errors.
