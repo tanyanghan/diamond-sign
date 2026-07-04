@@ -2411,15 +2411,15 @@ def register_commands(router, auth: dict) -> None:
         if not backend.is_available():
             ctx.reply("Server is not reachable right now — try again once it's up.")
             return
-        logger.info("Allowlist: %s ran '%s %s'", ctx.sender_label, verb,
-                    " ".join(ctx.args))
+        ctx.server.log.info("Allowlist: '%s %s' by [%s] on [%s]", verb,
+                            " ".join(ctx.args), ctx.sender_label, ctx.chat_label)
 
         # Run in a thread: Bedrock capture polls the log for up to a few seconds.
         def run():
             try:
                 resp = backend.allowlist_command(ctx.args)
             except Exception as e:
-                logger.exception("Allowlist command failed")
+                ctx.server.log.exception("Allowlist command failed")
                 ctx.adapter.send(ctx.chat_id, f"{verb} command failed: {e}")
                 return
             ctx.adapter.send(ctx.chat_id,
