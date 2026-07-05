@@ -568,17 +568,21 @@ For disaster recovery when the bot isn't running, `restore.py` does the same
 restore from a shell (it does **not** stop/start the server — do that yourself):
 
 ```bash
-python restore.py --server <name>            # per-server paths from diamondsign.json
-python restore.py --server <name> --dry-run  # preview only
+python restore.py                            # pick a server from diamondsign.json
+python restore.py --server <name>            # skip the picker (name/key)
+python restore.py --dry-run                  # preview only
 python restore.py --backup-dir P --target-dir Q   # files-only, no chain reset
 ```
 
-It scans the backup directory, groups incrementals into chains, shows restore
-points, then extracts the full backup and applies each incremental up to your
-pick. With `--server` (in-place) it rebuilds the manifest and writes a fresh
-`.diamondsign_chain`; restoring to an incremental point also writes a single
-**merged incremental** so the new chain needs only the original full + that one
-file. Without `--server` it extracts files only (no chain reset).
+Run with no arguments and it reads `diamondsign.json` and offers a **numbered
+list of servers** to choose from (a single-server config is auto-selected);
+`--server <name>` skips the picker. It then scans that server's backup directory,
+groups incrementals into chains, shows restore points, and extracts the full
+backup and applies each incremental up to your pick. In server mode (in-place) it
+rebuilds the manifest and writes a fresh `.diamondsign_chain`; restoring to an
+incremental point also writes a single **merged incremental** so the new chain
+needs only the original full + that one file. The `--backup-dir P --target-dir Q`
+files-only mode (no server context) extracts files only — no chain reset.
 
 If you restore by other means (manual copy, other tools), delete that server's
 `data/<name>/backup_manifest.json` and its `.diamondsign_chain` so the bot starts

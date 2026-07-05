@@ -9,8 +9,9 @@ The Minecraft server MUST be stopped before restoring in-place — the bot's
 not, so it exists mainly for offline/disaster recovery when the bot isn't running.
 
 Usage:
-    python restore.py --server <name>        # per-server paths from diamondsign.json
-    python restore.py --server <name> --dry-run
+    python restore.py                        # pick a server from diamondsign.json
+    python restore.py --server <name>        # skip the picker (name/key)
+    python restore.py --dry-run
     python restore.py --backup-dir P --target-dir Q   # files-only, no chain reset
 """
 
@@ -190,44 +191,79 @@ def display_restore_points(chains: list, header: str | None = None) -> tuple:
     return points, selected
 
 
-def _resolve_paths(args):
-    """Return (backup_dir, target_dir, manifest_path, exclude_names, copy_cmd,
-    preserve_names, establish_chain) from --server (preferred) or the legacy
-    --backup-dir/--target-dir flags."""
-    if args.server:
-        try:
-            app = load_config()
-        except ConfigError as e:
-            print(f"\n{e}\n", file=sys.stderr)
-            sys.exit(1)
-        server = next((s for s in app.all_servers() if s.name == args.server
-                       or s.key == args.server), None)
+def _select_server(app, server_arg):
+    """Return the chosen ServerConfig from diamondsign.json.
+
+    With ``--server <name/key>`` it's resolved directly; otherwise the single
+    server is used, or the servers are listed numbered and the user picks one."""
+    servers = app.all_servers()
+    if not servers:
+        print("No servers configured in diamondsign.json.", file=sys.stderr)
+        sys.exit(1)
+    if server_arg:
+        server = next((s for s in servers
+                       if server_arg in (s.name, s.key)), None)
         if server is None:
-            names = ", ".join(s.name for s in app.all_servers())
-            print(f"Unknown server '{args.server}'. Configured: {names}",
+            names = ", ".join(s.name for s in servers)
+            print(f"Unknown server '{server_arg}'. Configured: {names}",
                   file=sys.stderr)
             sys.exit(1)
-        backup_dir = Path(args.backup_dir) if args.backup_dir else server.backup_dir
-        target_dir = Path(args.target_dir) if args.target_dir else server.minecraft_dir
-        exclude = backup_exclude_names(server)
-        establish = target_dir.resolve() == server.minecraft_dir.resolve()
-        return (backup_dir, target_dir, server.data_dir / "backup_manifest.json",
-                exclude, server.backup_copy_cmd, exclude, establish)
-    # Legacy: no server context → files-only restore (can't safely rebuild a
-    # per-server manifest/marker without knowing which server it belongs to).
-    if not args.backup_dir or not args.target_dir:
-        print("Specify --server <name>, or both --backup-dir and --target-dir.",
-              file=sys.stderr)
+        return server
+    if len(servers) == 1:
+        return servers[0]
+    print("Servers in diamondsign.json:")
+    for i, s in enumerate(servers, 1):
+        print(f"  {i}. {s.name}   [{s.edition}]   ({s.minecraft_dir})")
+    try:
+        raw = input(f"Choose a server [1-{len(servers)}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
         sys.exit(1)
-    return (Path(args.backup_dir), Path(args.target_dir), None, set(), "",
-            set(), False)
+    try:
+        idx = int(raw)
+        if not (1 <= idx <= len(servers)):
+            raise ValueError
+    except ValueError:
+        print(f"Invalid choice: '{raw}'", file=sys.stderr)
+        sys.exit(1)
+    return servers[idx - 1]
+
+
+def _resolve_paths(args):
+    """Return (backup_dir, target_dir, manifest_path, exclude_names, copy_cmd,
+    preserve_names, establish_chain).
+
+    Files-only legacy mode (``--backup-dir`` + ``--target-dir`` with no
+    ``--server``) restores an arbitrary backup dir with no config and no chain
+    reset. Otherwise a server is resolved from diamondsign.json — picked
+    interactively from a numbered list when ``--server`` isn't given — and its
+    backup dir / server dir / manifest / excludes are used (each dir still
+    overridable by the matching flag)."""
+    if args.backup_dir and args.target_dir and not args.server:
+        # Legacy files-only restore: no server context, so we can't safely
+        # rebuild a per-server manifest/marker — just extract the chain's files.
+        return (Path(args.backup_dir), Path(args.target_dir), None, set(), "",
+                set(), False)
+    try:
+        app = load_config()
+    except ConfigError as e:
+        print(f"\n{e}\n", file=sys.stderr)
+        sys.exit(1)
+    server = _select_server(app, args.server)
+    backup_dir = Path(args.backup_dir) if args.backup_dir else server.backup_dir
+    target_dir = Path(args.target_dir) if args.target_dir else server.minecraft_dir
+    exclude = backup_exclude_names(server)
+    establish = target_dir.resolve() == server.minecraft_dir.resolve()
+    return (backup_dir, target_dir, server.data_dir / "backup_manifest.json",
+            exclude, server.backup_copy_cmd, exclude, establish)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Restore a Minecraft server from a full + incremental chain")
     parser.add_argument("--server", help="server name/key in diamondsign.json "
-                        "(uses its backup dir, server dir, manifest, excludes)")
+                        "(skip the interactive picker; uses its backup dir, "
+                        "server dir, manifest, excludes)")
     parser.add_argument("--backup-dir", help="override the backup zip directory")
     parser.add_argument("--target-dir", help="override the restore target dir")
     parser.add_argument("--dry-run", action="store_true",
