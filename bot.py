@@ -2054,6 +2054,27 @@ def _cmd_log(ctx, action: str, extra: str = "") -> None:
                      action, ctx.sender_label, ctx.chat_label, extra)
 
 
+def _status_line(server) -> str:
+    """One-line up/down + player summary for a server (used by /status).
+
+    Liveness first, so a down server gets a clear 'offline' answer instead of a
+    slow/last-known one; when online, the server is queried live (reconciling
+    the in-memory set) so the count reflects reality, not the last log parse."""
+    name = server.config.name
+    if not server.backend.is_online():
+        hint = " Start it with /start." if server.backend.can_restart else ""
+        return f"🔴 {name} is offline.{hint}"
+    online = reconcile_online(server, reason="/status")
+    suffix = ""
+    if online is None:  # reachable a moment ago but the query failed — last-known
+        online = server.get_online_players()
+        suffix = " (last known — live query failed)"
+    if online:
+        return (f"🟢 {name} is online — {len(online)} player(s): "
+                f"{', '.join(online)}{suffix}")
+    return f"🟢 {name} is online — no players online.{suffix}"
+
+
 def register_commands(router, auth: dict) -> None:
     """Register every command on the platform-agnostic router. Handlers take a
     Context and reply via it, so the same logic serves any chat platform. Each
@@ -2109,32 +2130,24 @@ def register_commands(router, auth: dict) -> None:
     # --- /status ---
     def cmd_status(ctx):
         _cmd_log(ctx, "Status")
-        server = ctx.server
-        name = server.config.name
-        # Liveness first, so a down server gets a clear "offline" answer instead
-        # of a slow/last-known one. Every branch states the server's up/down
-        # state by name, then the player detail.
-        if not server.backend.is_online():
-            start_hint = " Start it with /start." if server.backend.can_restart else ""
-            reply = f"🔴 {name} is offline.{start_hint}"
-            ctx.reply(reply)
-            ctx.bot.log.info("Status: replied to [%s] — offline", ctx.sender_label)
-            return
-        # Query the server live (and reconcile the in-memory set) so the answer
-        # reflects reality, not just what the bot last parsed from the log.
-        online = reconcile_online(server, reason="/status")
-        suffix = ""
-        if online is None:  # reachable a moment ago but query failed — last-known
-            online = server.get_online_players()
-            suffix = " (last known — live query failed)"
-        if online:
-            reply = (f"🟢 {name} is online — {len(online)} player(s): "
-                     f"{', '.join(online)}{suffix}")
+        # An admin DM reports every server this bot fronts (a whole-bot overview);
+        # an authorized group/channel reports just the server bound to it, as
+        # before. A private chat is only reachable by the admin (is_authorized),
+        # so is_private here implies admin — the is_admin check is belt-and-braces.
+        if ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth):
+            servers = ctx.bot.servers
         else:
-            reply = f"🟢 {name} is online — no players online.{suffix}"
+            server = ctx.bot.resolve_target_server(ctx)
+            if server is None:
+                ctx.reply("This chat isn't bound to a server. Ask an admin to "
+                          "/authorize it for one.")
+                return
+            servers = [server]
+        reply = "\n".join(_status_line(s) for s in servers)
         ctx.reply(reply)
-        ctx.bot.log.info("Status: replied to [%s] — %s", ctx.sender_label, reply)
-    router.register("status", cmd_status)
+        ctx.bot.log.info("Status: replied to [%s] — %d server(s)",
+                         ctx.sender_label, len(servers))
+    router.register("status", cmd_status, needs_server=False)
 
     # --- /stats ---
     def cmd_stats(ctx):

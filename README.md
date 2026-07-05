@@ -346,9 +346,10 @@ One process runs **any mix of bots × servers** from `diamondsign.json`:
 
 - **One bot, many servers** — add more entries to a bot's `servers`. The bot
   routes each server's events to the chats **bound** to that server, and
-  server-scoped commands (`/backup`, `/status`, `/restore`, …) target a server you
-  pick with **`/use <server>`** (or the channel's binding). `/authorize <chat_id>
-  <server>` binds a chat to a server.
+  server-scoped commands (`/backup`, `/restore`, …) target a server you pick with
+  **`/use <server>`** (or the channel's binding). `/authorize <chat_id> <server>`
+  binds a chat to a server. (`/status` is the exception: in an admin DM it lists
+  every server the bot fronts, so it never needs `/use`.)
 - **Many bots** — add more entries to `bots` (e.g. a separate Telegram bot per
   community). Each bot has its own tokens, its own admin, and its own slice of
   `auth.json`. All run in one process with independent pollers (N tokens = N
@@ -389,7 +390,7 @@ chats bound to it, and answers commands in whichever chat they're sent.
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show whether the server is online, and who's playing |
+| `/status` | Show whether the server is online, and who's playing. In an admin DM it lists every server the bot fronts; in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
