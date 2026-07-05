@@ -136,6 +136,50 @@ class _NetworkErrorFilter(logging.Filter):
 _HEALTH = _PollingHealth()
 
 
+class _PollingExceptionHandler(telebot.ExceptionHandler):
+    """Honour Telegram's 429 ``retry after N`` on the polling loop.
+
+    telebot's own backoff for a rate-limited getUpdates is a 0.25s-doubling
+    schedule that ignores the server's ``retry_after`` — so it retries *sooner*
+    than asked and prolongs the throttle, logging a full traceback each time.
+
+    telebot calls ``handle()`` synchronously in the polling thread: returning
+    True suppresses its ERROR traceback and lets it continue, and sleeping here
+    delays the next getUpdates by exactly the requested window (interruptible via
+    the adapter's stop event, so shutdown isn't blocked for the whole wait). Any
+    exception that isn't a rate-limit returns False and falls through to
+    telebot's logging, which ``_NetworkErrorFilter`` collapses as before.
+    """
+    _MAX_WAIT = 60   # cap an absurd server value so the poller can't stall
+
+    def __init__(self, stop_event: threading.Event):
+        self._stop = stop_event
+
+    _DEFAULT_WAIT = 5   # a 429/420 that omits retry_after still needs a backoff
+
+    def handle(self, exception) -> bool:
+        if not isinstance(exception, telebot.apihelper.ApiTelegramException):
+            return False   # network/other — let telebot log it (filter folds it)
+        try:
+            retry_after = int((exception.result_json.get("parameters") or {})
+                              .get("retry_after", 0))
+        except (AttributeError, TypeError, ValueError):
+            retry_after = 0
+        # Honour an explicit retry window (429 Too Many Requests, 420 Flood); a
+        # rate-limit with no window still backs off a default. Any other API
+        # error (401 bad token, 403 blocked, 400 …) is real — return False so it
+        # surfaces through telebot's normal logging.
+        if retry_after <= 0:
+            if exception.error_code != 429:
+                return False
+            retry_after = self._DEFAULT_WAIT
+        wait = min(retry_after, self._MAX_WAIT)
+        logger.warning("Polling: Telegram rate-limited (%d), waiting %ds before "
+                       "retry...", exception.error_code, wait)
+        self._stop.wait(wait)   # returns early if the adapter is stopping
+        return True
+
+
 def _sender_label(message) -> str:
     u = message.from_user
     if u is None:
@@ -148,7 +192,11 @@ class TelegramAdapter(ChatAdapter):
 
     def __init__(self, config):
         super().__init__(config)
-        self._bot = telebot.TeleBot(config.bot_token)
+        # Set on stop() so a 429 retry_after wait can't block shutdown.
+        self._stop_event = threading.Event()
+        self._bot = telebot.TeleBot(
+            config.bot_token,
+            exception_handler=_PollingExceptionHandler(self._stop_event))
         _NetworkErrorFilter.install(_HEALTH)
 
     def start(self, dispatch) -> None:
@@ -174,6 +222,7 @@ class TelegramAdapter(ChatAdapter):
         self._bot.infinity_polling(timeout=30, long_polling_timeout=20)
 
     def stop(self) -> None:
+        self._stop_event.set()   # interrupt any in-progress 429 retry_after wait
         try:
             self._bot.stop_polling()
         except Exception:
