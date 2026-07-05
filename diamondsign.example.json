@@ -8,10 +8,13 @@
       "servers": [
         {
           "name": "survival",
-          "edition": "java",
+          "edition": {
+            "type": "java",
+            "rcon": { "password": "your_rcon_password", "host": "localhost", "port": 25575 }
+          },
           "minecraft_dir": "/srv/survival",
-          "rcon": { "password": "your_rcon_password", "host": "localhost", "port": 25575 },
           "mux": { "session": "0:survival", "start_cmd": "cd /srv/survival && java -jar server.jar nogui" },
+          "chat_relay": false,
           "backup": {
             "dir": "~/backup/survival",
             "schedule": "daily",
@@ -19,8 +22,7 @@
             "pre_restore_backup": false,
             "restore_warning_seconds": 15,
             "incremental": { "enabled": true, "interval_minutes": 15 }
-          },
-          "chat_relay": false
+          }
         }
       ]
     },
@@ -32,18 +34,22 @@
       "servers": [
         {
           "name": "creative",
-          "edition": "java",
+          "edition": {
+            "type": "java",
+            "rcon": { "password": "your_rcon_password" }
+          },
           "minecraft_dir": "/srv/creative",
-          "rcon": { "password": "your_rcon_password" },
           "backup": { "dir": "~/backup/creative" }
         },
         {
           "name": "bedrock-smp",
-          "edition": "bedrock",
+          "edition": {
+            "type": "bedrock",
+            "bedrock_script_events": true,
+            "console_log": null
+          },
           "minecraft_dir": "/srv/bedrock",
           "mux": { "session": "", "start_cmd": "" },
-          "console_log": null,
-          "bedrock_script_events": true,
           "chat_relay": true,
           "backup": {
             "dir": "~/backup/bedrock",

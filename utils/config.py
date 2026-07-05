@@ -59,18 +59,21 @@ class ServerConfig:
     minecraft_dir: Path
     backup_dir: Path
 
-    # Java (RCON) transport
+    # Edition-specific settings — parsed from the nested "edition" object
+    # ({"type": ..., ...}). rcon.* is Java-only; console_log and
+    # bedrock_script_events are Bedrock-only.
     rcon_host: str = "localhost"
     rcon_port: int = 25575
     rcon_password: str = ""
-
-    # Bedrock (terminal multiplexer) transport
     console_log: Path | None = None
+    bedrock_script_events: bool = False
+
+    # Shared (both editions), parsed from the server top level:
+    #   mux — Bedrock's console transport AND Java's optional /restore restart;
+    #   chat_relay — relay in-game chat to the chat platforms (an on/off toggle;
+    #   on Bedrock it additionally requires bedrock_script_events).
     mux_session: str = ""
     mux_start_cmd: str = ""
-
-    # Bedrock Script-API events (via the bedrock_pack behavior pack).
-    bedrock_script_events: bool = False
     chat_relay: bool = False
 
     # Backup behaviour (edition-agnostic)
@@ -138,7 +141,16 @@ class AppConfig:
 # JSON -> dataclasses
 # ---------------------------------------------------------------------------
 def _server_from_dict(d: dict) -> ServerConfig:
-    edition = (d.get("edition") or EDITION_JAVA).strip().lower()
+    # Edition-specific settings are nested under "edition": a tagged object
+    # {"type": "java"|"bedrock", ...}. Java carries "rcon"; Bedrock carries
+    # "bedrock_script_events" and "console_log". A bare string (or a missing
+    # object) still names the type — there are then no nested settings, and
+    # validate_config flags an unknown/blank type.
+    ed = d.get("edition")
+    if not isinstance(ed, dict):
+        ed = {"type": ed} if isinstance(ed, str) else {}
+    edition = (ed.get("type") or EDITION_JAVA).strip().lower()
+
     mc_raw = (d.get("minecraft_dir") or "").strip()
     mc_dir = Path(os.path.expanduser(mc_raw)) if mc_raw else None
     name = (d.get("name") or "").strip()
@@ -149,14 +161,15 @@ def _server_from_dict(d: dict) -> ServerConfig:
         # explicitly-set name is left as-is and validated (see validate_config).
         name = _slug(get_level_name(mc_dir))
 
-    rcon = d.get("rcon") or {}
-    mux = d.get("mux") or {}
+    rcon = ed.get("rcon") or {}          # Java-only (under "edition")
+    mux = d.get("mux") or {}             # shared (server top level)
     backup = d.get("backup") or {}
     incr = backup.get("incremental") or {}
 
     backup_dir = Path(os.path.expanduser(backup.get("dir") or "~/minecraft_backup"))
 
-    console_raw = (d.get("console_log") or "").strip() if d.get("console_log") else ""
+    console_cfg = ed.get("console_log")  # Bedrock-only (under "edition")
+    console_raw = console_cfg.strip() if isinstance(console_cfg, str) else ""
     if console_raw:
         console_log = Path(os.path.expanduser(console_raw))
     elif edition == EDITION_BEDROCK and mc_dir is not None:
@@ -180,9 +193,9 @@ def _server_from_dict(d: dict) -> ServerConfig:
         rcon_port=int(rcon.get("port") or 25575),
         rcon_password=(rcon.get("password") or ""),
         console_log=console_log,
+        bedrock_script_events=bool(ed.get("bedrock_script_events", False)),
         mux_session=(mux.get("session") or "").strip(),
         mux_start_cmd=mux_start,
-        bedrock_script_events=bool(d.get("bedrock_script_events", False)),
         chat_relay=bool(d.get("chat_relay", False)),
         incremental_enabled=bool(incr.get("enabled", False)),
         incremental_interval_minutes=int(incr.get("interval_minutes") or 15),
@@ -259,8 +272,17 @@ def validate_config(app: AppConfig) -> list:
                 problems.append(f"{slabel}: minecraft_dir does not exist: "
                                 f"{s.minecraft_dir}")
             if s.edition not in _EDITIONS:
-                problems.append(f"{slabel}: edition must be one of "
+                problems.append(f"{slabel}: edition.type must be one of "
                                 f"{list(_EDITIONS)} (got '{s.edition}')")
+            # Bedrock relays in-game chat via the behavior pack's script events,
+            # so chat_relay there depends on edition.bedrock_script_events. Java
+            # parses chat from its log and has no such dependency.
+            if (s.edition == EDITION_BEDROCK and s.chat_relay
+                    and not s.bedrock_script_events):
+                problems.append(
+                    f"{slabel}: chat_relay needs edition.bedrock_script_events = "
+                    "true on Bedrock (chat is relayed through the behavior pack's "
+                    "script events). Enable script events, or turn chat_relay off.")
             if not s.name:
                 problems.append(f"{slabel}: could not determine a server name; "
                                 "set \"name\"")
@@ -337,7 +359,7 @@ def _wizard_doc() -> dict:
     platforms = [p.strip().lower() for p in raw.split(",") if p.strip()]
 
     bot = {"name": "default", "platforms": platforms,
-           "servers": [{"edition": edition, "minecraft_dir": mc}]}
+           "servers": [{"edition": {"type": edition}, "minecraft_dir": mc}]}
     if "telegram" in platforms:
         bot["telegram"] = {"bot_token":
                            _prompt("Telegram bot token (from @BotFather)")}
@@ -419,15 +441,27 @@ _EXAMPLE_DOC = {
             "servers": [
                 {
                     "name": "survival",
-                    "edition": "java",
+                    "edition": {"type": "java",
+                                "rcon": {"password": "your_rcon_password"}},
                     "minecraft_dir": "/path/to/your/server",
-                    "rcon": {"password": "your_rcon_password"},
+                    "chat_relay": True,   # relay in-game chat to the chat platform(s)
                     "backup": {"dir": "~/minecraft_backup", "schedule": "daily",
                                "hour": 4,
                                "copy_cmd": "",  # e.g. "rsync -az {file} user@nas:/backups/"
                                "incremental": {"enabled": True,
                                                "interval_minutes": 15}},
                 }
+                # A Bedrock server instead would look like:
+                # {
+                #     "name": "bedrock-smp",
+                #     "edition": {"type": "bedrock",
+                #                 "bedrock_script_events": True,
+                #                 "console_log": None},   # None -> <dir>/console.log
+                #     "minecraft_dir": "/path/to/bedrock",
+                #     "mux": {"session": "", "start_cmd": ""},
+                #     "chat_relay": True,   # Bedrock needs bedrock_script_events too
+                #     "backup": {"dir": "~/bedrock_backup"},
+                # }
             ],
         }
     ],

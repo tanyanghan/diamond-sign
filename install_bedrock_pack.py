@@ -173,13 +173,20 @@ def _set_kv(path: Path, key: str, value: str) -> bool:
     return changed
 
 
+# Flags that live under the server's nested "edition" object rather than at the
+# server top level (see utils/config.py). chat_relay stays top-level (shared).
+_EDITION_FLAGS = {"bedrock_script_events", "console_log"}
+
+
 def _set_server_flags(server, **flags) -> bool:
     """Set boolean fields on ``server``'s entry in diamondsign.json, in place.
 
     The entry is matched by its resolved ``minecraft_dir`` (unique per server),
-    so it works whether or not the entry has an explicit ``name``. Other fields
-    and formatting of siblings are preserved (json re-dumped with indent=2).
-    Returns True if anything changed."""
+    so it works whether or not the entry has an explicit ``name``. Edition-scoped
+    flags (bedrock_script_events) are written under the entry's "edition" object;
+    shared ones (chat_relay) at the top level. Other fields and formatting of
+    siblings are preserved (json re-dumped with indent=2). Returns True if
+    anything changed."""
     cfg_path = _REPO_ROOT / "diamondsign.json"
     if not cfg_path.exists():
         print(f"warning: {cfg_path.name} not found; set "
@@ -194,11 +201,22 @@ def _set_server_flags(server, **flags) -> bool:
             raw_dir = (s.get("minecraft_dir") or "").strip()
             if not raw_dir:
                 continue
-            if Path(os.path.expanduser(raw_dir)).resolve() == target:
-                for k, v in flags.items():
-                    if s.get(k) != v:
-                        s[k] = v
-                        changed = True
+            if Path(os.path.expanduser(raw_dir)).resolve() != target:
+                continue
+            for k, v in flags.items():
+                if k in _EDITION_FLAGS:
+                    ed = s.get("edition")
+                    if not isinstance(ed, dict):
+                        # Defensive: upgrade a bare string/absent edition to the
+                        # object form, preserving any existing type.
+                        ed = {"type": ed} if isinstance(ed, str) else {}
+                        s["edition"] = ed
+                    container = ed
+                else:
+                    container = s
+                if container.get(k) != v:
+                    container[k] = v
+                    changed = True
     if changed:
         cfg_path.write_text(json.dumps(doc, indent=2) + "\n")
     return changed

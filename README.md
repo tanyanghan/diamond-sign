@@ -67,9 +67,8 @@ run **multiple bots** at once.
          "servers": [
            {
              "name": "survival",
-             "edition": "java",
+             "edition": { "type": "java", "rcon": { "password": "your_rcon_password" } },
              "minecraft_dir": "/srv/survival",
-             "rcon": { "password": "your_rcon_password" },
              "backup": { "dir": "~/backup/survival",
                          "incremental": { "enabled": true } }
            }
@@ -117,13 +116,20 @@ identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
                                          // be filesystem-safe: letters, digits,
                                          // '.', '_', '-' (NO spaces). Defaults to
                                          // the world's level-name (slugified).
-          "edition": "java",             // "java" (default) or "bedrock"
+          "edition": {                   // edition-specific settings, nested here:
+            "type": "java",              //   "java" (default) or "bedrock"
+            "rcon": { "password": "…", "host": "localhost", "port": 25575 }
+                                         //   Java only — RCON command transport
+            // Bedrock uses these two instead of rcon:
+            //   "type": "bedrock",
+            //   "bedrock_script_events": false,// deaths/chat via the behavior pack
+            //   "console_log": null            // captured-stdout path (null → <dir>/console.log)
+          },
           "minecraft_dir": "/srv/survival",
-          "rcon": { "password": "…", "host": "localhost", "port": 25575 },
-          "mux": { "session": "", "start_cmd": "" },  // see per-edition sections
-          "console_log": null,           // Bedrock: captured-stdout path
-          "bedrock_script_events": false,// Bedrock deaths/chat via behavior pack
-          "chat_relay": false,           // relay in-game chat to the chats
+          "mux": { "session": "", "start_cmd": "" },  // shared: Bedrock's console
+                                         // transport, and Java's optional /restore restart
+          "chat_relay": false,           // shared: relay in-game chat to the chats
+                                         // (on Bedrock also needs bedrock_script_events)
           "backup": {
             "dir": "~/backup/survival",
             "schedule": "daily",         // daily | weekly (Mon) | monthly (1st)
@@ -142,7 +148,7 @@ identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
 
 The config is validated on start; it stops with a clear list of problems if
 anything required is missing or a server `name` isn't filesystem-safe. Secrets
-(`diamondsign.json`, `auth.json`, `.env`) are git-ignored.
+(`diamondsign.json`, `auth.json`) are git-ignored.
 
 ---
 
@@ -235,8 +241,11 @@ Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/authorize`
 
 ## Connecting your Minecraft server
 
-Each server sets `edition` to `java` or `bedrock`. The two editions differ in how
-the bot sends commands to the server.
+Each server's `edition` is a nested object whose `type` is `java` or `bedrock`,
+holding that edition's settings (Java: `rcon`; Bedrock: `bedrock_script_events`,
+`console_log`). The two editions differ in how the bot sends commands to the
+server. Settings that apply to both — `mux` and `chat_relay` — sit at the server
+top level, alongside `edition`.
 
 ### Java (RCON)
 
@@ -250,8 +259,8 @@ The bot drives a Java server over **RCON** (used for backups, `/list`,
    rcon.password=your_password
    ```
 2. Restart the server.
-3. Set the same password in the server's `rcon.password` (and `rcon.port`/
-   `rcon.host` if not the defaults).
+3. Set the same password in the server's `edition.rcon.password` (and
+   `edition.rcon.port`/`edition.rcon.host` if not the defaults).
 
 To also use **`/restore` and `/start`** (whole-world restore / bring-up), Java
 needs a way to *restart* the JVM — RCON can stop it but can't relaunch it. Run the
@@ -327,8 +336,8 @@ is `"<session>:<window-number>"`.
 
 **Capturing output.** BDS writes to stdout, not `logs/latest.log`. Launch it so
 its output is captured to a file the bot tails (default
-`minecraft_dir/console.log`, override with `console_log`), e.g. inside your
-tmux/screen window:
+`minecraft_dir/console.log`, override with `edition.console_log`), e.g. inside
+your tmux/screen window:
 ```bash
 ./bedrock_server 2>&1 | tee -a console.log
 ```
@@ -423,7 +432,7 @@ other command name is the same on both platforms.
 **Edition notes.** On **Bedrock**, `/achievements` and `/scan_achievements` are
 unavailable (achievements are Xbox-bound and not exposed to servers). `/deaths`
 and `/death_summary` work only with the optional [behavior
-pack](#bedrock-chat--death-events) + `bedrock_script_events: true`; the `/scan_*`
+pack](#bedrock-chat--death-events) + `edition.bedrock_script_events: true`; the `/scan_*`
 commands stay Java-only (they scan log history, which Bedrock doesn't keep).
 `/restore_player` works on both, via different mechanisms (see
 [Per-player restore](#restoring-a-single-player)).
@@ -654,8 +663,8 @@ copies the pack into `behavior_packs/diamondsign_events/`, activates it in the
 world's `world_behavior_packs.json`, sets
 `content-log-console-output-enabled=true` in `server.properties`, enables the
 **Beta APIs** experiment in `level.dat`, and sets that server's
-`bedrock_script_events: true` (and `chat_relay: true` for chat) in
-`diamondsign.json` — then you just restart the server and bot. Use `--deaths-only`
+`edition.bedrock_script_events: true` (and top-level `chat_relay: true` for chat)
+in `diamondsign.json` — then you just restart the server and bot. Use `--deaths-only`
 to skip the experiment (deaths only, no chat), or `--uninstall` to reverse it (the
 Beta APIs experiment can't be undone — Bedrock flags a world permanently once
 used). Full details and the manual steps are in

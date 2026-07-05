@@ -25,7 +25,7 @@ lists them and asks which — or pass `--server <name>`), takes the world's
 `world_behavior_packs.json`, sets `content-log-console-output-enabled=true` in
 `server.properties`, verifies the server isn't running and enables the **Beta
 APIs** experiment in `level.dat`, and sets that server's
-`bedrock_script_events: true` + `chat_relay: true` in `diamondsign.json`.
+`edition.bedrock_script_events: true` + top-level `chat_relay: true` in `diamondsign.json`.
 
 It first confirms the server is a Bedrock server and prompts you to confirm it's
 stopped (the install edits the world and irreversibly enables an experiment).
@@ -39,7 +39,7 @@ Flags:
   APIs experiment is **not** undone — Bedrock can't disable an experiment once a
   world has used it, so `level.dat` is left as-is (harmless with the pack gone).
 - `--deaths-only` — skip the experiment (deaths only; no chat, no amulet libs, sets
-  only `bedrock_script_events`).
+  only `edition.bedrock_script_events`).
 - `--yes` / `-y` — skip the "is the server stopped?" prompt (non-interactive use).
 - `--force` — skip the automated "server not running" probe (implies `--yes`).
 - `--no-config` — don't modify `diamondsign.json`.
@@ -131,11 +131,15 @@ Common startup errors:
 
 ## 5. Turn it on in the bot
 
-On this server's entry in `diamondsign.json`:
+On this server's entry in `diamondsign.json` (`bedrock_script_events` nests under
+the server's `edition`; `chat_relay` is a top-level server key):
 
 ```jsonc
-"bedrock_script_events": true,   // ingest death markers; enables /deaths, /death_summary
-"chat_relay": true               // relay in-game chat to the chat platforms
+"edition": {
+  "type": "bedrock",
+  "bedrock_script_events": true   // ingest death markers; enables /deaths, /death_summary
+},
+"chat_relay": true                // relay in-game chat (Bedrock needs bedrock_script_events too)
 ```
 
 Restart the bot. Deaths now announce + record (like Java); chat is relayed to
@@ -147,4 +151,5 @@ If you only want death notifications and don't want the irreversible Beta APIs
 experiment, edit `manifest.json` and change the dependency `"version": "beta"` to
 a **stable** version your server provides (e.g. `"2.7.0"`). The pack then loads
 without the experiment; deaths work, chat does not (the script logs
-`chatSend unavailable` and carries on). Set only `bedrock_script_events: true`.
+`chatSend unavailable` and carries on). Set only `edition.bedrock_script_events:
+true` (leave `chat_relay` off).
