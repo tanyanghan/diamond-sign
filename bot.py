@@ -32,6 +32,10 @@ from core.state import (
     refresh_player_names, register_player, uuid_by_name,
     load_achievements, record_achievement, load_deaths, record_death,
 )
+from core.auth import (
+    AUTH_PATH, auth_lock, load_auth, save_auth, auth_ns,
+    is_admin, is_authorized,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -796,9 +800,9 @@ class Bot:
         names = ns.setdefault("chat_names", {})
         if names.get(ctx.chat_id) == ctx.chat_name:
             return  # unchanged — no write
-        with _auth_lock:
+        with auth_lock:
             names[ctx.chat_id] = ctx.chat_name
-            save_auth(self.auth_doc, _AUTH_PATH)
+            save_auth(self.auth_doc, AUTH_PATH)
         self.log.info("Chat name learned: %s = [%s]", ctx.chat_id, ctx.chat_name)
 
     def chat_display(self, platform: str, chat_id: str) -> str:
@@ -1843,102 +1847,7 @@ def reconcile_online(server, *, reason: str = "") -> list | None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Authorization System
-# ---------------------------------------------------------------------------
-_AUTH_PATH = Path(__file__).parent / "auth.json"
-_auth_lock = threading.Lock()
-
-# The whole bot-namespaced auth doc ({bot_name: {platform: ns}}) for the process,
-# set in main(). Each Bot's `auth` is its own slice (the {platform: ns} value for
-# its name), sharing the same dict objects — so mutating a bot's slice and
-# persisting the doc (save_auth(_AUTH_DOC)) stay consistent.
-_AUTH_DOC: dict = {}
-
-
-def _normalize_ns(ns: dict) -> dict:
-    """Normalize one platform's auth namespace: string IDs throughout.
-
-    ``chat_servers`` binds an authorized chat to a specific server key (used
-    once a bot fronts several servers); single-server bots ignore it and
-    announce to every authorized chat. ``chat_names`` records each authorized
-    chat's human name (group/channel title) — learned + refreshed from inbound
-    messages — so logs and /listchats show names, not raw IDs.
-    """
-    admin = ns.get("admin_user_id")
-    return {
-        "admin_user_id": str(admin) if admin is not None else None,
-        "authorized_chat_ids": [str(c) for c in ns.get("authorized_chat_ids", [])],
-        "chat_servers": {str(c): str(s)
-                         for c, s in (ns.get("chat_servers") or {}).items()},
-        "chat_names": {str(c): str(n)
-                       for c, n in (ns.get("chat_names") or {}).items()},
-    }
-
-
-def load_auth(path: Path, bots: list) -> dict:
-    """Load the whole bot-namespaced auth doc for the configured ``bots`` (a list
-    of BotConfig):
-    ``{bot_name: {platform: {admin_user_id, authorized_chat_ids, chat_servers,
-    chat_names}}}``.
-
-    Every configured bot gets a namespace (so ``_AUTH_DOC[bot.name]`` always
-    resolves) and each namespace is normalized (defaults filled, ids
-    stringified). Any bot namespaces already on disk for bots not in this run
-    are carried through untouched. Top-level or platform entries that aren't the
-    expected ``{bot: {platform: ns}}`` shape are ignored rather than crashing
-    startup (there is no migration of older on-disk shapes).
-    """
-    data = {}
-    if path.exists():
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except Exception:
-            logger.exception("Failed to load auth.json")
-    if not isinstance(data, dict):
-        data = {}
-    for b in bots:
-        data.setdefault(b.name, {})
-    return {bname: {p: _normalize_ns(ns) for p, ns in bns.items()
-                    if isinstance(ns, dict)}
-            for bname, bns in data.items() if isinstance(bns, dict)}
-
-
-def save_auth(auth: dict, path: Path) -> None:
-    # Write-then-rename so a crash mid-write can't corrupt auth.json.
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(auth, f, indent=2)
-    os.replace(tmp, path)
-
-
-def _auth_ns(auth: dict, platform: str) -> dict:
-    ns = auth.setdefault(
-        platform,
-        {"admin_user_id": None, "authorized_chat_ids": [], "chat_servers": {},
-         "chat_names": {}})
-    ns.setdefault("chat_names", {})  # older docs predate chat_names
-    return ns
-
-
-def is_admin(platform: str, user_id, auth: dict) -> bool:
-    admin = (auth.get(platform) or {}).get("admin_user_id")
-    return admin is not None and str(admin) == str(user_id)
-
-
-def is_authorized(platform: str, chat_id, user_id, is_private: bool,
-                  auth: dict) -> bool:
-    """A command is processed only from the platform admin (in private) or an
-    authorized chat (in a group/channel)."""
-    ns = auth.get(platform) or {}
-    if is_private:
-        admin = ns.get("admin_user_id")
-        return admin is not None and str(admin) == str(user_id)
-    return str(chat_id) in ns.get("authorized_chat_ids", [])
-
-
-# ---------------------------------------------------------------------------
-# 9. Bot Commands
+# Bot Commands
 # ---------------------------------------------------------------------------
 def _cmd_log(ctx, action: str, extra: str = "") -> None:
     """Uniform command audit line, prefixed with the handling bot:
@@ -2585,12 +2494,12 @@ def register_commands(router, auth: dict) -> None:
             return
         else:
             server = ctx.bot.servers[0]
-        with _auth_lock:
-            ns = _auth_ns(auth, ctx.platform)
+        with auth_lock:
+            ns = auth_ns(auth, ctx.platform)
             if target_id not in ns["authorized_chat_ids"]:
                 ns["authorized_chat_ids"].append(target_id)
             ns["chat_servers"][target_id] = server.config.key
-            save_auth(_AUTH_DOC, _AUTH_PATH)
+            save_auth(ctx.bot.auth_doc, AUTH_PATH)
         ctx.bot.log.info("Authorize: chat %s -> %s by [%s] on [%s]",
                          ctx.bot.chat_display(ctx.platform, target_id),
                          server.config.name, ctx.sender_label, ctx.chat_label)
@@ -2605,8 +2514,8 @@ def register_commands(router, auth: dict) -> None:
             ctx.reply("Usage: /revoke <chat_id>")
             return
         target_id = str(ctx.args[0]).strip()
-        with _auth_lock:
-            ns = _auth_ns(auth, ctx.platform)
+        with auth_lock:
+            ns = auth_ns(auth, ctx.platform)
             display = ctx.bot.chat_display(ctx.platform, target_id)
             was_bound = ns["chat_servers"].pop(target_id, None) is not None
             was_authed = target_id in ns["authorized_chat_ids"]
@@ -2614,7 +2523,7 @@ def register_commands(router, auth: dict) -> None:
                 ns["authorized_chat_ids"].remove(target_id)
                 ns.get("chat_names", {}).pop(target_id, None)
             if was_authed or was_bound:
-                save_auth(_AUTH_DOC, _AUTH_PATH)
+                save_auth(ctx.bot.auth_doc, AUTH_PATH)
                 ctx.bot.log.info("Revoke: chat %s by [%s] on [%s]",
                                  display, ctx.sender_label, ctx.chat_label)
                 ctx.reply(f"Chat {target_id} has been revoked.")
@@ -2656,11 +2565,11 @@ def _make_unclaimed_handler(auth: dict):
         ns = auth.get(ctx.platform) or {}
         if ns.get("admin_user_id") is not None or not ctx.is_private:
             return False
-        with _auth_lock:
-            if _auth_ns(auth, ctx.platform).get("admin_user_id") is not None:
+        with auth_lock:
+            if auth_ns(auth, ctx.platform).get("admin_user_id") is not None:
                 return False
-            _auth_ns(auth, ctx.platform)["admin_user_id"] = ctx.user_id
-            save_auth(_AUTH_DOC, _AUTH_PATH)
+            auth_ns(auth, ctx.platform)["admin_user_id"] = ctx.user_id
+            save_auth(ctx.bot.auth_doc, AUTH_PATH)
         ctx.bot.log.info("Admin claimed on %s by [%s] (id=%s)",
                          ctx.platform, ctx.sender_label, ctx.user_id)
         ctx.reply("You are now the admin.")
@@ -2940,8 +2849,6 @@ def main():
     args = _parse_args()
     setup_logging(Path(__file__).parent / "logs")
 
-    global _AUTH_DOC
-
     bots_cfg = APP_CONFIG.bots
     if args.only:
         bots_cfg = [b for b in APP_CONFIG.bots if b.name == args.only]
@@ -2952,17 +2859,17 @@ def main():
             sys.exit(1)
 
     # One auth.json for the whole process; each bot operates on its own slice
-    # (shared dict objects, so save_auth(_AUTH_DOC) persists in-place mutations).
-    # Pass the FULL bot list (not the --only-filtered one) so every configured
-    # bot gets a normalized namespace regardless of which one --only selected.
-    _AUTH_DOC = load_auth(_AUTH_PATH, APP_CONFIG.bots)
+    # (shared dict objects, so save_auth(bot.auth_doc) persists in-place
+    # mutations). Pass the FULL bot list (not the --only-filtered one) so every
+    # configured bot gets a normalized namespace regardless of --only.
+    auth_doc = load_auth(AUTH_PATH, APP_CONFIG.bots)
 
     bots = []
     for bcfg in bots_cfg:
         servers = [Server(scfg) for scfg in bcfg.servers]
         bot = Bot(bcfg, servers)
-        bot.auth_doc = _AUTH_DOC
-        bot.auth = _AUTH_DOC[bcfg.name]
+        bot.auth_doc = auth_doc
+        bot.auth = auth_doc[bcfg.name]
         # Adapters first so a server backend failure can still alert the admins.
         bot.adapters = make_adapters(bcfg)
         # Bring up each server; drop any whose backend won't start.
