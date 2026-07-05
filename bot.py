@@ -27,6 +27,7 @@ from backends import (
     EVENT_DEATH, EVENT_ACHIEVEMENT,
 )
 from chat import make_adapters, CommandRouter
+from core.logutil import TagLogAdapter
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -189,14 +190,6 @@ def record_death(uuid: str, message: str, timestamp: str,
 # ---------------------------------------------------------------------------
 # 3. Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
-class _TagLogAdapter(logging.LoggerAdapter):
-    """Prefix every record with [<tag>] so interleaved multi-bot / multi-server
-    logs stay attributable (per-server backups/notifications, per-bot commands)."""
-
-    def process(self, msg, kwargs):
-        return f"[{self.extra['tag']}] {msg}", kwargs
-
-
 class Server:
     """One Minecraft server's runtime: its config, backend, and per-server
     mutable state (online players, session xuids, pending UUID correlation, and
@@ -207,7 +200,7 @@ class Server:
 
     def __init__(self, config):
         self.config = config
-        self.log = _TagLogAdapter(logger, {"tag": config.name})
+        self.log = TagLogAdapter(logger, {"tag": config.name})
         self.backend = None  # set in main() after make_backend
         self.watcher = None  # LogWatcher, set when the server is brought up
         self.observer = None  # watchdog Observer, stopped on shutdown
@@ -863,7 +856,7 @@ class Bot:
 
     def __init__(self, config, servers):
         self.config = config
-        self.log = _TagLogAdapter(logger, {"tag": config.name})
+        self.log = TagLogAdapter(logger, {"tag": config.name})
         self.servers = list(servers)
         self.by_name = {s.config.name: s for s in self.servers}
         self.by_key = {s.config.key: s for s in self.servers}
