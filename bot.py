@@ -28,6 +28,10 @@ from backends import (
 )
 from chat import make_adapters, CommandRouter
 from core.logutil import TagLogAdapter
+from core.state import (
+    refresh_player_names, register_player, uuid_by_name,
+    load_achievements, record_achievement, load_deaths, record_death,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -85,110 +89,7 @@ def setup_logging(logs_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Player Name Registry
-# ---------------------------------------------------------------------------
-# The {player_id: name} registry is owned by the backend (Java: player_names.json
-# keyed by UUID; Bedrock: projected from bedrock_players.json keyed by xuid) and
-# mirrored in ``server.names``; these helpers operate on a given Server.
-_names_lock = threading.Lock()
-
-
-def refresh_player_names(server) -> None:
-    with _names_lock:
-        server.names.clear()
-        server.names.update(server.backend.load_names())
-
-
-def register_player(server, uuid: str, name: str) -> None:
-    names = server.names
-    old = names.get(uuid)
-    names[uuid] = name
-    changed = server.backend.register_name(uuid, name)
-    if old and old != name:
-        server.log.info("Player registry: %s renamed %s -> %s", uuid, old, name)
-    elif changed and not old:
-        server.log.info("Player registry: registered %s (%s)", name, uuid)
-
-
-def _uuid_by_name(player_name: str, names: dict) -> str | None:
-    for uuid, name in names.items():
-        if name == player_name:
-            return uuid
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 2b. Achievements Storage
-# ---------------------------------------------------------------------------
-_achievements_lock = threading.Lock()
-
-
-def load_achievements(path: Path) -> dict:
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            logger.exception("Failed to load %s", path)
-    return {}
-
-
-def _save_achievements(achievements: dict, path: Path) -> None:
-    with open(path, "w") as f:
-        json.dump(achievements, f, indent=2)
-
-
-def record_achievement(uuid: str, achievement: str, ach_type: str,
-                       timestamp: str, achievements: dict, path: Path) -> bool:
-    with _achievements_lock:
-        entries = achievements.setdefault(uuid, [])
-        for e in entries:
-            if e["achievement"] == achievement and e["timestamp"] == timestamp:
-                return False
-        entries.append({
-            "achievement": achievement,
-            "type": ach_type,
-            "timestamp": timestamp,
-        })
-        _save_achievements(achievements, path)
-    return True
-
-
-# ---------------------------------------------------------------------------
-# 2c. Deaths Storage
-# ---------------------------------------------------------------------------
-_deaths_lock = threading.Lock()
-
-
-def load_deaths(path: Path) -> dict:
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            logger.exception("Failed to load %s", path)
-    return {}
-
-
-def _save_deaths(deaths: dict, path: Path) -> None:
-    with open(path, "w") as f:
-        json.dump(deaths, f, indent=2)
-
-
-def record_death(uuid: str, message: str, timestamp: str,
-                 deaths: dict, path: Path) -> bool:
-    with _deaths_lock:
-        entries = deaths.setdefault(uuid, [])
-        for e in entries:
-            if e["message"] == message and e["timestamp"] == timestamp:
-                return False
-        entries.append({"message": message, "timestamp": timestamp})
-        _save_deaths(deaths, path)
-    return True
-
-
-# ---------------------------------------------------------------------------
-# 3. Server runtime object (per-server state)
+# Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
 class Server:
     """One Minecraft server's runtime: its config, backend, and per-server
@@ -385,7 +286,7 @@ class Server:
                 log(f"Learned Bedrock identity for {name}")
 
         # Drop players who have left; keep still-online ones for the next backup.
-        online_xuids = {_uuid_by_name(n, names) for n in self.get_online_players()}
+        online_xuids = {uuid_by_name(n, names) for n in self.get_online_players()}
         online_xuids.discard(None)
         with self.session_lock:
             self.session_xuids.intersection_update(online_xuids)
@@ -1461,7 +1362,7 @@ def make_notify_callback(bot, server):
             _last_event[key] = now
 
             timestamp = f"{datetime.now().strftime('%Y-%m-%d')} {time_str}"
-            uuid = _uuid_by_name(player, server.names)
+            uuid = uuid_by_name(player, server.names)
             if uuid:
                 record_achievement(uuid, achievement, ach_type, timestamp,
                                    server.achievements, server.achievements_path)
@@ -1477,7 +1378,7 @@ def make_notify_callback(bot, server):
             death_msg = payload["message"]
             time_str = payload["time"]
             timestamp = f"{datetime.now().strftime('%Y-%m-%d')} {time_str}"
-            uuid = _uuid_by_name(player, server.names)
+            uuid = uuid_by_name(player, server.names)
             if uuid:
                 record_death(uuid, death_msg, timestamp, server.deaths,
                              server.deaths_path)
@@ -1501,7 +1402,7 @@ def make_notify_callback(bot, server):
         name = payload
         # Online-time accumulation (Bedrock; no-op on Java). Done before the
         # cooldown gate so a quick rejoin still records the session boundary.
-        pid = _uuid_by_name(name, server.names)
+        pid = uuid_by_name(name, server.names)
         if pid:
             server.backend.record_player_session(event_type, pid)
             server.note_active_xuid(pid)  # candidate for identity learning
@@ -1583,7 +1484,7 @@ def _scan_log_for_achievements(file_path: Path, date_str: str, server) -> int:
                 time_str, player, ach_type_full, achievement = m.groups()
                 ach_type = _ACH_TYPE_MAP[ach_type_full]
                 timestamp = f"{date_str} {time_str}"
-                uuid = _uuid_by_name(player, server.names)
+                uuid = uuid_by_name(player, server.names)
                 if uuid:
                     if record_achievement(uuid, achievement, ach_type,
                                           timestamp, server.achievements,
@@ -1609,7 +1510,7 @@ def _scan_log_for_deaths(file_path: Path, date_str: str, server) -> int:
                 time_str, player, msg = m.groups()
                 if any(msg.startswith(p) for p in _DEATH_PHRASES):
                     timestamp = f"{date_str} {time_str}"
-                    uuid = _uuid_by_name(player, server.names)
+                    uuid = uuid_by_name(player, server.names)
                     if uuid:
                         if record_death(uuid, msg, timestamp, server.deaths,
                                         server.deaths_path):
@@ -1864,7 +1765,7 @@ def _recover_online_identities(server, online_names: list) -> None:
     Java (its name registry is recovered from world data, not this log)."""
     if server.config.edition != EDITION_BEDROCK:
         return
-    missing = [n for n in online_names if _uuid_by_name(n, server.names) is None]
+    missing = [n for n in online_names if uuid_by_name(n, server.names) is None]
     if not missing:
         return
     found: dict = {}
@@ -1925,12 +1826,12 @@ def reconcile_online(server, *, reason: str = "") -> list | None:
                         sorted(joined) or "none", sorted(left) or "none")
         for name in joined:
             server.player_join(name)
-            pid = _uuid_by_name(name, server.names)
+            pid = uuid_by_name(name, server.names)
             if pid:
                 server.backend.record_player_session("join", pid)
         for name in left:
             server.player_leave(name)
-            pid = _uuid_by_name(name, server.names)
+            pid = uuid_by_name(name, server.names)
             if pid:
                 server.backend.record_player_session("leave", pid)
         # Match the incremental cycle to reality: running iff someone is online.
@@ -2816,7 +2717,7 @@ def _capture_initial_online(server, bot) -> None:
     # recover their xuids from the log to register them (Bedrock; no-op on Java).
     _recover_online_identities(server, current)
     for name in current:
-        pid = _uuid_by_name(name, server.names)
+        pid = uuid_by_name(name, server.names)
         if pid:
             backend.record_player_session("join", pid)
     # The join notify callback never fired for these players, so start the cycle.
