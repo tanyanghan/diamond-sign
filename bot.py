@@ -322,6 +322,17 @@ def _validate_chain(server) -> None:
         server.save_manifest({}, chain_id="", base_full="")
 
 
+# Serialize scheduled full backups across every server in the process: when
+# several servers share a backup hour they otherwise all fire at once and thrash
+# the disk and uplink concurrently, which prolongs each backup's save-hold /
+# auto-save-off consistency window. Schedulers that collide block on this lock
+# and run back-to-back instead — the blocked threads are the queue, so none are
+# skipped (a stuck backup would hold up the queue, same exposure as before but
+# now shared). Only scheduled full backups take it; incrementals and manual
+# /backup are unaffected (they gate on the per-server backup_lock as before).
+_scheduled_backup_lock = threading.Lock()
+
+
 def _start_scheduled_backup(server, bot) -> None:
     """Start the per-server scheduled full-backup thread. Status is reported to
     the owning bot's admins."""
@@ -362,27 +373,37 @@ def _start_scheduled_backup(server, bot) -> None:
                                server.config.name)
                 continue
 
-            # Same exclusivity as /backup and the incremental cycle: never
-            # overlap another backup's save-hold on this server.
-            if not server.backup_lock.acquire(blocking=False):
-                logger.warning("[%s] Scheduled backup skipped: another backup "
-                               "is in progress", server.config.name)
-                continue
-
-            logger.info("[%s] Scheduled %s backup starting",
-                        server.config.name, schedule)
-
-            def status_cb(msg):
-                bot.alert_admins(f"[Backup {server.config.name}] {msg}")
-
+            # Wait our turn: run one scheduled backup at a time process-wide.
+            # Try without blocking first only so we can log when we're actually
+            # queued behind another server's backup; then block until it's ours.
+            if not _scheduled_backup_lock.acquire(blocking=False):
+                logger.info("[%s] Scheduled %s backup queued behind another "
+                            "server's backup", server.config.name, schedule)
+                _scheduled_backup_lock.acquire()
             try:
-                path = server.run_backup(status_cb=status_cb)
-                status_cb(f"Complete: {Path(path).name}")
-            except Exception as e:
-                logger.exception("[%s] Scheduled backup failed", server.config.name)
-                status_cb(f"Failed: {e}")
+                # Same exclusivity as /backup and the incremental cycle: never
+                # overlap another backup's save-hold on this server.
+                if not server.backup_lock.acquire(blocking=False):
+                    logger.warning("[%s] Scheduled backup skipped: another backup "
+                                   "is in progress", server.config.name)
+                    continue
+
+                logger.info("[%s] Scheduled %s backup starting",
+                            server.config.name, schedule)
+
+                def status_cb(msg):
+                    bot.alert_admins(f"[Backup {server.config.name}] {msg}")
+
+                try:
+                    path = server.run_backup(status_cb=status_cb)
+                    status_cb(f"Complete: {Path(path).name}")
+                except Exception as e:
+                    logger.exception("[%s] Scheduled backup failed", server.config.name)
+                    status_cb(f"Failed: {e}")
+                finally:
+                    server.backup_lock.release()
             finally:
-                server.backup_lock.release()
+                _scheduled_backup_lock.release()
 
     threading.Thread(target=_loop, daemon=True,
                      name=f"backup-{server.config.key}").start()

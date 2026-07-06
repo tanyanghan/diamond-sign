@@ -511,6 +511,13 @@ preserved through backup and restore.
 scheduled backup runs at `hour` on the `schedule`. Progress is sent to the admin's
 chat.
 
+**Scheduled backups run one at a time across all servers.** If several servers
+share a `hour`, their scheduled full backups don't run concurrently — they queue
+and run back-to-back, so simultaneous schedules don't thrash the disk/uplink or
+prolong each backup's save-hold. To spread them out in wall-clock time anyway,
+give each server a distinct `hour`. (This serialization applies only to scheduled
+full backups; incrementals and manual `/backup` still gate per-server.)
+
 ### Incremental backups
 
 When `incremental.enabled` is set, the bot backs up only files changed since the
