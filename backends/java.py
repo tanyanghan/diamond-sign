@@ -167,12 +167,20 @@ class JavaBackend(ServerBackend):
         return True
 
     def wait_until_stopped(self, timeout: float = 120) -> bool:
-        """Poll the RCON port with a plain TCP connect until it stops accepting —
-        i.e. the JVM (and its RCON listener) is gone. Deliberately does NOT send
-        an RCON command: a shutting-down server can accept the socket but never
-        reply, blocking the read (mcrcon would fire its process-killing alarm).
-        A bare connect probe can't hang and needs no command round-trip."""
+        """Wait until the JVM has fully exited — safe to replace the world dir.
+
+        Two phases. First poll the RCON port with a plain TCP connect until it
+        stops accepting — i.e. the RCON listener is gone (the JVM is shutting
+        down or down). Deliberately does NOT send an RCON command: a
+        shutting-down server can accept the socket but never reply, blocking the
+        read (mcrcon would fire its process-killing alarm); a bare connect probe
+        can't hang. The closed port is only a *proxy* for process exit, though —
+        the listener can close while the JVM is still flushing worlds. So then
+        hard-confirm the process is fully gone by checking the mux pane has
+        returned to a shell prompt (see ``_confirm_console_free``); if there is
+        no mux to confirm through, trust the port signal."""
         deadline = time.time() + timeout
+        port_open = True
         while time.time() < deadline:
             try:
                 with socket.create_connection(
@@ -180,9 +188,18 @@ class JavaBackend(ServerBackend):
                         timeout=2):
                     pass  # port still accepting -> server still up
             except OSError:
-                return True  # refused / unreachable -> server is down
+                port_open = False  # refused / unreachable -> RCON listener gone
+                break
             time.sleep(1)
-        return False
+        if port_open:
+            return False  # never stopped accepting within the timeout
+        # Hard-confirm the JVM process itself has exited (the console pane is a
+        # shell again), giving the world-file swap the same guarantee Bedrock's
+        # "Quit correctly" wait provides. At least a short window for this even
+        # if the port took a while to close.
+        remaining = max(15.0, deadline - time.time())
+        result = self._confirm_console_free(remaining)
+        return True if result is None else result
 
     def relaunch(self, log_fn=None) -> bool:
         """Type the start command into the mux session ONCE, then wait

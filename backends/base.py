@@ -15,6 +15,8 @@ command transport, the save/flush sequence, and server-side queries.
 """
 
 import re
+import secrets
+import shlex
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -232,6 +234,58 @@ class ServerBackend(ABC):
         """Block until the server process is fully down (Bedrock: world db lock
         released; Java: RCON no longer answering)."""
         raise NotSupported("wait_until_stopped")
+
+    def _confirm_console_free(self, timeout: float, log_fn=None):
+        """Confirm the server's mux pane has returned to a shell prompt — i.e.
+        the server process has fully exited and its world files/db are released.
+
+        The server runs in a tmux/screen pane as ``<start cmd> | tee``; while it
+        is up, an injected line reaches the *server's* console stdin, and once it
+        exits the pane falls back to the *shell*. So we inject a command only a
+        shell can satisfy — write a nonce to a sentinel file — and watch for that
+        file. A running server takes the injection as a bogus console command
+        (logged as unknown) and cannot create the file, so the file appearing
+        means the pane is a shell again. Keying on a file the server can't write
+        (rather than grepping the log) rules out a false positive from the server
+        echoing the command back. Re-injects each probe so a line lands as soon
+        as the shell is ready.
+
+        Returns True (confirmed free), False (timed out), or None if there is no
+        mux to inject through — the caller then trusts its own weaker signal.
+        """
+        mux = getattr(self, "_mux", None)
+        if mux is None:
+            return None
+
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+
+        nonce = secrets.token_hex(8)
+        sentinel = (self.data_dir / "stopcheck").resolve()
+        try:
+            sentinel.unlink()  # clear any stale sentinel from a prior run
+        except OSError:
+            pass
+        # Absolute path so the shell's cwd doesn't matter; quoted for safety.
+        cmd = f"echo {nonce} > {shlex.quote(sentinel.as_posix())}"
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            mux.send(cmd)       # -> server console (ignored) or shell (runs it)
+            time.sleep(3)
+            try:
+                if sentinel.read_text().strip() == nonce:
+                    sentinel.unlink()
+                    return True
+            except OSError:
+                pass            # not written yet -> pane still busy with the server
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
+        log("Console did not return to a shell prompt in time")
+        return False
 
     def relaunch(self, log_fn=None) -> bool:
         """Relaunch the server and return once it reports ready."""

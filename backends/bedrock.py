@@ -18,12 +18,10 @@ target server's actual output (see the design doc's open questions).
 
 import json
 import logging
-import os
 import re
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 from utils.backup_utils import RE_FULL, RE_INCR
 from .base import (
@@ -326,37 +324,6 @@ class BedrockBackend(ServerBackend):
         log("Stop requested" if ok else "Warning: 'stop' not confirmed")
         return ok
 
-    def _world_process_alive(self, proc_root: Path = Path("/proc")):
-        """Whether this server's BDS process is still running — matched by its
-        executable living under this server's ``minecraft_dir`` (the server
-        binary ``<dir>/bedrock_server`` is launched from there).
-
-        Match the *exe*, not the cwd: the start command ``cd <dir> &&
-        ./bedrock_server | tee`` leaves the tmux/screen shell (and ``tee``) with
-        their cwd in the dir even after the server exits — the ``cd`` persists —
-        so a cwd match would never clear. The exe path identifies the server
-        process itself and excludes the shell (``/bin/bash``) and ``tee``
-        (``/usr/bin/tee``), whose executables live outside the dir.
-
-        Sibling-safe (another Bedrock server's exe is under *its* dir) and
-        independent of the binary's name. Returns True / False, or None if the
-        process table can't be read (no ``/proc`` — a non-Linux dev box).
-        ``proc_root`` is injectable for testing.
-        """
-        if not proc_root.is_dir():
-            return None
-        target = self.config.minecraft_dir.resolve()
-        for entry in proc_root.iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                exe = Path(os.readlink(entry / "exe")).resolve()
-            except OSError:
-                continue  # process exited between listing and readlink, or not ours
-            if exe.is_relative_to(target):
-                return True
-        return False
-
     def wait_until_stopped(self, timeout: float = 120) -> bool:
         """Wait until BDS has fully shut down — safe to edit the world db.
 
@@ -371,7 +338,8 @@ class BedrockBackend(ServerBackend):
         Deliberately does NOT use the LevelDB lock: this BDS build never locks
         the world db (there is no LOCK file even while it runs), so it always
         looks free. If no LogWatcher is attached (unusual), fall back to
-        confirming the server *process* has exited via /proc.
+        confirming the mux pane has returned to a shell prompt (see
+        ``_confirm_console_free``).
         """
         waiter = getattr(self, "_shutdown_waiter", None)
         self._shutdown_waiter = None
@@ -383,14 +351,8 @@ class BedrockBackend(ServerBackend):
                 self._watcher.cancel(waiter)
             return False
 
-        # Fallback (no LogWatcher): confirm the process has exited from /proc.
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._world_process_alive() is False:
-                time.sleep(2)
-                return True
-            time.sleep(2)
-        return False
+        # Fallback (no LogWatcher): confirm the console pane is free again.
+        return bool(self._confirm_console_free(timeout))
 
     def relaunch(self, log_fn=None) -> bool:
         """Send MUX_START_CMD to the mux window and wait for 'Server started'."""
