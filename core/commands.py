@@ -845,7 +845,12 @@ def register_commands(router, auth: dict) -> None:
                         ctx.sender_label, ctx.chat_label,
                         point["pretty_ts"], point["kind"])
         ctx.reply(f"Starting world restore to {point['pretty_ts']}...")
-        say = lambda m: ctx.adapter.send(ctx.chat_id, m)
+
+        # Log every status line as well as sending it to chat, so the restore is
+        # fully traced in the bot log (mirrors restore_player's status()).
+        def say(m):
+            server.log.info("Restore: %s", m)
+            ctx.adapter.send(ctx.chat_id, m)
 
         def run():
             if not server.backup_lock.acquire(blocking=False):
@@ -871,7 +876,10 @@ def register_commands(router, auth: dict) -> None:
             ctx.reply(f"{server.config.name} is already running.")
             return
         ctx.reply(f"Starting {server.config.name}...")
-        say = lambda m: ctx.adapter.send(ctx.chat_id, m)
+
+        def say(m):
+            server.log.info("Start: %s", m)
+            ctx.adapter.send(ctx.chat_id, m)
 
         def run():
             # relaunch = type the start command into the mux session, then wait
