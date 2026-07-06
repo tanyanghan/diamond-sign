@@ -18,10 +18,12 @@ target server's actual output (see the design doc's open questions).
 
 import json
 import logging
+import os
 import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from utils.backup_utils import RE_FULL, RE_INCR
 from .base import (
@@ -313,21 +315,70 @@ class BedrockBackend(ServerBackend):
         log("Stop requested" if ok else "Warning: 'stop' not confirmed")
         return ok
 
+    def _world_process_alive(self, proc_root: Path = Path("/proc")):
+        """Whether this server's BDS process is still running — matched by its
+        working directory (the start command ``cd <dir> && ./bedrock_server``
+        leaves the process cwd at ``minecraft_dir``), so a sibling Bedrock server
+        in another dir isn't confused and the binary's name doesn't matter.
+
+        Returns True (a process is still in this dir), False (none), or None if
+        the process table can't be read (no ``/proc`` — a non-Linux dev box).
+        Biased to safety: a process we can't attribute is left counted, so we
+        over-wait rather than declare a live server stopped. ``proc_root`` is
+        injectable for testing.
+        """
+        if not proc_root.is_dir():
+            return None
+        target = self.config.minecraft_dir.resolve()
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cwd = Path(os.readlink(entry / "cwd"))
+            except OSError:
+                continue  # process exited between listing and readlink, or not ours
+            try:
+                if cwd.resolve() == target:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def wait_until_stopped(self, timeout: float = 120) -> bool:
         """Wait until BDS has fully exited — safe to edit the world db.
 
-        Deliberately does NOT use the LevelDB lock: amulet-leveldb's lock
-        detection is unreliable across BDS builds (on some servers it opens a
-        *running* world's db, which would make the lock look free while the
-        server is up — dangerous for the callers that edit the db next). Instead
-        detect a clean exit from two independent signals:
-          - the server no longer answers a console ``list`` (is_online), AND
-          - ``console.log`` has stopped growing (BDS wrote its shutdown/flush
-            lines and the process exited, closing the tee pipe).
-        Both are required so a mid-shutdown lull, or an idle-but-still-running
-        server, isn't mistaken for a clean exit (the log-growth check also keeps
-        us waiting through the final world flush before a caller touches the db).
+        The reliable signal is the server *process* exiting, which releases the
+        world db. Console silence is NOT enough: after ``stop`` BDS prints
+        "Stopping server..." then goes quiet while it flushes the world and
+        exits, so a console-idle check returns while the process is still alive
+        and still holds the db — the bot would then edit the db and relaunch
+        into a still-running server. So confirm the exit from the process table
+        (see ``_world_process_alive``). Only when that can't be read (no
+        ``/proc``, i.e. off-Linux) do we fall back to the weaker console-idle
+        heuristic.
+
+        Deliberately does NOT use the LevelDB lock: this BDS build never locks
+        the world db (there is no LOCK file even while it runs), so the lock
+        always looks free.
         """
+        deadline = time.time() + timeout
+        proc_checked = False
+        while time.time() < deadline:
+            alive = self._world_process_alive()
+            if alive is None:
+                break  # can't inspect processes here — use the fallback below
+            proc_checked = True
+            if not alive:
+                time.sleep(2)   # settle: let the kernel finish releasing the db
+                return True
+            time.sleep(2)
+        if proc_checked:
+            return False        # timed out waiting for the process to exit
+
+        # Fallback (no /proc, non-Linux): the server stopped answering ``list``
+        # AND console.log stopped growing for several probes. Weaker — a
+        # mid-flush lull can look stopped — but production is Linux, so this path
+        # is only reached in off-Linux development.
         log_path = self.config.log_path
 
         def size():
@@ -336,7 +387,6 @@ class BedrockBackend(ServerBackend):
             except OSError:
                 return -1
 
-        deadline = time.time() + timeout
         prev_size = size()
         misses = 0  # consecutive probes with no console response and no log growth
         while time.time() < deadline:
@@ -609,11 +659,11 @@ class BedrockBackend(ServerBackend):
             self.stop_server(status)
             stopped = True
             if not self.wait_until_stopped(timeout=120):
-                status("⚠️ Server did not release the world db in time. "
+                status("⚠️ Server did not fully stop in time. "
                        "Aborting; check the server manually.")
                 return
             db_unlocked = True
-            status("Server stopped; world db unlocked")
+            status("Server stopped (process exited); world db free")
 
             # 4. Resolve the live data key (per-server), back it up, overwrite.
             db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
