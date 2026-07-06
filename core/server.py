@@ -8,6 +8,7 @@ used only by ``Server``.
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -20,13 +21,14 @@ from watchdog.observers import Observer
 from core.logutil import TagLogAdapter
 from core.state import load_achievements, load_deaths, uuid_by_name
 from core.presence import reconcile_online
-from core.logwatch import LogWatcher
 from utils.backup_utils import (
     CHAIN_MARKER_NAME, META_FILES,
     build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
 )
 from utils.config import backup_exclude_names, EDITION_BEDROCK
 from utils import restore_core
+
+logger = logging.getLogger("diamondsign")
 
 # ---------------------------------------------------------------------------
 # Server runtime object (per-server state)

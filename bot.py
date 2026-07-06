@@ -1,44 +1,20 @@
 import argparse
-import gzip
-import json
 import logging
-import os
-import re
 import sys
 import threading
 import time
-import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from watchdog.observers import Observer
 
-from utils.backup_utils import (
-    CHAIN_MARKER_NAME, META_FILES,
-    build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
-)
-from utils.config import (
-    load_config, backup_exclude_names, EDITION_BEDROCK, ConfigError,
-)
-from utils import restore_core
-from backends import (
-    make_backend, BackendUnavailable, CAP_PLAYER_RESTORE, CAP_STATS,
-    EVENT_DEATH, EVENT_ACHIEVEMENT,
-)
+from utils.config import load_config, ConfigError
+from backends import make_backend, BackendUnavailable
 from chat import make_adapters, CommandRouter
 from core.logutil import TagLogAdapter
-from core.state import (
-    refresh_player_names, register_player, uuid_by_name,
-    load_achievements, record_achievement, load_deaths, record_death,
-)
+from core.state import uuid_by_name
 from core.auth import (
-    AUTH_PATH, auth_lock, load_auth, save_auth, auth_ns,
-    is_admin, is_authorized,
-)
-from core.logparse import (
-    parse_line, categorize_death, DEATH_CATEGORIES, DEATH_PHRASES,
-    ACH_TYPE_MAP,
-    RE_UUID, RE_ACHIEVEMENT, RE_SERVER_MSG,
+    AUTH_PATH, auth_lock, load_auth, save_auth, is_admin, is_authorized,
 )
 from core.presence import reconcile_online, recover_online_identities
 from core.notifications import make_notify_callback
@@ -97,8 +73,6 @@ def setup_logging(logs_dir: Path) -> None:
     telebot_logger.addHandler(file_handler)
 
     logger.info("Logging started — writing to %s", log_file)
-
-
 
 
 class Bot:
