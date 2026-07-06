@@ -26,8 +26,8 @@ chains, new incremental backups would be mixed with old ones from before the
 restore, and the restore tool couldn't tell them apart. The chain ID makes each
 sequence of full + incrementals uniquely identifiable.
 
-Chain Marker (.mcnotifier_chain)
---------------------------------
+Chain Marker (.diamondsign_chain)
+---------------------------------
 A small file placed in the Minecraft server directory containing the current
 chain ID. On startup, the bot compares this marker against the manifest to
 detect if the server state was replaced while the bot was offline (e.g., manual
@@ -53,7 +53,7 @@ from pathlib import Path
 # Name of the chain marker file placed in the Minecraft server directory.
 # This file is excluded from all backup zips — it's metadata about the
 # backup process, not part of the server data.
-CHAIN_MARKER_NAME = ".mcnotifier_chain"
+CHAIN_MARKER_NAME = ".diamondsign_chain"
 
 # Internal metadata files stored inside incremental backup zips.
 # These are skipped when extracting files during restore.
@@ -111,6 +111,11 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None,
 
     Skips:
     - CHAIN_MARKER_NAME: backup metadata, not server data
+    - META_FILES (_meta.json / _deletions.json / _players.json): backup-format
+      entries the bot writes into each zip. If a copy of one lingers in the
+      world dir (e.g. extracted by a restore), it must not be treated as world
+      data — otherwise the backup zips it AND re-writes it (a "Duplicate name"
+      warning) and it shows as perpetually changed in incrementals.
     - Any basename in exclude_names: bot infrastructure that lives in the
       server directory but isn't server data (e.g. the Bedrock console.log
       the bot tails). Must match the set excluded from the backup zips, or
@@ -118,7 +123,7 @@ def build_file_manifest(root_dir: Path, backup_dir: Path | None = None,
     - Anything under backup_dir: if the backup output directory happens to
       be inside the server directory, we don't want to back up backups
     """
-    skip = {CHAIN_MARKER_NAME} | (exclude_names or set())
+    skip = {CHAIN_MARKER_NAME} | META_FILES | (exclude_names or set())
     backup_dir_resolved = backup_dir.resolve() if backup_dir else None
     files = {}
     for dirpath, _dirnames, filenames in os.walk(root_dir):
@@ -185,19 +190,19 @@ def wait_for_settle(root_dir: Path, backup_dir: Path | None = None,
     return manifest
 
 
-def run_copy_command(file_path: Path, log_fn=None) -> None:
-    """Run BACKUP_COPY_CMD to upload a backup file to off-server storage.
+def run_copy_command(file_path: Path, cmd_template: str, log_fn=None) -> None:
+    """Run a copy command to upload a backup file to off-server storage.
 
-    Reads BACKUP_COPY_CMD from the environment. The placeholder {file} in the
-    command is replaced with the full path to the backup zip. Does nothing if
-    BACKUP_COPY_CMD is not set.
+    ``cmd_template`` is the per-server ``backup.copy_cmd`` from the config; the
+    placeholder {file} in it is replaced with the full path to the backup zip.
+    Does nothing if ``cmd_template`` is empty.
 
     Args:
-        file_path: Path to the backup zip file to copy.
-        log_fn:    Callback for status messages, e.g. logger.info or print.
-                   If None, messages are silently discarded.
+        file_path:    Path to the backup zip file to copy.
+        cmd_template: The shell command template (with an optional {file}).
+        log_fn:       Callback for status messages, e.g. logger.info or print.
+                      If None, messages are silently discarded.
     """
-    cmd_template = os.environ.get("BACKUP_COPY_CMD", "")
     if not cmd_template:
         return
 

@@ -14,8 +14,21 @@ Line parsing and the shared player-state bookkeeping deliberately stay in
 command transport, the save/flush sequence, and server-side queries.
 """
 
+import re
+import secrets
+import shlex
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+# Minecraft formatting codes: the section sign (§, U+00A7) followed by one
+# color/style char. They render as garbage in a chat message, so strip them
+# from anything shown to the user.
+_RE_MC_FORMAT = re.compile("§.")
+
+
+def strip_minecraft_formatting(text: str) -> str:
+    return _RE_MC_FORMAT.sub("", text)
 
 # Normalized event types yielded by line parsing.
 EVENT_JOIN = "join"
@@ -49,7 +62,15 @@ class ServerBackend(ABC):
 
     def __init__(self, config):
         self.config = config
+        # Per-server state lives under data/<server-name>/ (config.data_dir),
+        # so two servers in one process never share a state file.
+        self.data_dir = config.data_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self._watcher = None  # LogWatcher, attached after construction
+
+    def _data_path(self, filename: str) -> Path:
+        """Resolve a per-server state file under ``data/<key>/``."""
+        return self.data_dir / filename
 
     def attach_watcher(self, watcher) -> None:
         """Give the backend the LogWatcher it uses to await server log lines.
@@ -65,12 +86,59 @@ class ServerBackend(ABC):
     # --- availability / readiness ---
     @abstractmethod
     def is_available(self, log_warnings: bool = False) -> bool:
-        """Whether the backend can currently issue commands (RCON configured and
-        server.properties valid for Java; a live mux session for Bedrock)."""
+        """Whether the backend is CONFIGURED to issue commands (RCON set up and
+        server.properties valid for Java; a mux session for Bedrock). This is a
+        config check — it does NOT mean the server process is running; use
+        ``is_online`` for liveness."""
 
-    @abstractmethod
-    def wait_for_ready(self, timeout: float = 120) -> bool:
-        """Block until the server is ready to accept commands, or timeout."""
+    def is_online(self) -> bool:
+        """Whether the server PROCESS is currently running/reachable — distinct
+        from ``is_available`` (config only). Subclasses probe cheaply (Java: the
+        RCON port; Bedrock: the world-db lock). Defaults True so a backend
+        without a probe doesn't over-restrict command gating."""
+        return True
+
+    def wait_until_online(self, log_fn=None, *, stall: float = 120,
+                          cap: float = 900) -> bool:
+        """Wait for the server to accept commands, tolerating a slow boot.
+
+        Polls ``is_online`` and EXTENDS the wait as long as the server log keeps
+        growing (boot in progress) — so a server that takes minutes to start
+        (Paper + plugins on a Pi) isn't abandoned on a fixed timeout. Gives up
+        only if the log stays idle for ``stall`` seconds with the server still
+        offline (stuck/crashed), or after ``cap`` seconds overall. Uses
+        ``is_online`` (a port/lock probe), so it's robust across the log rotation
+        a restart causes — unlike matching a one-off 'ready' log line."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+
+        def size():
+            try:
+                return self.config.log_path.stat().st_size
+            except OSError:
+                return -1
+
+        start = time.time()
+        last_size, last_activity = size(), time.time()
+        announced = False
+        while time.time() - start < cap:
+            if self.is_online():
+                return True
+            time.sleep(3)
+            cur = size()
+            if cur != last_size:            # log grew -> boot is making progress
+                last_size, last_activity = cur, time.time()
+                if not announced:
+                    log("Server is starting (log active); waiting for it to "
+                        "accept commands...")
+                    announced = True
+            elif time.time() - last_activity > stall:
+                log(f"Server log idle for {int(stall)}s and still not accepting "
+                    "commands — giving up.")
+                return False
+        log(f"Server did not come online within {int(cap)}s.")
+        return False
 
     # --- command transport ---
     @abstractmethod
@@ -98,7 +166,18 @@ class ServerBackend(ABC):
         cmd = self.ALLOWLIST_VERB
         if args:
             cmd += " " + " ".join(args)
-        return self.capture_command(cmd, timeout=timeout)
+        # Java RCON responses carry § colour codes; strip them so the chat reply
+        # is clean (Bedrock's captured output is already plain).
+        return strip_minecraft_formatting(self.capture_command(cmd, timeout=timeout))
+
+    def broadcast(self, message: str) -> None:
+        """Announce ``message`` to all players in-game via the console ``say``
+        command. Works on both editions (Java over RCON, Bedrock over the mux).
+        Newlines are stripped: ``say`` is a single line and the mux guard
+        (backends/mux.py) refuses control characters anyway."""
+        one_line = " ".join(message.split())
+        if one_line:
+            self.send_command(f"say {one_line}")
 
     # --- backup freeze/flush ---
     @abstractmethod
@@ -135,16 +214,78 @@ class ServerBackend(ABC):
     # backup manifest/chain state; Bedrock simply omits the capability. The
     # backend's role there is limited to the save dance and ``is_player_online``.
 
-    # --- server lifecycle (Bedrock per-player restore: stop -> edit -> start) ---
-    # Java doesn't need these (RCON edits live), so they default to NotSupported
-    # and only the Bedrock backend overrides them.
+    # --- server lifecycle (stop -> replace files -> start) ---
+    # Used by Bedrock per-player restore and by the world-restore command on both
+    # editions. Bedrock always overrides these; Java overrides them only when a
+    # mux + start command are configured (else they stay NotSupported, and
+    # ``can_restart`` is False so /restore is refused with a clear message).
+    @property
+    def can_restart(self) -> bool:
+        """Whether this backend can stop and relaunch the server (needed for a
+        world restore). Subclasses override based on their transport."""
+        return False
+
     def stop_server(self, log_fn=None) -> bool:
-        """Stop the server and return once it has shut down."""
+        """Request a stop and return once the server has acknowledged it (actual
+        shutdown is confirmed by ``wait_until_stopped``)."""
         raise NotSupported("stop_server")
 
-    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
-        """Wait until the world db is no longer locked by the server."""
-        raise NotSupported("wait_for_db_unlock")
+    def wait_until_stopped(self, timeout: float = 120) -> bool:
+        """Block until the server process is fully down (Bedrock: world db lock
+        released; Java: RCON no longer answering)."""
+        raise NotSupported("wait_until_stopped")
+
+    def _confirm_console_free(self, timeout: float, log_fn=None):
+        """Confirm the server's mux pane has returned to a shell prompt — i.e.
+        the server process has fully exited and its world files/db are released.
+
+        The server runs in a tmux/screen pane as ``<start cmd> | tee``; while it
+        is up, an injected line reaches the *server's* console stdin, and once it
+        exits the pane falls back to the *shell*. So we inject a command only a
+        shell can satisfy — write a nonce to a sentinel file — and watch for that
+        file. A running server takes the injection as a bogus console command
+        (logged as unknown) and cannot create the file, so the file appearing
+        means the pane is a shell again. Keying on a file the server can't write
+        (rather than grepping the log) rules out a false positive from the server
+        echoing the command back. Re-injects each probe so a line lands as soon
+        as the shell is ready.
+
+        Returns True (confirmed free), False (timed out), or None if there is no
+        mux to inject through — the caller then trusts its own weaker signal.
+        """
+        mux = getattr(self, "_mux", None)
+        if mux is None:
+            return None
+
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+
+        nonce = secrets.token_hex(8)
+        sentinel = (self.data_dir / "stopcheck").resolve()
+        try:
+            sentinel.unlink()  # clear any stale sentinel from a prior run
+        except OSError:
+            pass
+        # Absolute path so the shell's cwd doesn't matter; quoted for safety.
+        cmd = f"echo {nonce} > {shlex.quote(sentinel.as_posix())}"
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            mux.send(cmd)       # -> server console (ignored) or shell (runs it)
+            time.sleep(3)
+            try:
+                if sentinel.read_text().strip() == nonce:
+                    sentinel.unlink()
+                    return True
+            except OSError:
+                pass            # not written yet -> pane still busy with the server
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
+        log("Console did not return to a shell prompt in time")
+        return False
 
     def relaunch(self, log_fn=None) -> bool:
         """Relaunch the server and return once it reports ready."""

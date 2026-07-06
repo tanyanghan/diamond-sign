@@ -22,7 +22,6 @@ import re
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 from utils.backup_utils import RE_FULL, RE_INCR
 from .base import (
@@ -31,17 +30,16 @@ from .base import (
 )
 from .mux import detect
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Portable player list / name registry. xuid -> {name, identities:[MsaId,
 # SelfSignedId], first_seen, last_seen}. Identities are account-stable (the data
 # key is per-server random), so this file can be copied to another instance.
-_PLAYERS_PATH = Path(__file__).resolve().parent.parent / "bedrock_players.json"
+# bedrock_players.json and statistics.json now live under data/<server-name>/
+# (paths set per-instance in __init__), so two Bedrock servers in one process
+# can't clobber each other's player list / stats. The player list is still
+# portable (identities are account-stable; the data key is per-server random).
 _players_lock = threading.Lock()
-
-# Per-server online-time stats (NOT portable). xuid -> {name, total_seconds,
-# sessions, open_since}.
-_STATS_PATH = Path(__file__).resolve().parent.parent / "statistics.json"
 _stats_lock = threading.Lock()
 
 # Serialises response-capturing commands so two concurrent captures can't read
@@ -49,9 +47,9 @@ _stats_lock = threading.Lock()
 _capture_lock = threading.Lock()
 
 
-def _load_players() -> dict:
+def _load_players(path) -> dict:
     try:
-        return json.loads(_PLAYERS_PATH.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception:
@@ -59,16 +57,16 @@ def _load_players() -> dict:
         return {}
 
 
-def _save_players(data: dict) -> None:
+def _save_players(path, data: dict) -> None:
     try:
-        _PLAYERS_PATH.write_text(json.dumps(data, indent=2))
+        path.write_text(json.dumps(data, indent=2))
     except Exception:
         logger.exception("Failed to write bedrock_players.json")
 
 
-def _load_stats() -> dict:
+def _load_stats(path) -> dict:
     try:
-        return json.loads(_STATS_PATH.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception:
@@ -76,9 +74,9 @@ def _load_stats() -> dict:
         return {}
 
 
-def _save_stats(data: dict) -> None:
+def _save_stats(path, data: dict) -> None:
     try:
-        _STATS_PATH.write_text(json.dumps(data, indent=2))
+        path.write_text(json.dumps(data, indent=2))
     except Exception:
         logger.exception("Failed to write statistics.json")
 
@@ -138,7 +136,7 @@ def _format_console_response(text: str) -> str:
         stripped = _strip_prefix(ln)
         if stripped in ("###*", "*###") or not stripped:
             continue
-        if "MCNOTIFIER " in stripped:
+        if "DIAMONDSIGN " in stripped:
             continue  # behavior-pack event marker (async; not command output)
         lines.append(stripped)
     return "\n".join(lines)
@@ -150,6 +148,8 @@ class BedrockBackend(ServerBackend):
 
     def __init__(self, config):
         super().__init__(config)
+        self.players_path = self._data_path("bedrock_players.json")
+        self.stats_path = self._data_path("statistics.json")
         self._mux = detect(config.mux_session)
         if self._mux is None:
             looked = f" '{config.mux_session}'" if config.mux_session else ""
@@ -170,12 +170,19 @@ class BedrockBackend(ServerBackend):
             logger.warning("Bedrock: no tmux/screen session available for commands")
         return ok
 
-    def wait_for_ready(self, timeout: float = 120) -> bool:
-        """Wait for BDS to report it has started (in console.log)."""
-        logger.info("Waiting for Bedrock server to be ready (monitoring %s)...",
-                    self.config.log_path.name)
-        waiter = self._watcher.expect_line("Server started")
-        return waiter.wait(timeout=timeout)
+    def is_online(self) -> bool:
+        """True if the server is running and responding on the console.
+
+        Sends ``list`` and checks whether BDS echoed anything into console.log —
+        a running server always responds (even with zero players); a stopped one
+        produces nothing. This is authoritative and side-effect-free, unlike
+        probing the world LevelDB lock (whose behaviour is BDS-version-dependent,
+        depends on the level-name path resolving to the *running* world, and is
+        unsafe to open read-write against a live server)."""
+        try:
+            return bool(self.capture_command("list", timeout=3.0).strip())
+        except Exception:
+            return False
 
     # --- command transport (fire-and-forget) ---
     def send_command(self, cmd: str) -> str:
@@ -290,26 +297,62 @@ class BedrockBackend(ServerBackend):
             log("Warning: 'save resume' not confirmed after retries")
 
     # --- server lifecycle (per-player restore: stop -> edit db -> relaunch) ---
+    @property
+    def can_restart(self) -> bool:
+        """Bedrock always runs under a mux (required at construction); it can
+        relaunch as long as a start command is set (synthesized by default)."""
+        return bool(self.config.mux_start_cmd)
+
+    # BDS appends this line to the console as the final step of a clean
+    # shutdown, after the world is saved and closed — the safe-to-edit signal.
+    _SHUTDOWN_MARKER = "Quit correctly"
+
     def stop_server(self, log_fn=None) -> bool:
-        """Request a stop and confirm BDS acknowledged it. Actual shutdown (lock
-        release) is confirmed separately by wait_for_db_unlock()."""
+        """Request a stop and confirm BDS acknowledged it. Actual shutdown is
+        confirmed separately by wait_until_stopped().
+
+        Registers the shutdown-complete waiter BEFORE sending stop: on a small
+        world BDS prints ``Quit correctly`` within a fraction of a second, so a
+        waiter registered afterwards would miss it. wait_until_stopped() blocks
+        on this waiter."""
         def log(msg):
             if log_fn:
                 log_fn(msg)
+        self._shutdown_waiter = (self._watcher.expect_line(self._SHUTDOWN_MARKER)
+                                 if self._watcher else None)
         ok = self._send_confirmed("stop", "Server stop requested", retries=3, log=log)
         log("Stop requested" if ok else "Warning: 'stop' not confirmed")
         return ok
 
-    def wait_for_db_unlock(self, timeout: float = 120) -> bool:
-        """Poll until the world db LevelDB lock is released (server fully down)."""
-        from utils import bedrock_player
-        db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not bedrock_player.is_db_locked(db_path):
+    def wait_until_stopped(self, timeout: float = 120) -> bool:
+        """Wait until BDS has fully shut down — safe to edit the world db.
+
+        Primary signal: the ``Quit correctly`` line BDS appends to the console
+        (captured in console.log) as the last step of a clean shutdown, after
+        the world is saved and closed. The waiter was registered in
+        stop_server() *before* the stop was sent, so a fast shutdown isn't
+        missed. Console silence is NOT a usable signal on its own — after "stop"
+        BDS prints "Stopping server..." then goes quiet while it flushes and
+        exits, so a quiet console can still mean a live server holding the db.
+
+        Deliberately does NOT use the LevelDB lock: this BDS build never locks
+        the world db (there is no LOCK file even while it runs), so it always
+        looks free. If no LogWatcher is attached (unusual), fall back to
+        confirming the mux pane has returned to a shell prompt (see
+        ``_confirm_console_free``).
+        """
+        waiter = getattr(self, "_shutdown_waiter", None)
+        self._shutdown_waiter = None
+        if waiter is not None:
+            if waiter.wait(timeout):
+                time.sleep(2)   # settle: let the process finish exiting
                 return True
-            time.sleep(1)
-        return False
+            if self._watcher:
+                self._watcher.cancel(waiter)
+            return False
+
+        # Fallback (no LogWatcher): confirm the console pane is free again.
+        return bool(self._confirm_console_free(timeout))
 
     def relaunch(self, log_fn=None) -> bool:
         """Send MUX_START_CMD to the mux window and wait for 'Server started'."""
@@ -343,7 +386,7 @@ class BedrockBackend(ServerBackend):
 
     # --- name registry / portable player list (bedrock_players.json) ---
     def load_names(self) -> dict:
-        return {xuid: e["name"] for xuid, e in _load_players().items()
+        return {xuid: e["name"] for xuid, e in _load_players(self.players_path).items()
                 if e.get("name")}
 
     def register_name(self, player_id: str, name: str) -> bool:
@@ -351,21 +394,21 @@ class BedrockBackend(ServerBackend):
         Returns True if the name was created/changed."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with _players_lock:
-            data = _load_players()
+            data = _load_players(self.players_path)
             entry = data.get(player_id, {})
             changed = entry.get("name") != name
             entry["name"] = name
             entry.setdefault("first_seen", now)
             entry["last_seen"] = now
             data[player_id] = entry
-            _save_players(data)
+            _save_players(self.players_path, data)
             return changed
 
     def learn_player(self, name: str, xuid: str, idents: list) -> bool:
         """Merge a learned xuid -> identities binding (account-stable), preserving
         name/timestamps. Returns True if the identities were newly learned."""
         with _players_lock:
-            data = _load_players()
+            data = _load_players(self.players_path)
             entry = data.get(xuid, {})
             if entry.get("identities") == idents:
                 return False
@@ -373,20 +416,20 @@ class BedrockBackend(ServerBackend):
             if name and not entry.get("name"):
                 entry["name"] = name
             data[xuid] = entry
-            _save_players(data)
+            _save_players(self.players_path, data)
             return True
 
     def player_identities(self, xuid: str) -> list:
-        return _load_players().get(xuid, {}).get("identities", [])
+        return _load_players(self.players_path).get(xuid, {}).get("identities", [])
 
     def known_identities(self) -> set:
         out = set()
-        for e in _load_players().values():
+        for e in _load_players(self.players_path).values():
             out.update(e.get("identities", []))
         return out
 
     def list_known_players(self, names: dict) -> list:
-        return sorted(e["name"] for e in _load_players().values() if e.get("name"))
+        return sorted(e["name"] for e in _load_players(self.players_path).values() if e.get("name"))
 
     # --- online-time stats (statistics.json, accumulated from join/leave) ---
     def record_player_session(self, event_type: str, player_id: str,
@@ -395,10 +438,10 @@ class BedrockBackend(ServerBackend):
             return
         now = time.time() if now is None else now
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             entry = data.get(player_id) or {"total_seconds": 0, "sessions": 0,
                                             "open_since": None}
-            nm = _load_players().get(player_id, {}).get("name")
+            nm = _load_players(self.players_path).get(player_id, {}).get("name")
             if nm:
                 entry["name"] = nm
             if event_type == EVENT_JOIN:
@@ -410,26 +453,26 @@ class BedrockBackend(ServerBackend):
                     entry["sessions"] = entry.get("sessions", 0) + 1
                 entry["open_since"] = None
             data[player_id] = entry
-            _save_stats(data)
+            _save_stats(self.stats_path, data)
 
     def reset_open_sessions(self) -> None:
         """Clear any open_since left dangling by a crash (called at startup
         before re-opening sessions for currently-online players)."""
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             touched = False
             for entry in data.values():
                 if entry.get("open_since") is not None:
                     entry["open_since"] = None
                     touched = True
             if touched:
-                _save_stats(data)
+                _save_stats(self.stats_path, data)
 
     def close_open_sessions(self, now: float | None = None) -> None:
         """Flush open sessions (graceful shutdown)."""
         now = time.time() if now is None else now
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             touched = False
             for entry in data.values():
                 start = entry.get("open_since")
@@ -439,7 +482,7 @@ class BedrockBackend(ServerBackend):
                     entry["open_since"] = None
                     touched = True
             if touched:
-                _save_stats(data)
+                _save_stats(self.stats_path, data)
 
     def checkpoint_open_sessions(self, now: float | None = None) -> None:
         """Bank elapsed time for open sessions but keep them open (open_since
@@ -447,7 +490,7 @@ class BedrockBackend(ServerBackend):
         session — it's a durability checkpoint, not a sign-off. Idempotent."""
         now = time.time() if now is None else now
         with _stats_lock:
-            data = _load_stats()
+            data = _load_stats(self.stats_path)
             touched = False
             for entry in data.values():
                 start = entry.get("open_since")
@@ -456,15 +499,15 @@ class BedrockBackend(ServerBackend):
                     entry["open_since"] = now
                     touched = True
             if touched:
-                _save_stats(data)
+                _save_stats(self.stats_path, data)
 
     def player_stats(self, names: dict) -> list:
         # Persist running time so the displayed value survives a later crash
         # and /stats can't show a number that isn't on disk.
         self.checkpoint_open_sessions()
-        players = _load_players()
+        players = _load_players(self.players_path)
         result = []
-        for xuid, e in _load_stats().items():
+        for xuid, e in _load_stats(self.stats_path).items():
             secs = e.get("total_seconds", 0)
             if e.get("open_since"):  # include the in-progress session
                 secs += max(0, time.time() - e["open_since"])
@@ -533,7 +576,7 @@ class BedrockBackend(ServerBackend):
         from utils import bedrock_player
 
         def status(msg):
-            logger.info("RestorePlayer(BR): %s", msg)
+            logger.info("[%s] RestorePlayer: %s", self.config.name, msg)
             if status_cb:
                 status_cb(msg)
 
@@ -566,12 +609,12 @@ class BedrockBackend(ServerBackend):
             status("Stopping server...")
             self.stop_server(status)
             stopped = True
-            if not self.wait_for_db_unlock(timeout=120):
-                status("⚠️ Server did not release the world db in time. "
+            if not self.wait_until_stopped(timeout=120):
+                status("⚠️ Server did not fully stop in time. "
                        "Aborting; check the server manually.")
                 return
             db_unlocked = True
-            status("Server stopped; world db unlocked")
+            status("Server stopped cleanly; world db free")
 
             # 4. Resolve the live data key (per-server), back it up, overwrite.
             db_path = bedrock_player.world_db_path(self.config.minecraft_dir)

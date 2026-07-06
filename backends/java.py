@@ -1,6 +1,6 @@
 """Java server backend: RCON transport, verbose latest.log, per-player .dat.
 
-This wraps the behaviour mcnotifier shipped before edition support was added,
+This wraps the behaviour Diamond Sign shipped before edition support was added,
 behind the ``ServerBackend`` interface. Functionally it is the original RCON
 code path (``rcon_command``, the save-off/save-all/save-on dance,
 ``_wait_for_rcon_ready``, ``_validate_server_properties``, the ``list`` parsing)
@@ -13,12 +13,29 @@ import logging
 import os
 import re
 import shutil
+import signal
+import socket
 import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
 from mcrcon import MCRcon
+
+
+def _neutralize_rcon_alarm() -> None:
+    """mcrcon's _read() arms signal.alarm(timeout) around every recv, and its
+    __init__ installs the SIGALRM handler. We bypass __init__ (signal.signal
+    can't run in a worker thread), so the handler is never installed and a
+    blocked read would fire SIGALRM with its default disposition — terminating
+    the whole process ("Alarm clock"). Ignore SIGALRM so a stray alarm can't
+    kill us; recv is instead bounded by an explicit socket timeout (see
+    send_command)."""
+    try:
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass  # not the main thread — send_command's socket timeout is the bound
 
 from utils.backup_utils import RE_FULL, RE_INCR, wait_for_settle
 from utils.config import read_server_properties, get_level_name, backup_exclude_names
@@ -26,14 +43,15 @@ from .base import (
     ServerBackend, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
     CAP_PLAYER_RESTORE, CAP_STATS,
 )
+from .mux import detect
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Response to the `list` command: "There are X of a max of Y players online: a, b"
 _RE_LIST = re.compile(r'There are \d+ of a max of \d+ players online:(.*)')
 
-# Java name registry: UUID -> name, learned from server logs.
-_NAMES_PATH = Path(__file__).resolve().parent.parent / "player_names.json"
+# Java name registry: UUID -> name, learned from server logs. The file
+# (player_names.json) lives under data/<server-name>/ — path set per-instance.
 _names_lock = threading.Lock()
 
 
@@ -48,6 +66,18 @@ def _cm_to_km(cm: int) -> float:
 class JavaBackend(ServerBackend):
     CAPABILITIES = {EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
                     CAP_PLAYER_RESTORE, CAP_STATS}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.names_path = self._data_path("player_names.json")
+        # Constructed in the main thread (main() startup), so we can safely
+        # disarm mcrcon's process-killing SIGALRM here.
+        _neutralize_rcon_alarm()
+        # Optional mux — only needed to RESTART the JVM for a world restore
+        # (RCON dies with the server, so the start command must be typed into the
+        # session hosting it). Absent for a normal Java install; when unset the
+        # world-restore command is refused (see can_restart). Never fatal.
+        self._mux = detect(config.mux_session) if config.mux_session else None
 
     # --- availability / readiness ---
     def is_available(self, log_warnings: bool = False) -> bool:
@@ -81,11 +111,15 @@ class JavaBackend(ServerBackend):
                             "RCON_PASSWORD from .env")
         return warnings
 
-    def wait_for_ready(self, timeout: float = 120) -> bool:
-        """Wait for the 'RCON running on' line in latest.log via the watcher."""
-        logger.info("Waiting for RCON to be ready (monitoring latest.log)...")
-        waiter = self._watcher.expect_line("RCON running on")
-        return waiter.wait(timeout=timeout)
+    def is_online(self) -> bool:
+        """True if the RCON port is accepting connections — i.e. the JVM is up.
+        A plain TCP connect (no RCON round-trip), so it can't hang."""
+        try:
+            with socket.create_connection(
+                    (self.config.rcon_host, self.config.rcon_port), timeout=2):
+                return True
+        except OSError:
+            return False
 
     # --- command transport ---
     def send_command(self, cmd: str) -> str:
@@ -102,9 +136,94 @@ class JavaBackend(ServerBackend):
         mcr.timeout = 5
         mcr.connect()
         try:
+            # Bound recv in THIS thread so a slow/dead server can't hang the read
+            # (mcrcon's own signal.alarm timeout is neutralized — see
+            # _neutralize_rcon_alarm).
+            if mcr.socket is not None:
+                mcr.socket.settimeout(mcr.timeout)
             return mcr.command(cmd)
         finally:
             mcr.disconnect()
+
+    # --- server lifecycle (world restore: stop -> replace files -> start) ---
+    @property
+    def can_restart(self) -> bool:
+        """Java can stop/restart only if it runs under a mux with a start command
+        (RCON alone can stop but not relaunch the JVM)."""
+        return bool(self._mux and self.config.mux_start_cmd)
+
+    def stop_server(self, log_fn=None) -> bool:
+        """Issue the RCON ``stop`` command. The RCON link drops as the JVM shuts
+        down (so the call may error mid-shutdown — that's fine); actual shutdown
+        is confirmed by wait_until_stopped()."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+        try:
+            self.send_command("stop")
+        except Exception:
+            pass  # connection dropped as the server went down
+        log("Stop requested")
+        return True
+
+    def wait_until_stopped(self, timeout: float = 120) -> bool:
+        """Wait until the JVM has fully exited — safe to replace the world dir.
+
+        Two phases. First poll the RCON port with a plain TCP connect until it
+        stops accepting — i.e. the RCON listener is gone (the JVM is shutting
+        down or down). Deliberately does NOT send an RCON command: a
+        shutting-down server can accept the socket but never reply, blocking the
+        read (mcrcon would fire its process-killing alarm); a bare connect probe
+        can't hang. The closed port is only a *proxy* for process exit, though —
+        the listener can close while the JVM is still flushing worlds. So then
+        hard-confirm the process is fully gone by checking the mux pane has
+        returned to a shell prompt (see ``_confirm_console_free``); if there is
+        no mux to confirm through, trust the port signal."""
+        deadline = time.time() + timeout
+        port_open = True
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(
+                        (self.config.rcon_host, self.config.rcon_port),
+                        timeout=2):
+                    pass  # port still accepting -> server still up
+            except OSError:
+                port_open = False  # refused / unreachable -> RCON listener gone
+                break
+            time.sleep(1)
+        if port_open:
+            return False  # never stopped accepting within the timeout
+        # Hard-confirm the JVM process itself has exited (the console pane is a
+        # shell again), giving the world-file swap the same guarantee Bedrock's
+        # "Quit correctly" wait provides. At least a short window for this even
+        # if the port took a while to close.
+        remaining = max(15.0, deadline - time.time())
+        result = self._confirm_console_free(remaining)
+        return True if result is None else result
+
+    def relaunch(self, log_fn=None) -> bool:
+        """Type the start command into the mux session ONCE, then wait
+        (activity-aware) for the server to accept RCON.
+
+        Sends once and confirms readiness via wait_until_online() — which polls
+        the RCON port and extends while latest.log keeps growing. This is
+        rotation-proof (a restart rotates latest.log) and never re-types the
+        start command into a now-running console, which previously produced
+        'Unknown command' spam and a false 'relaunch not confirmed'."""
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+        if not self.can_restart:
+            log("No mux/start command configured; cannot relaunch the server")
+            return False
+        if self.is_online():
+            return True  # already up — don't type the start cmd into the console
+        self._mux.send(self.config.mux_start_cmd)
+        log("Start command sent; waiting for the server to come up...")
+        if self.wait_until_online(log_fn):
+            log("Server relaunched")
+            return True
+        return False
 
     # --- backup freeze/flush ---
     def begin_save(self, log_fn=None) -> None:
@@ -163,9 +282,9 @@ class JavaBackend(ServerBackend):
 
     # --- name registry (player_names.json, keyed by UUID) ---
     def load_names(self) -> dict:
-        if _NAMES_PATH.exists():
+        if self.names_path.exists():
             try:
-                with open(_NAMES_PATH) as f:
+                with open(self.names_path) as f:
                     return json.load(f)
             except Exception:
                 logger.exception("Failed to load player_names.json")
@@ -178,7 +297,7 @@ class JavaBackend(ServerBackend):
                 return False
             data[player_id] = name
             try:
-                with open(_NAMES_PATH, "w") as f:
+                with open(self.names_path, "w") as f:
                     json.dump(data, f, indent=2)
             except Exception:
                 logger.exception("Failed to write player_names.json")
@@ -351,7 +470,7 @@ class JavaBackend(ServerBackend):
         uuid = player_id
 
         def status(msg):
-            logger.info("RestorePlayer: %s", msg)
+            logger.info("[%s] RestorePlayer: %s", self.config.name, msg)
             if status_cb:
                 status_cb(msg)
 
@@ -369,7 +488,8 @@ class JavaBackend(ServerBackend):
             self.begin_save(status)
             save_started = True
             wait_for_settle(self.config.minecraft_dir, self.config.backup_dir,
-                            log_fn=status, exclude_names=backup_exclude_names())
+                            log_fn=status,
+                            exclude_names=backup_exclude_names(self.config))
 
             target = self._live_playerdata_dir() / f"{uuid}.dat"
             source_bytes = _read_player_data_bytes(version)
@@ -386,7 +506,7 @@ class JavaBackend(ServerBackend):
             status(f"Restored {username}.dat from {version['source']} "
                    f"({version['timestamp']})")
         except Exception as e:
-            logger.exception("RestorePlayer failed")
+            logger.exception("[%s] RestorePlayer failed", self.config.name)
             status(f"Restore failed: {e}")
         finally:
             if save_started:

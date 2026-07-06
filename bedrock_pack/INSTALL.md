@@ -1,7 +1,7 @@
-# mcnotifier events — Bedrock behavior pack
+# Diamond Sign events — Bedrock behavior pack
 
 This optional behavior pack makes a Bedrock server emit **player chat** and
-**death** events to the console so mcnotifier can relay them (Bedrock's console
+**death** events to the console so Diamond Sign can relay them (Bedrock's console
 otherwise reports only join/leave). It uses the Script API and emits marker lines
 via `console.warn`, which the bot reads from the same `console.log` it already
 tails — no HTTP endpoint or `@minecraft/server-net` permission required.
@@ -18,29 +18,41 @@ With the **server stopped**, from the repo root:
 python install_bedrock_pack.py
 ```
 
-It reads `MINECRAFT_DIR` from your `.env` and the world's `level-name` from
-`server.properties`, then: copies the pack into `behavior_packs/`, activates it in
-the world's `world_behavior_packs.json`, sets
-`content-log-console-output-enabled=true` in `server.properties`, verifies the
-server isn't running and enables the **Beta APIs** experiment in `level.dat`, and
-sets `BEDROCK_SCRIPT_EVENTS=true` + `CHAT_RELAY=true` in `.env`. Flags:
+It reads the Bedrock server(s) from `diamondsign.json` (if more than one, it
+lists them and asks which — or pass `--server <name>`), takes the world's
+`level-name` from that server's `server.properties`, then: copies the pack into
+`behavior_packs/diamondsign_events/`, activates it in the world's
+`world_behavior_packs.json`, sets `content-log-console-output-enabled=true` in
+`server.properties`, verifies the server isn't running and enables the **Beta
+APIs** experiment in `level.dat`, and sets that server's
+`edition.bedrock_script_events: true` + top-level `chat_relay: true` in `diamondsign.json`.
 
 It first confirms the server is a Bedrock server and prompts you to confirm it's
 stopped (the install edits the world and irreversibly enables an experiment).
 Flags:
 
+- `--server <name>` — which Bedrock server (name/key from `diamondsign.json`) to
+  act on; if omitted and several exist, you're prompted.
 - `--uninstall` — reverse it: remove the pack, deactivate it in
   `world_behavior_packs.json` (preserving other packs), turn
-  `content-log-console-output-enabled` and the two `.env` flags back off. The Beta
+  `content-log-console-output-enabled` and the two config flags back off. The Beta
   APIs experiment is **not** undone — Bedrock can't disable an experiment once a
   world has used it, so `level.dat` is left as-is (harmless with the pack gone).
 - `--deaths-only` — skip the experiment (deaths only; no chat, no amulet libs, sets
-  only `BEDROCK_SCRIPT_EVENTS`).
+  only `edition.bedrock_script_events`).
 - `--yes` / `-y` — skip the "is the server stopped?" prompt (non-interactive use).
-- `--force` — skip the automated "server not running" lock check (implies `--yes`).
-- `--no-env` — don't modify `.env`.
+- `--force` — skip the automated "server not running" probe (implies `--yes`).
+- `--no-config` — don't modify `diamondsign.json`.
 
-The experiment step needs `amulet-nbt`/`amulet-leveldb`
+Before enabling the experiment the installer checks the server is really down by
+sending `list` on its console (via the tmux/screen `mux.session`) and seeing
+whether it answers — it does **not** use the world LevelDB lock, because BDS
+doesn't lock the world db (there's no `LOCK` file even while it runs), so a lock
+check would both misread a running server as stopped and open the live world db.
+If no mux session is configured/found it can't probe and falls back to your
+"stopped?" confirmation.
+
+The experiment step needs `amulet-nbt`
 (`requirements-bedrock-restore.txt`). After it finishes, just restart the server
 and the bot. The manual steps below document what the installer does.
 
@@ -67,7 +79,7 @@ server-root `behavior_packs/` (the global pool) and
 conventional and usually already present:
 
 ```
-behavior_packs/mcnotifier_events/        # copy this bedrock_pack/ folder here
+behavior_packs/diamondsign_events/        # copy this bedrock_pack/ folder here
 ```
 
 Then activate it for your world by adding the pack's **header** UUID — the
@@ -103,12 +115,12 @@ On startup, success looks like:
 
 ```
 Experiment(s) active: gtst
-Pack Stack - [00] mcnotifier events (id: dd12725f-…) @ behavior_packs/mcnotifier_events
+Pack Stack - [00] Diamond Sign events (id: dd12725f-…) @ behavior_packs/diamondsign_events
 ```
 
 with **no** `[Scripting] ... chatSend unavailable` error. Then:
-- A player **dies** → `[… WARN] [Scripting] MCNOTIFIER {"t":"death",…}`
-- A player **chats** → `[… WARN] [Scripting] MCNOTIFIER {"t":"chat",…}`
+- A player **dies** → `[… WARN] [Scripting] DIAMONDSIGN {"t":"death",…}`
+- A player **chats** → `[… WARN] [Scripting] DIAMONDSIGN {"t":"chat",…}`
 
 Common startup errors:
 - `requesting dependency on beta APIs … but the Beta APIs experiment is not
@@ -119,15 +131,19 @@ Common startup errors:
 
 ## 5. Turn it on in the bot
 
-In the bot's `.env`:
+On this server's entry in `diamondsign.json` (`bedrock_script_events` nests under
+the server's `edition`; `chat_relay` is a top-level server key):
 
-```
-BEDROCK_SCRIPT_EVENTS=true   # ingest death markers; enables /deaths, /death_summary
-CHAT_RELAY=true              # relay in-game chat to the chat platforms
+```jsonc
+"edition": {
+  "type": "bedrock",
+  "bedrock_script_events": true   // ingest death markers; enables /deaths, /death_summary
+},
+"chat_relay": true                // relay in-game chat (Bedrock needs bedrock_script_events too)
 ```
 
 Restart the bot. Deaths now announce + record (like Java); chat is relayed to
-every authorized chat as `💬 <player>: <message>`.
+every authorized chat bound to this server as `💬 <player>: <message>`.
 
 ## Deaths only (no experiment)
 
@@ -135,4 +151,5 @@ If you only want death notifications and don't want the irreversible Beta APIs
 experiment, edit `manifest.json` and change the dependency `"version": "beta"` to
 a **stable** version your server provides (e.g. `"2.7.0"`). The pack then loads
 without the experiment; deaths work, chat does not (the script logs
-`chatSend unavailable` and carries on). Set only `BEDROCK_SCRIPT_EVENTS=true`.
+`chatSend unavailable` and carries on). Set only `edition.bedrock_script_events:
+true` (leave `chat_relay` off).

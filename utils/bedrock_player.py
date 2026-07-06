@@ -43,19 +43,14 @@ def world_db_path(minecraft_dir) -> Path:
     return Path(minecraft_dir) / "worlds" / get_level_name(minecraft_dir) / "db"
 
 
-def is_db_locked(db_path) -> bool:
-    """True if the world db is locked (server running) or absent. An open
-    succeeds only when the lock is free; we close immediately. Guard on the
-    CURRENT file first — a valid LevelDB always has one, and it stops
-    amulet-leveldb from creating an empty db at a missing/wrong path."""
-    if not (Path(db_path) / "CURRENT").exists():
-        return True
-    try:
-        db = open_db(db_path)
-        db.close()
-        return False
-    except Exception:
-        return True
+# NOTE: there used to be an is_db_locked() here that inferred "server running"
+# from the world LevelDB lock. It was removed: BDS (at least this build) never
+# takes an fcntl lock on the world db — there is no LOCK file even while the
+# server runs — so the check always reported "unlocked", AND it opened the live
+# world db via amulet (a second LevelDB instance against a db the server is
+# writing) just to find out, risking corruption. Detect liveness from the
+# console instead (BedrockBackend.is_online / wait_until_stopped send `list` and
+# watch console.log); never open the world db to probe a running server.
 
 
 def open_db(db_path, create: bool = False):

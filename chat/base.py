@@ -22,7 +22,7 @@ class Context:
     """
 
     def __init__(self, adapter, chat_id, user_id, is_private, text, args,
-                 sender_label, reply_to=None):
+                 sender_label, reply_to=None, chat_name=None):
         self.adapter = adapter
         self.platform = adapter.name
         self.chat_id = str(chat_id)
@@ -31,7 +31,24 @@ class Context:
         self.text = text
         self.args = args                 # command args, whitespace-split, sans the /cmd
         self.sender_label = sender_label  # human-readable, for logging
+        # Human-readable group/channel name from the inbound payload (Telegram
+        # chat title / Slack channel name); None for private chats or when the
+        # platform didn't supply one. Used for readable audit logs.
+        self.chat_name = chat_name
         self.reply_to = reply_to          # opaque per-adapter handle for threaded replies
+        # Populated by CommandRouter.dispatch before the handler runs: the Bot
+        # this router serves, and (for server-scoped commands) the resolved
+        # target Server. See Bot.resolve_target_server.
+        self.bot = None
+        self.server = None
+
+    @property
+    def chat_label(self) -> str:
+        """Readable location for audit logs: 'direct' for a DM, else the chat's
+        name (falling back to its raw ID if the platform gave no name)."""
+        if self.is_private:
+            return "direct"
+        return self.chat_name or self.chat_id
 
     def reply(self, text, *, monospace=False):
         self.adapter.send(self.chat_id, text, monospace=monospace,
@@ -88,32 +105,45 @@ class CommandRouter:
     """Maps ``/command`` names to handlers and enforces access rules.
 
     Replaces telebot's ``@bot.message_handler`` decorators and the per-handler
-    ``guard``/``is_admin``/``chat.type`` boilerplate. ``auth`` is the per-platform
-    authorization object (see ``bot`` auth helpers).
+    ``guard``/``is_admin``/``chat.type`` boilerplate. Authorization is delegated
+    to the ``is_admin``/``is_authorized`` callables (see ``bot`` auth helpers).
     """
 
-    def __init__(self, auth, is_admin, is_authorized, on_unclaimed=None,
-                 logger=None):
+    def __init__(self, is_admin, is_authorized, on_unclaimed=None,
+                 logger=None, bot=None, resolve=None):
         self._cmds = {}              # name -> spec dict
-        self._auth = auth
         self._is_admin = is_admin
         self._is_authorized = is_authorized
         self._on_unclaimed = on_unclaimed  # called for any message when admin unclaimed
         self._log = logger
+        self._bot = bot              # set on ctx.bot for every dispatched command
+        # resolve(ctx) -> bool: sets ctx.server for server-scoped commands, or
+        # replies with a disambiguation message and returns False. Skipped for
+        # commands registered needs_server=False (bot-level / public).
+        self._resolve = resolve
 
     def register(self, names, handler, *, private_only=False, admin_only=False,
-                 cap=None, cap_message=None, public=False):
+                 cap=None, cap_message=None, public=False, needs_server=True,
+                 needs_online=False):
         if isinstance(names, str):
             names = [names]
         spec = {"handler": handler, "private_only": private_only,
                 "admin_only": admin_only, "cap": cap, "cap_message": cap_message,
-                "public": public}
+                "public": public, "needs_server": needs_server,
+                "needs_online": needs_online}
         for n in names:
             self._cmds[n] = spec
 
     def dispatch(self, ctx) -> None:
         """Parse and route one inbound message. Silently ignores non-commands and
         unauthorized callers (no reply), matching the original Telegram behaviour."""
+        ctx.bot = self._bot
+
+        # Learn/refresh this chat's human name (for readable audit logs and
+        # /listchats). Runs on every inbound message so a group rename is caught.
+        if self._bot is not None:
+            self._bot.note_chat_name(ctx)
+
         # Admin-claim hook: before an admin exists on this platform, a private
         # message may claim it.
         if self._on_unclaimed and self._on_unclaimed(ctx):
@@ -139,7 +169,23 @@ class CommandRouter:
             return
         if spec["admin_only"] and not self._is_admin(ctx.platform, ctx.user_id):
             return
-        if spec["cap"] is not None and not spec["cap"]():
+        # Target-server resolution for server-scoped commands: sets ctx.server,
+        # or (on a multi-server bot with no binding/selection) replies with a
+        # disambiguation message and short-circuits. Runs before cap so cap
+        # checks can consult ctx.server.backend.
+        if spec["needs_server"] and self._resolve is not None:
+            if not self._resolve(ctx):
+                return
+        # Liveness gate: commands that act on the live server (backup, allowlist,
+        # per-player restore) are refused with a clear message when the server
+        # process is down — instead of failing with a transport error. The admin
+        # brings it up with /start (or /restore to recover).
+        if spec["needs_online"] and ctx.server is not None \
+                and not ctx.server.backend.is_online():
+            ctx.reply(f"⚠️ {ctx.server.config.name} is offline — /{name} needs "
+                      "the server running. Start it with /start.")
+            return
+        if spec["cap"] is not None and not spec["cap"](ctx):
             if spec["cap_message"]:
                 ctx.reply(spec["cap_message"])
             return

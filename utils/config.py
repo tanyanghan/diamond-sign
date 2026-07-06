@@ -1,161 +1,97 @@
-"""Central configuration for mcnotifier.
+"""Central configuration for Diamond Sign.
 
-All environment reading happens here so the rest of the code receives a single
-``ServerConfig`` object instead of scattering ``os.environ`` lookups and
-hardcoded paths across modules. The config is edition-aware (Java vs Bedrock)
-and is injected into the server backends.
+Loads a hierarchical JSON config (``diamondsign.json``): a list of **bots**, each
+with its chat identity (Telegram/Slack tokens + platforms) and a list of
+Minecraft **servers**. This lets one process run either shape — many
+single-server bots, or one bot fronting several servers, or any mix.
 
-Also hosts a couple of small world-layout helpers (``read_server_properties``,
-``get_level_name``) that both ``bot.py`` and the backends need; keeping them
-here avoids a circular import between ``bot.py`` and ``backends``.
+The rest of the code receives an ``AppConfig`` (``.bots`` -> ``BotConfig`` ->
+``.servers`` -> ``ServerConfig``). Each ``ServerConfig`` is per-server (edition,
+dir, rcon/mux, backups) and owns its ``data_dir`` (``data/<server-name>/``);
+chat tokens live on ``BotConfig``.
+
+Also hosts the world-layout helpers (``read_server_properties``,
+``get_level_name``) shared by ``bot.py`` and the backends.
 """
 
+import json
 import os
 import re
 import shlex
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 # Recognised server editions.
 EDITION_JAVA = "java"
 EDITION_BEDROCK = "bedrock"
 _EDITIONS = (EDITION_JAVA, EDITION_BEDROCK)
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_ENV_PATH = _REPO_ROOT / ".env"
-_ENV_EXAMPLE_PATH = _REPO_ROOT / ".env.example"
+_KNOWN_PLATFORMS = ("telegram", "slack")
 
-# A line like ``KEY=value`` or a commented ``#KEY=value`` placeholder.
-_SETTING_RE = re.compile(r"^\s*#?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_PATH = _REPO_ROOT / "diamondsign.json"
+_EXAMPLE_PATH = _REPO_ROOT / "diamondsign.example.json"
+_DATA_DIR = _REPO_ROOT / "data"            # per-server state lives in data/<key>/
 
 
 class ConfigError(Exception):
-    """Raised when the .env is missing or misconfigured. The message lists every
-    problem; the caller (bot.py) prints it and stops."""
+    """Raised when the config is missing or misconfigured. The message lists
+    every problem; the caller (bot.py) prints it and stops."""
 
 
-def _active_env_values(text: str) -> dict:
-    """{key: raw_value} for the uncommented settings in a .env body — the user's
-    data, preserved verbatim (everything after the first ``=``)."""
-    out = {}
-    for line in text.splitlines():
-        if line.lstrip().startswith("#"):
-            continue
-        m = _SETTING_RE.match(line)
-        if m:
-            out[m.group(1)] = m.group(2)
-    return out
+def _slug(name: str) -> str:
+    """Filesystem-safe directory key for a server name (data/<key>/)."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip()).strip("-._")
+    return s or "server"
 
 
-def _example_settings(text: str) -> dict:
-    """{key: (is_commented, value)} for every setting in .env.example. Used to
-    detect a .env value that's still the example placeholder."""
-    out = {}
-    for line in text.splitlines():
-        m = _SETTING_RE.match(line)
-        if m:
-            out[m.group(1)] = (line.lstrip().startswith("#"), m.group(2).strip())
-    return out
-
-
-def sync_env_from_example(env_path=_ENV_PATH, example_path=_ENV_EXAMPLE_PATH) -> list:
-    """Rewrite .env so it mirrors .env.example line for line, filling in the
-    user's existing values for each key as it goes.
-
-    The result has the exact same ordering, comments and blank lines as the
-    template, with the user's active settings substituted in — so .env and
-    .env.example diff cleanly at a glance. Existing values are preserved; any
-    user settings not present in the template are kept under a trailing marker.
-    Returns the list of template keys newly introduced (or a single sentinel when
-    .env was created from scratch). Idempotent and best-effort — a write failure
-    is non-fatal, and an already-aligned .env is left untouched.
-    """
-    env_path, example_path = Path(env_path), Path(example_path)
-    if not example_path.exists():
-        return []
-    example_text = example_path.read_text()
-
-    if not env_path.exists():
-        try:
-            env_path.write_text(example_text)
-        except OSError:
-            return []
-        return ["(created .env from .env.example)"]
-
-    old_text = env_path.read_text()
-    user_values = _active_env_values(old_text)          # the user's data to keep
-    present_before = {m.group(1) for line in old_text.splitlines()
-                      if (m := _SETTING_RE.match(line))}
-
-    out, used = [], set()
-    for line in example_text.splitlines():
-        m = _SETTING_RE.match(line)
-        if m and m.group(1) in user_values:
-            key = m.group(1)
-            out.append(f"{key}={user_values[key]}")     # fill in the user's value
-            used.add(key)
-        else:
-            out.append(line)                             # comment / blank / placeholder
-            if m:
-                used.add(m.group(1))
-
-    leftover = [k for k in user_values if k not in used]
-    if leftover:                                         # keys not in the template
-        out += ["", "# --- settings not in .env.example (kept) ---"]
-        out += [f"{k}={user_values[k]}" for k in leftover]
-
-    new_text = "\n".join(out) + "\n"
-    if new_text != old_text:
-        try:
-            env_path.write_text(new_text)
-        except OSError:
-            return []
-    return [k for k in used if k not in present_before]
-
-
+# ---------------------------------------------------------------------------
+# Config dataclasses
+# ---------------------------------------------------------------------------
 @dataclass
 class ServerConfig:
-    """Resolved runtime configuration.
-
-    ``minecraft_dir`` and ``backup_dir`` are stored as ``Path`` objects so call
-    sites don't have to wrap them. ``log_path`` is derived from the edition:
-    Java writes ``logs/latest.log``; Bedrock has no such file, so the bot tails
-    the captured-stdout ``console.log`` instead.
-    """
-    bot_token: str
+    """One Minecraft server. ``log_path`` is derived from the edition (Java:
+    ``logs/latest.log``; Bedrock tails the captured-stdout ``console.log``).
+    ``data_dir`` is where this server's state files live, namespaced by name."""
+    name: str
     edition: str
     minecraft_dir: Path
     backup_dir: Path
 
-    # Chat platforms served simultaneously (e.g. ["telegram", "slack"]).
-    chat_platforms: tuple = ("telegram",)
-    slack_bot_token: str = ""   # xoxb-… (Slack Web API)
-    slack_app_token: str = ""   # xapp-… (Slack Socket Mode)
-
-    # Java (RCON) transport
+    # Edition-specific settings — parsed from the nested "edition" object
+    # ({"type": ..., ...}). rcon.* is Java-only; console_log and
+    # bedrock_script_events are Bedrock-only.
     rcon_host: str = "localhost"
     rcon_port: int = 25575
     rcon_password: str = ""
-
-    # Bedrock (terminal multiplexer) transport
     console_log: Path | None = None
-    mux_session: str = ""
-    # Command sent to the mux window to relaunch BDS after a player restore's
-    # stop->edit->restart. Derived from minecraft_dir if not set explicitly.
-    mux_start_cmd: str = ""
+    bedrock_script_events: bool = False
 
-    # Bedrock Script-API events (via the bedrock_pack behavior pack).
-    bedrock_script_events: bool = False   # ingest death markers; enables /deaths
-    chat_relay: bool = False              # relay in-game chat to the chat platforms
+    # Shared (both editions), parsed from the server top level:
+    #   mux — Bedrock's console transport AND Java's optional /restore restart;
+    #   chat_relay — relay in-game chat to the chat platforms (an on/off toggle;
+    #   on Bedrock it additionally requires bedrock_script_events).
+    mux_session: str = ""
+    mux_start_cmd: str = ""
+    chat_relay: bool = False
 
     # Backup behaviour (edition-agnostic)
     incremental_enabled: bool = False
     incremental_interval_minutes: int = 15
     backup_hour: int = 4
     backup_schedule: str = "daily"
+    # Optional off-server copy run after each backup; "{file}" is replaced with
+    # the backup zip path (e.g. "rsync -az {file} user@nas:/backups/"). Empty
+    # disables the copy step.
+    backup_copy_cmd: str = ""
+    # World-restore (/restore): take a fresh full backup of the CURRENT world
+    # before wiping it (a recoverable pre-restore snapshot). Off by default
+    # (faster, less disk); when off, /restore is a direct stop -> wipe -> extract.
+    pre_restore_backup: bool = False
+    # Seconds of in-game "server restoring, you'll be disconnected" warning before
+    # /restore stops the server.
+    restore_warning_seconds: int = 15
 
     @property
     def log_path(self) -> Path:
@@ -163,70 +99,221 @@ class ServerConfig:
             return self.console_log or (self.minecraft_dir / "console.log")
         return self.minecraft_dir / "logs" / "latest.log"
 
+    @property
+    def key(self) -> str:
+        """Unique, filesystem-safe key used for ``data/<key>/``."""
+        return _slug(self.name)
 
-def _env_bool(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
-
-
-_KNOWN_PLATFORMS = ("telegram", "slack")
-
-
-def _platforms() -> tuple:
-    """Configured chat platforms (csv), defaulting to telegram; not yet filtered
-    to the known set (so validation can flag unknown entries)."""
-    return tuple(p.strip().lower() for p in
-                 os.environ.get("CHAT_PLATFORMS", "telegram").split(",")
-                 if p.strip()) or ("telegram",)
+    @property
+    def data_dir(self) -> Path:
+        return _DATA_DIR / self.key
 
 
-def _missing_value(key: str, example: dict) -> bool:
-    """True if a required key is unset or still the example placeholder."""
-    val = os.environ.get(key, "").strip()
-    if not val:
-        return True
-    commented, exval = example.get(key, (True, ""))
-    return (not commented) and val == exval  # untouched placeholder
+@dataclass
+class BotConfig:
+    """One chat identity (one Telegram bot and/or one Slack app) serving a set
+    of servers. Token attribute names match the old ServerConfig so the chat
+    adapters need no changes."""
+    name: str
+    platforms: tuple = ("telegram",)
+    bot_token: str = ""          # Telegram (from @BotFather)
+    slack_bot_token: str = ""    # xoxb-… (Slack Web API)
+    slack_app_token: str = ""    # xapp-… (Slack Socket Mode)
+    servers: list = field(default_factory=list)   # list[ServerConfig]
 
 
-def _collect_problems(example: dict) -> list:
-    """Return a human-readable list of every missing/misconfigured required
-    field, read from the current environment. Empty list means good to go."""
+@dataclass
+class AppConfig:
+    """The whole config: every bot (each with its servers)."""
+    bots: list = field(default_factory=list)      # list[BotConfig]
+
+    def all_servers(self) -> list:
+        return [s for b in self.bots for s in b.servers]
+
+    def bot(self, name: str):
+        for b in self.bots:
+            if b.name == name:
+                return b
+        return None
+
+
+# ---------------------------------------------------------------------------
+# JSON -> dataclasses
+# ---------------------------------------------------------------------------
+def _server_from_dict(d: dict) -> ServerConfig:
+    # Edition-specific settings are nested under "edition": a tagged object
+    # {"type": "java"|"bedrock", ...}. Java carries "rcon"; Bedrock carries
+    # "bedrock_script_events" and "console_log". A bare string (or a missing
+    # object) still names the type — there are then no nested settings, and
+    # validate_config flags an unknown/blank type.
+    ed = d.get("edition")
+    if not isinstance(ed, dict):
+        ed = {"type": ed} if isinstance(ed, str) else {}
+    edition = (ed.get("type") or EDITION_JAVA).strip().lower()
+
+    mc_raw = (d.get("minecraft_dir") or "").strip()
+    mc_dir = Path(os.path.expanduser(mc_raw)) if mc_raw else None
+    name = (d.get("name") or "").strip()
+    if not name and mc_dir is not None:
+        # Fall back to the Minecraft level-name, slugified: the user didn't type
+        # this, and level-names routinely contain spaces (e.g. "Bedrock level"),
+        # so make it a safe key rather than tripping name validation. An
+        # explicitly-set name is left as-is and validated (see validate_config).
+        name = _slug(get_level_name(mc_dir))
+
+    rcon = ed.get("rcon") or {}          # Java-only (under "edition")
+    mux = d.get("mux") or {}             # shared (server top level)
+    backup = d.get("backup") or {}
+    incr = backup.get("incremental") or {}
+
+    backup_dir = Path(os.path.expanduser(backup.get("dir") or "~/minecraft_backup"))
+
+    console_cfg = ed.get("console_log")  # Bedrock-only (under "edition")
+    console_raw = console_cfg.strip() if isinstance(console_cfg, str) else ""
+    if console_raw:
+        console_log = Path(os.path.expanduser(console_raw))
+    elif edition == EDITION_BEDROCK and mc_dir is not None:
+        console_log = mc_dir / "console.log"
+    else:
+        console_log = None
+
+    mux_start = (mux.get("start_cmd") or "").strip()
+    if not mux_start and edition == EDITION_BEDROCK and mc_dir is not None:
+        log_target = console_log or (mc_dir / "console.log")
+        mux_start = (f"cd {shlex.quote(mc_dir.as_posix())} && "
+                     f"./bedrock_server 2>&1 | tee -a "
+                     f"{shlex.quote(log_target.as_posix())}")
+
+    return ServerConfig(
+        name=name,
+        edition=edition,
+        minecraft_dir=mc_dir if mc_dir is not None else Path(""),
+        backup_dir=backup_dir,
+        rcon_host=(rcon.get("host") or "localhost"),
+        rcon_port=int(rcon.get("port") or 25575),
+        rcon_password=(rcon.get("password") or ""),
+        console_log=console_log,
+        bedrock_script_events=bool(ed.get("bedrock_script_events", False)),
+        mux_session=(mux.get("session") or "").strip(),
+        mux_start_cmd=mux_start,
+        chat_relay=bool(d.get("chat_relay", False)),
+        incremental_enabled=bool(incr.get("enabled", False)),
+        incremental_interval_minutes=int(incr.get("interval_minutes") or 15),
+        backup_hour=int(backup.get("hour") or 4),
+        backup_schedule=(backup.get("schedule") or "daily").lower(),
+        backup_copy_cmd=(backup.get("copy_cmd") or "").strip(),
+        pre_restore_backup=bool(backup.get("pre_restore_backup", False)),
+        restore_warning_seconds=int(backup.get("restore_warning_seconds") or 15),
+    )
+
+
+def _bot_from_dict(d: dict) -> BotConfig:
+    platforms = tuple(str(p).strip().lower()
+                      for p in (d.get("platforms") or ["telegram"])
+                      if str(p).strip()) or ("telegram",)
+    tg = d.get("telegram") or {}
+    sl = d.get("slack") or {}
+    return BotConfig(
+        name=(d.get("name") or "").strip(),
+        platforms=platforms,
+        bot_token=(tg.get("bot_token") or "").strip(),
+        slack_bot_token=(sl.get("bot_token") or "").strip(),
+        slack_app_token=(sl.get("app_token") or "").strip(),
+        servers=[_server_from_dict(s) for s in (d.get("servers") or [])],
+    )
+
+
+def _app_from_dict(doc: dict) -> AppConfig:
+    return AppConfig(bots=[_bot_from_dict(b) for b in (doc.get("bots") or [])])
+
+
+# Track which server had no explicit minecraft_dir so validation can flag it
+# (Path("") would otherwise resolve to ".", which is a real directory).
+def _has_dir(server: ServerConfig) -> bool:
+    return str(server.minecraft_dir) not in ("", ".")
+
+
+def validate_config(app: AppConfig) -> list:
+    """Return a human-readable list of every problem; empty means good to go."""
     problems = []
+    if not app.bots:
+        problems.append('no bots configured (need at least one entry under "bots")')
 
-    minecraft_dir = os.environ.get("MINECRAFT_DIR", "").strip()
-    if _missing_value("MINECRAFT_DIR", example):
-        problems.append("MINECRAFT_DIR: set it to your Minecraft server directory")
-    elif not Path(os.path.expanduser(minecraft_dir)).is_dir():
-        problems.append(f"MINECRAFT_DIR: directory does not exist: {minecraft_dir}")
+    seen_bots = set()
+    seen_keys = {}
+    for bi, bot in enumerate(app.bots):
+        blabel = bot.name or f"bot[{bi}]"
+        if not bot.name:
+            problems.append(f"{blabel}: missing \"name\"")
+        elif bot.name in seen_bots:
+            problems.append(f"bot name '{bot.name}' is used more than once")
+        seen_bots.add(bot.name)
 
-    platforms = _platforms()
-    bad = [p for p in platforms if p not in _KNOWN_PLATFORMS]
-    if bad:
-        problems.append(f"CHAT_PLATFORMS: unknown {bad}; "
-                        f"allowed: {list(_KNOWN_PLATFORMS)}")
-    platforms = tuple(p for p in platforms if p in _KNOWN_PLATFORMS) or ("telegram",)
+        bad = [p for p in bot.platforms if p not in _KNOWN_PLATFORMS]
+        if bad:
+            problems.append(f"{blabel}: unknown platforms {bad}; "
+                            f"allowed {list(_KNOWN_PLATFORMS)}")
+        if "telegram" in bot.platforms and not bot.bot_token:
+            problems.append(f"{blabel}: telegram.bot_token required for telegram "
+                            "(get one from @BotFather)")
+        if "slack" in bot.platforms:
+            if not bot.slack_bot_token:
+                problems.append(f"{blabel}: slack.bot_token required (xoxb-...)")
+            if not bot.slack_app_token:
+                problems.append(f"{blabel}: slack.app_token required (xapp-...)")
 
-    if "telegram" in platforms and _missing_value("BOT_TOKEN", example):
-        problems.append("BOT_TOKEN: required for telegram (get one from @BotFather)")
-    if "slack" in platforms:
-        if not os.environ.get("SLACK_BOT_TOKEN", "").strip():
-            problems.append("SLACK_BOT_TOKEN: required for slack (xoxb-...)")
-        if not os.environ.get("SLACK_APP_TOKEN", "").strip():
-            problems.append("SLACK_APP_TOKEN: required for slack (xapp-...)")
-
-    edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
-    if edition not in _EDITIONS:
-        problems.append(f"SERVER_EDITION: must be one of {list(_EDITIONS)} "
-                        f"(got '{edition}')")
+        if not bot.servers:
+            problems.append(f"{blabel}: has no servers")
+        for si, s in enumerate(bot.servers):
+            slabel = f"{blabel} / {s.name or f'server[{si}]'}"
+            if not _has_dir(s):
+                problems.append(f"{slabel}: minecraft_dir is required")
+            elif not s.minecraft_dir.is_dir():
+                problems.append(f"{slabel}: minecraft_dir does not exist: "
+                                f"{s.minecraft_dir}")
+            if s.edition not in _EDITIONS:
+                problems.append(f"{slabel}: edition.type must be one of "
+                                f"{list(_EDITIONS)} (got '{s.edition}')")
+            # Bedrock relays in-game chat via the behavior pack's script events,
+            # so chat_relay there depends on edition.bedrock_script_events. Java
+            # parses chat from its log and has no such dependency.
+            if (s.edition == EDITION_BEDROCK and s.chat_relay
+                    and not s.bedrock_script_events):
+                problems.append(
+                    f"{slabel}: chat_relay needs edition.bedrock_script_events = "
+                    "true on Bedrock (chat is relayed through the behavior pack's "
+                    "script events). Enable script events, or turn chat_relay off.")
+            if not s.name:
+                problems.append(f"{slabel}: could not determine a server name; "
+                                "set \"name\"")
+            elif _slug(s.name) != s.name:
+                # The name is used verbatim as the data-dir key, the chat->server
+                # binding, and the /use & /authorize argument, so it must be
+                # filesystem- and command-token-safe: letters, digits, '.', '_',
+                # '-' only, no spaces.
+                problems.append(
+                    f"{slabel}: server name '{s.name}' isn't allowed — use only "
+                    f"letters, digits, '.', '_' and '-' with no spaces (replace "
+                    f"each space with '-' or '_'). Try \"{_slug(s.name)}\".")
+            else:
+                key = s.key
+                if key in seen_keys:
+                    problems.append(
+                        f"server name '{s.name}' collides with '{seen_keys[key]}'; "
+                        f"give one a unique \"name\"")
+                else:
+                    seen_keys[key] = s.name
     return problems
 
 
+def _write_doc(path: Path, doc: dict) -> None:
+    path.write_text(json.dumps(doc, indent=2) + "\n")
+
+
 # ---------------------------------------------------------------------------
-# Interactive first-run setup
+# Interactive first-run setup (emits diamondsign.json)
 # ---------------------------------------------------------------------------
 def _interactive() -> bool:
-    """True only when both stdin and stdout are real terminals, so the wizard
-    never blocks a piped/systemd launch on input()."""
     try:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except Exception:
@@ -234,8 +321,6 @@ def _interactive() -> bool:
 
 
 def _prompt(question: str, default: str = "", validate=None) -> str:
-    """Ask one question, re-prompting until a non-empty (and, if given, valid)
-    answer is supplied. ``validate`` returns an error string or None."""
     while True:
         suffix = f" [{default}]" if default else ""
         ans = input(f"  {question}{suffix}: ").strip() or default
@@ -250,165 +335,137 @@ def _prompt(question: str, default: str = "", validate=None) -> str:
         return ans
 
 
-def _set_env_values(env_path, values: dict) -> None:
-    """Write each KEY=value into the .env file, updating the key in place
-    (uncommenting a placeholder line if present) or appending it. All other
-    lines and comments are preserved."""
-    path = Path(env_path)
-    lines = path.read_text().splitlines() if path.exists() else []
-    remaining = dict(values)
-    for i, line in enumerate(lines):
-        m = _SETTING_RE.match(line)
-        if m and m.group(1) in remaining:
-            key = m.group(1)
-            lines[i] = f"{key}={remaining.pop(key)}"
-    for key, val in remaining.items():
-        lines.append(f"{key}={val}")
-    path.write_text("\n".join(lines) + "\n")
+def _wizard_doc() -> dict:
+    """Prompt for a single bot + single server and return a config doc."""
+    print("\nDiamond Sign setup")
+    print("No config found. Answer the prompts to get started")
+    print(f"(saved to {_CONFIG_PATH}; press Ctrl-C to abort).\n")
 
-
-def run_setup_wizard(example: dict) -> None:
-    """Interactively prompt for the missing/misconfigured required fields, then
-    persist the answers to ``.env`` (and the current environment). Only asks
-    about fields that are actually missing, so a partially-filled .env just
-    fills the gaps. Raises EOFError/KeyboardInterrupt if the user aborts."""
-    print("\nmcnotifier setup")
-    print("Some required settings are missing. Answer the prompts to get started")
-    print(f"(saved to {_ENV_PATH}; press Ctrl-C to abort).\n")
-
-    answers = {}
-
-    def _record(key, value):
-        answers[key] = value
-        os.environ[key] = value          # so later prompts see the new value
-
-    # Edition and platforms are quick choices with sensible defaults, so always
-    # confirm them (the current/sensible value pre-fills as a one-key default);
-    # the wizard only runs at setup time, so this isn't asked on healthy starts.
-    cur_edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
-    _record("SERVER_EDITION", _prompt(
-        f"Server edition ({'/'.join(_EDITIONS)})",
-        default=cur_edition if cur_edition in _EDITIONS else EDITION_JAVA,
+    edition = _prompt(
+        f"Server edition ({'/'.join(_EDITIONS)})", default=EDITION_JAVA,
         validate=lambda v: None if v.lower() in _EDITIONS
-        else f"choose one of: {', '.join(_EDITIONS)}").lower())
-
-    mc = os.environ.get("MINECRAFT_DIR", "").strip()
-    if _missing_value("MINECRAFT_DIR", example) or \
-            not Path(os.path.expanduser(mc)).is_dir():
-        _record("MINECRAFT_DIR", _prompt(
-            "Minecraft server directory",
-            validate=lambda v: None if Path(os.path.expanduser(v)).is_dir()
-            else "no such directory; check the path and try again"))
+        else f"choose one of: {', '.join(_EDITIONS)}").lower()
+    mc = _prompt("Minecraft server directory",
+                 validate=lambda v: None if Path(os.path.expanduser(v)).is_dir()
+                 else "no such directory; check the path and try again")
 
     def _vplat(v):
         bad = [p.strip().lower() for p in v.split(",")
                if p.strip() and p.strip().lower() not in _KNOWN_PLATFORMS]
         return (f"unknown: {bad}; allowed: {', '.join(_KNOWN_PLATFORMS)}"
                 if bad else None)
-    cur_plats = _platforms()
-    plat_default = ",".join(cur_plats) if all(
-        p in _KNOWN_PLATFORMS for p in cur_plats) else "telegram"
-    raw = _prompt(f"Chat platforms ({', '.join(_KNOWN_PLATFORMS)}; "
-                  "comma-separated)", default=plat_default, validate=_vplat)
-    _record("CHAT_PLATFORMS",
-            ",".join(p.strip().lower() for p in raw.split(",") if p.strip()))
+    raw = _prompt(f"Chat platforms ({', '.join(_KNOWN_PLATFORMS)}; comma-separated)",
+                  default="telegram", validate=_vplat)
+    platforms = [p.strip().lower() for p in raw.split(",") if p.strip()]
 
-    platforms = tuple(p for p in _platforms() if p in _KNOWN_PLATFORMS) \
-        or ("telegram",)
-    if "telegram" in platforms and _missing_value("BOT_TOKEN", example):
-        _record("BOT_TOKEN", _prompt("Telegram bot token (from @BotFather)"))
+    bot = {"name": "default", "platforms": platforms,
+           "servers": [{"edition": {"type": edition}, "minecraft_dir": mc}]}
+    if "telegram" in platforms:
+        bot["telegram"] = {"bot_token":
+                           _prompt("Telegram bot token (from @BotFather)")}
     if "slack" in platforms:
-        if not os.environ.get("SLACK_BOT_TOKEN", "").strip():
-            _record("SLACK_BOT_TOKEN", _prompt("Slack bot token (xoxb-...)"))
-        if not os.environ.get("SLACK_APP_TOKEN", "").strip():
-            _record("SLACK_APP_TOKEN", _prompt("Slack app token (xapp-...)"))
-
-    if answers:
-        _set_env_values(_ENV_PATH, answers)
-    print(f"\nSaved {len(answers)} setting(s) to {_ENV_PATH}. Starting mcnotifier...\n")
+        bot["slack"] = {"bot_token": _prompt("Slack bot token (xoxb-...)"),
+                        "app_token": _prompt("Slack app token (xapp-...)")}
+    return {"version": 1, "bots": [bot]}
 
 
-def load_config() -> ServerConfig:
-    """Load and validate configuration from ``.env``.
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def load_config() -> AppConfig:
+    """Load and validate the Diamond Sign config.
 
-    On startup the .env is first brought up to date with .env.example (missing
-    fields and their comments are appended; existing values are kept). Required
-    fields are then validated: if any are missing/misconfigured and the launch
-    is interactive, a setup wizard prompts for them and writes the answers back
-    to .env. Anything still unresolved is collected and raised together as a
-    single ``ConfigError`` so the bot stops with a clear, complete list.
+    Order of precedence: an existing ``diamondsign.json``; else a first-run
+    wizard (interactive) or an emitted example + ``ConfigError``
+    (non-interactive). All problems are collected and raised together as one
+    ``ConfigError``.
     """
-    added = sync_env_from_example(_ENV_PATH, _ENV_EXAMPLE_PATH)
-    load_dotenv(_ENV_PATH)
-
-    example = (_example_settings(_ENV_EXAMPLE_PATH.read_text())
-               if _ENV_EXAMPLE_PATH.exists() else {})
-
-    problems = _collect_problems(example)
-    if problems and _interactive():
+    if _CONFIG_PATH.exists():
         try:
-            run_setup_wizard(example)
+            doc = json.loads(_CONFIG_PATH.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise ConfigError(f"Could not read {_CONFIG_PATH}: {e}")
+        app = _app_from_dict(doc)
+    elif _interactive():
+        try:
+            doc = _wizard_doc()
         except (EOFError, KeyboardInterrupt):
-            print("\nSetup cancelled.\n", file=sys.stderr)
-        problems = _collect_problems(example)   # re-validate after the wizard
+            raise ConfigError("Setup cancelled.")
+        app = _app_from_dict(doc)
+        try:
+            _write_doc(_CONFIG_PATH, doc)
+            print(f"\nSaved {_CONFIG_PATH.name}. Starting Diamond Sign...\n")
+        except OSError:
+            pass
+    else:
+        try:
+            _write_doc(_EXAMPLE_PATH, _EXAMPLE_DOC)
+        except OSError:
+            pass
+        raise ConfigError(
+            f"No config found. A template was written to {_EXAMPLE_PATH.name}; "
+            f"fill it in and save it as {_CONFIG_PATH.name}.")
 
+    problems = validate_config(app)
     if problems:
-        msg = ("mcnotifier cannot start - fix the following in "
-               f"{_ENV_PATH}:\n" + "\n".join(f"  - {p}" for p in problems))
-        if added and added != ["(created .env from .env.example)"]:
-            msg += "\n\n(.env was updated with new template fields: "
-            msg += ", ".join(added) + ")"
-        elif added:
-            msg += "\n\n(a fresh .env was created from .env.example - fill it in)"
-        raise ConfigError(msg)
+        raise ConfigError("Diamond Sign cannot start - fix the following in "
+                          f"{_CONFIG_PATH}:\n"
+                          + "\n".join(f"  - {p}" for p in problems))
+    # Non-fatal: a Java server without an RCON password still gets log-driven
+    # notifications, but /status, /backup save-flush, and /allowlist need RCON.
+    for s in app.all_servers():
+        if s.edition == EDITION_JAVA and not s.rcon_password:
+            print(f"Warning: server '{s.name}' has no rcon.password — "
+                  "commands and backups that need RCON will be unavailable.",
+                  file=sys.stderr)
+        # World restore (/restore) needs BOTH a mux session and a start command
+        # to restart the server; one without the other can't restart it. (Bedrock
+        # synthesizes a start_cmd and may auto-detect the session, so this only
+        # meaningfully applies to Java, where both are operator-provided.)
+        if s.edition == EDITION_JAVA and bool(s.mux_session) != bool(s.mux_start_cmd):
+            missing = "mux.start_cmd" if s.mux_session else "mux.session"
+            print(f"Warning: server '{s.name}' sets one of mux.session/"
+                  f"mux.start_cmd but not the other ({missing} is empty) — "
+                  "/restore can't restart this server until both are set.",
+                  file=sys.stderr)
+    return app
 
-    edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
-    minecraft_dir = os.environ.get("MINECRAFT_DIR", "").strip()
-    platforms = tuple(p for p in _platforms() if p in _KNOWN_PLATFORMS) \
-        or ("telegram",)
-    bot_token = os.environ.get("BOT_TOKEN", "").strip()
-    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-    slack_app_token = os.environ.get("SLACK_APP_TOKEN", "").strip()
 
-    mc_dir = Path(minecraft_dir)
-    backup_dir = Path(os.path.expanduser(
-        os.environ.get("BACKUP_DIR", "~/minecraft_backup")))
-
-    console_log_env = os.environ.get("CONSOLE_LOG", "").strip()
-    console_log = Path(os.path.expanduser(console_log_env)) if console_log_env \
-        else (mc_dir / "console.log" if edition == EDITION_BEDROCK else None)
-
-    # Relaunch command for the mux window. Default mirrors the documented launch
-    # (`./bedrock_server 2>&1 | tee -a console.log` from the server dir); override
-    # with MUX_START_CMD for non-standard setups.
-    mux_start_cmd = os.environ.get("MUX_START_CMD", "").strip()
-    if not mux_start_cmd and edition == EDITION_BEDROCK:
-        log_target = console_log if console_log else (mc_dir / "console.log")
-        mux_start_cmd = (f"cd {shlex.quote(mc_dir.as_posix())} && "
-                         f"./bedrock_server 2>&1 | tee -a {shlex.quote(log_target.as_posix())}")
-
-    return ServerConfig(
-        bot_token=bot_token,
-        edition=edition,
-        minecraft_dir=mc_dir,
-        backup_dir=backup_dir,
-        chat_platforms=platforms,
-        slack_bot_token=slack_bot_token,
-        slack_app_token=slack_app_token,
-        rcon_host=os.environ.get("RCON_HOST", "localhost"),
-        rcon_port=int(os.environ.get("RCON_PORT", "25575")),
-        rcon_password=os.environ.get("RCON_PASSWORD", ""),
-        console_log=console_log,
-        mux_session=os.environ.get("MUX_SESSION", "").strip(),
-        mux_start_cmd=mux_start_cmd,
-        bedrock_script_events=_env_bool("BEDROCK_SCRIPT_EVENTS"),
-        chat_relay=_env_bool("CHAT_RELAY"),
-        incremental_enabled=_env_bool("INCREMENTAL_BACKUP_ENABLED"),
-        incremental_interval_minutes=int(
-            os.environ.get("INCREMENTAL_INTERVAL_MINUTES", "15")),
-        backup_hour=int(os.environ.get("BACKUP_HOUR", "4")),
-        backup_schedule=os.environ.get("BACKUP_SCHEDULE", "daily").lower(),
-    )
+_EXAMPLE_DOC = {
+    "version": 1,
+    "bots": [
+        {
+            "name": "default",
+            "platforms": ["telegram"],
+            "telegram": {"bot_token": "123456:your-telegram-bot-token"},
+            "servers": [
+                {
+                    "name": "survival",
+                    "edition": {"type": "java",
+                                "rcon": {"password": "your_rcon_password"}},
+                    "minecraft_dir": "/path/to/your/server",
+                    "chat_relay": True,   # relay in-game chat to the chat platform(s)
+                    "backup": {"dir": "~/minecraft_backup", "schedule": "daily",
+                               "hour": 4,
+                               "copy_cmd": "",  # e.g. "rsync -az {file} user@nas:/backups/"
+                               "incremental": {"enabled": True,
+                                               "interval_minutes": 15}},
+                }
+                # A Bedrock server instead would look like:
+                # {
+                #     "name": "bedrock-smp",
+                #     "edition": {"type": "bedrock",
+                #                 "bedrock_script_events": True,
+                #                 "console_log": None},   # None -> <dir>/console.log
+                #     "minecraft_dir": "/path/to/bedrock",
+                #     "mux": {"session": "", "start_cmd": ""},
+                #     "chat_relay": True,   # Bedrock needs bedrock_script_events too
+                #     "backup": {"dir": "~/bedrock_backup"},
+                # }
+            ],
+        }
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +476,7 @@ def read_server_properties(minecraft_dir: Path) -> dict:
 
     Java .properties files escape special characters with backslashes
     (e.g. ``\\!`` ``\\:`` ``\\=`` ``\\\\``). Values are unescaped so they
-    compare cleanly against equivalents from .env. Returns an empty dict if the
+    compare cleanly against equivalents from config. Returns an empty dict if the
     file is missing or unreadable. (Bedrock also ships a server.properties with
     a ``level-name`` key, so this is edition-agnostic.)
     """
@@ -451,17 +508,13 @@ def get_level_name(minecraft_dir: Path) -> str:
     return read_server_properties(minecraft_dir).get("level-name", "world")
 
 
-def backup_exclude_names() -> set:
+def backup_exclude_names(server: ServerConfig) -> set:
     """Basenames to exclude from backups (and the change manifest) in addition
-    to the chain marker, derived from the current environment.
-
-    This is bot infrastructure that lives in the server directory but isn't
-    server data — the Bedrock ``console.log`` the bot tails. Shared by ``bot.py``
-    and ``restore.py`` so both keep the backup zips and the manifest in sync.
-    Assumes ``.env`` is already loaded.
+    to the chain marker, for one server: bot infrastructure that lives in the
+    server directory but isn't server data — the Bedrock ``console.log`` the bot
+    tails. Shared by ``bot.py`` and ``restore.py`` so both keep the backup zips
+    and the manifest in sync.
     """
-    console_log_env = os.environ.get("CONSOLE_LOG", "").strip()
-    if console_log_env:
-        return {Path(console_log_env).name}
-    edition = os.environ.get("SERVER_EDITION", EDITION_JAVA).strip().lower()
-    return {"console.log"} if edition == EDITION_BEDROCK else set()
+    if server.console_log is not None:
+        return {server.console_log.name}
+    return {"console.log"} if server.edition == EDITION_BEDROCK else set()

@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-logger = logging.getLogger("mcnotifier")
+logger = logging.getLogger("diamondsign")
 
 # Serialise all injections process-wide: two senders interleaving keystrokes into
 # the same pane is what corrupted "save hold" into "ave" in the wild. A short
@@ -34,7 +34,27 @@ class ConsoleMultiplexer:
     def __init__(self, target: str):
         self.target = target  # session (tmux) or session name / pid.name (screen)
 
-    def send(self, cmd: str) -> None:  # pragma: no cover - subclass responsibility
+    def send(self, cmd: str) -> None:
+        """Inject one command line, after rejecting any that contains a control
+        character.
+
+        This is the single chokepoint for Bedrock console injection. Every legit
+        command is either a fixed literal (``save hold``, ``list``, …) or
+        ``allowlist <sub> <name>`` whose ``<name>`` came from ``str.split()`` and
+        so can hold no whitespace — a control char here means the input was not
+        what the caller thinks. Refuse rather than send a partial or a second
+        line: a newline would submit an extra console command (injection), and a
+        CR/other control byte can corrupt the keystroke stream. Defence in depth
+        so a future caller that forwards richer text (e.g. shlex-quoted args or a
+        chat relay) can't turn this into a command-injection sink."""
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in cmd):
+            logger.warning("mux: refusing command with control character(s): %r",
+                           cmd)
+            return
+        self._send_line(cmd)
+
+    def _send_line(self, cmd: str) -> None:  # pragma: no cover - subclass duty
+        """Actually inject one already-sanitised command line."""
         raise NotImplementedError
 
     def __repr__(self) -> str:
@@ -75,7 +95,7 @@ class TmuxMux(ConsoleMultiplexer):
             return cls(session) if name in sessions else None
         return cls(sessions[0])
 
-    def send(self, cmd: str) -> None:
+    def _send_line(self, cmd: str) -> None:
         # `-l` sends the command as a LITERAL string so tmux never interprets a
         # word as a key name (and never coalesces/escapes characters). Enter is
         # sent as a separate keystroke. Both are serialised + settled so two
@@ -117,7 +137,7 @@ class ScreenMux(ConsoleMultiplexer):
             return None
         return cls(entries[0])
 
-    def send(self, cmd: str) -> None:
+    def _send_line(self, cmd: str) -> None:
         # `stuff` injects literal text; the trailing newline submits the line.
         # `-p <window>` selects which window of the session receives it.
         # Serialised + settled so commands can't interleave in the window.
