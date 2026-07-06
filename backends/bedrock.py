@@ -305,27 +305,43 @@ class BedrockBackend(ServerBackend):
         relaunch as long as a start command is set (synthesized by default)."""
         return bool(self.config.mux_start_cmd)
 
+    # BDS appends this line to the console as the final step of a clean
+    # shutdown, after the world is saved and closed — the safe-to-edit signal.
+    _SHUTDOWN_MARKER = "Quit correctly"
+
     def stop_server(self, log_fn=None) -> bool:
-        """Request a stop and confirm BDS acknowledged it. Actual shutdown (lock
-        release) is confirmed separately by wait_until_stopped()."""
+        """Request a stop and confirm BDS acknowledged it. Actual shutdown is
+        confirmed separately by wait_until_stopped().
+
+        Registers the shutdown-complete waiter BEFORE sending stop: on a small
+        world BDS prints ``Quit correctly`` within a fraction of a second, so a
+        waiter registered afterwards would miss it. wait_until_stopped() blocks
+        on this waiter."""
         def log(msg):
             if log_fn:
                 log_fn(msg)
+        self._shutdown_waiter = (self._watcher.expect_line(self._SHUTDOWN_MARKER)
+                                 if self._watcher else None)
         ok = self._send_confirmed("stop", "Server stop requested", retries=3, log=log)
         log("Stop requested" if ok else "Warning: 'stop' not confirmed")
         return ok
 
     def _world_process_alive(self, proc_root: Path = Path("/proc")):
         """Whether this server's BDS process is still running — matched by its
-        working directory (the start command ``cd <dir> && ./bedrock_server``
-        leaves the process cwd at ``minecraft_dir``), so a sibling Bedrock server
-        in another dir isn't confused and the binary's name doesn't matter.
+        executable living under this server's ``minecraft_dir`` (the server
+        binary ``<dir>/bedrock_server`` is launched from there).
 
-        Returns True (a process is still in this dir), False (none), or None if
-        the process table can't be read (no ``/proc`` — a non-Linux dev box).
-        Biased to safety: a process we can't attribute is left counted, so we
-        over-wait rather than declare a live server stopped. ``proc_root`` is
-        injectable for testing.
+        Match the *exe*, not the cwd: the start command ``cd <dir> &&
+        ./bedrock_server | tee`` leaves the tmux/screen shell (and ``tee``) with
+        their cwd in the dir even after the server exits — the ``cd`` persists —
+        so a cwd match would never clear. The exe path identifies the server
+        process itself and excludes the shell (``/bin/bash``) and ``tee``
+        (``/usr/bin/tee``), whose executables live outside the dir.
+
+        Sibling-safe (another Bedrock server's exe is under *its* dir) and
+        independent of the binary's name. Returns True / False, or None if the
+        process table can't be read (no ``/proc`` — a non-Linux dev box).
+        ``proc_root`` is injectable for testing.
         """
         if not proc_root.is_dir():
             return None
@@ -334,72 +350,45 @@ class BedrockBackend(ServerBackend):
             if not entry.name.isdigit():
                 continue
             try:
-                cwd = Path(os.readlink(entry / "cwd"))
+                exe = Path(os.readlink(entry / "exe")).resolve()
             except OSError:
                 continue  # process exited between listing and readlink, or not ours
-            try:
-                if cwd.resolve() == target:
-                    return True
-            except OSError:
-                continue
+            if exe.is_relative_to(target):
+                return True
         return False
 
     def wait_until_stopped(self, timeout: float = 120) -> bool:
-        """Wait until BDS has fully exited — safe to edit the world db.
+        """Wait until BDS has fully shut down — safe to edit the world db.
 
-        The reliable signal is the server *process* exiting, which releases the
-        world db. Console silence is NOT enough: after ``stop`` BDS prints
-        "Stopping server..." then goes quiet while it flushes the world and
-        exits, so a console-idle check returns while the process is still alive
-        and still holds the db — the bot would then edit the db and relaunch
-        into a still-running server. So confirm the exit from the process table
-        (see ``_world_process_alive``). Only when that can't be read (no
-        ``/proc``, i.e. off-Linux) do we fall back to the weaker console-idle
-        heuristic.
+        Primary signal: the ``Quit correctly`` line BDS appends to the console
+        (captured in console.log) as the last step of a clean shutdown, after
+        the world is saved and closed. The waiter was registered in
+        stop_server() *before* the stop was sent, so a fast shutdown isn't
+        missed. Console silence is NOT a usable signal on its own — after "stop"
+        BDS prints "Stopping server..." then goes quiet while it flushes and
+        exits, so a quiet console can still mean a live server holding the db.
 
         Deliberately does NOT use the LevelDB lock: this BDS build never locks
-        the world db (there is no LOCK file even while it runs), so the lock
-        always looks free.
+        the world db (there is no LOCK file even while it runs), so it always
+        looks free. If no LogWatcher is attached (unusual), fall back to
+        confirming the server *process* has exited via /proc.
         """
-        deadline = time.time() + timeout
-        proc_checked = False
-        while time.time() < deadline:
-            alive = self._world_process_alive()
-            if alive is None:
-                break  # can't inspect processes here — use the fallback below
-            proc_checked = True
-            if not alive:
-                time.sleep(2)   # settle: let the kernel finish releasing the db
+        waiter = getattr(self, "_shutdown_waiter", None)
+        self._shutdown_waiter = None
+        if waiter is not None:
+            if waiter.wait(timeout):
+                time.sleep(2)   # settle: let the process finish exiting
                 return True
-            time.sleep(2)
-        if proc_checked:
-            return False        # timed out waiting for the process to exit
+            if self._watcher:
+                self._watcher.cancel(waiter)
+            return False
 
-        # Fallback (no /proc, non-Linux): the server stopped answering ``list``
-        # AND console.log stopped growing for several probes. Weaker — a
-        # mid-flush lull can look stopped — but production is Linux, so this path
-        # is only reached in off-Linux development.
-        log_path = self.config.log_path
-
-        def size():
-            try:
-                return log_path.stat().st_size
-            except OSError:
-                return -1
-
-        prev_size = size()
-        misses = 0  # consecutive probes with no console response and no log growth
+        # Fallback (no LogWatcher): confirm the process has exited from /proc.
+        deadline = time.time() + timeout
         while time.time() < deadline:
-            responding = self.is_online()   # sends `list`; grows the log if up
-            cur = size()
-            grew = cur != prev_size
-            prev_size = cur
-            if responding or grew:
-                misses = 0                  # still answering, or still flushing
-            else:
-                misses += 1
-                if misses >= 3:
-                    return True             # quiet + unresponsive -> fully down
+            if self._world_process_alive() is False:
+                time.sleep(2)
+                return True
             time.sleep(2)
         return False
 
@@ -663,7 +652,7 @@ class BedrockBackend(ServerBackend):
                        "Aborting; check the server manually.")
                 return
             db_unlocked = True
-            status("Server stopped (process exited); world db free")
+            status("Server stopped cleanly; world db free")
 
             # 4. Resolve the live data key (per-server), back it up, overwrite.
             db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
