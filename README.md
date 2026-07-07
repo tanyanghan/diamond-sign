@@ -1,3 +1,7 @@
+<p align="center">
+  <img width="384" height="384" alt="Diamond Sign" src="assets/diamond_sign_384x384.png" />
+</p>
+
 # Diamond Sign
 
 A chat bot that watches your Minecraft server(s) and keeps you in the loop from
