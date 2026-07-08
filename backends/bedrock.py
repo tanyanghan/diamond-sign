@@ -264,8 +264,15 @@ class BedrockBackend(ServerBackend):
         time.sleep(1)
         if self._send_confirmed("save hold", "Saving...", retries=2, log=log):
             log("Save held")
-        else:
-            log("Warning: 'save hold' not confirmed after retries, proceeding anyway")
+            return
+        # Still nothing. Before flooding the console with `save query` polls,
+        # distinguish "server is slow" from "server is not running at all": if
+        # the pane is back at a shell prompt, every injected line is being typed
+        # into the SHELL, not the server — abort the backup instead.
+        if self.probe_stopped(timeout=8) is True:
+            raise RuntimeError("server is not running (its console is at a "
+                               "shell prompt) — cannot take a live backup")
+        log("Warning: 'save hold' not confirmed after retries, proceeding anyway")
 
     def files_ready(self, log_fn=None):
         """Poll `save query` until the snapshot is ready; return [(path, bytes)].
@@ -595,26 +602,35 @@ class BedrockBackend(ServerBackend):
                 return
             backup_key, value = resolved
 
-            # 2. Player must be offline (server still up).
-            try:
-                if self.is_player_online(username):
-                    status(f"{username} is online — log them out first.")
+            # 2+3. Establish server state BEFORE injecting anything: if it is
+            # already down (crashed, or an admin killed a hung shutdown by
+            # hand), the pane is a shell prompt and `list`/`stop` typed there
+            # would run as shell commands. Already down also means the world db
+            # is already free — skip the online check and the stop.
+            if self.probe_stopped(timeout=10) is True:
+                status("Server is already stopped; world db free")
+                stopped = db_unlocked = True
+            else:
+                # Player must be offline (server still up).
+                try:
+                    if self.is_player_online(username):
+                        status(f"{username} is online — log them out first.")
+                        return
+                    status(f"{username} is offline")
+                except Exception as e:
+                    status(f"Online check failed: {e}")
                     return
-                status(f"{username} is offline")
-            except Exception as e:
-                status(f"Online check failed: {e}")
-                return
 
-            # 3. Stop the server and wait for the db lock to release.
-            status("Stopping server...")
-            self.stop_server(status)
-            stopped = True
-            if not self.wait_until_stopped(timeout=120):
-                status("⚠️ Server did not fully stop in time. "
-                       "Aborting; check the server manually.")
-                return
-            db_unlocked = True
-            status("Server stopped cleanly; world db free")
+                # Stop the server and wait for the db lock to release.
+                status("Stopping server...")
+                self.stop_server(status)
+                stopped = True
+                if not self.wait_until_stopped(timeout=120):
+                    status("⚠️ Server did not fully stop in time. "
+                           "Aborting; check the server manually.")
+                    return
+                db_unlocked = True
+                status("Server stopped cleanly; world db free")
 
             # 4. Resolve the live data key (per-server), back it up, overwrite.
             db_path = bedrock_player.world_db_path(self.config.minecraft_dir)

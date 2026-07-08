@@ -269,7 +269,7 @@ class Server:
 
     # --- Full backup --------------------------------------------------------
 
-    def run_backup(self, status_cb=None):
+    def run_backup(self, status_cb=None, offline: bool = False):
         """Run a full server backup.
 
         Full backup process:
@@ -284,6 +284,11 @@ class Server:
           4. Run BACKUP_COPY_CMD if configured (e.g., rsync to remote storage).
           5. Start a new incremental chain: generate a fresh chain ID, rebuild
              the file manifest (mtime baseline), and write the chain marker.
+
+        ``offline=True`` means the caller has CONFIRMED the server process is
+        down (e.g. restore_world's probe): the files are quiescent, so the
+        save freeze/flush is skipped entirely — its console commands would
+        otherwise be typed into the shell prompt now owning the server's pane.
         """
         backup_dir = self.config.backup_dir
 
@@ -298,7 +303,9 @@ class Server:
         backup_dir.mkdir(parents=True, exist_ok=True)
 
         # Step 1: Freeze the world and flush pending writes (edition-specific).
-        self.backend.begin_save(status)
+        # A stopped server can't (and needn't) freeze: its files are quiescent.
+        if not offline:
+            self.backend.begin_save(status)
 
         mc_dir = self.config.minecraft_dir
         # Uses relative paths inside the zip so the restore tool can extract
@@ -313,13 +320,26 @@ class Server:
             # the whole settled directory); Bedrock returns snapshot byte-lengths
             # so the walk truncates listed files and skips stale, unlisted db/
             # files.
-            ready = self.backend.files_ready(status)
+            if offline:
+                # Down server: every file is already consistent at its full
+                # length. Synthesize the Bedrock snapshot list from disk so the
+                # player sidecar is still embedded; Java (None) zips everything.
+                status("Server is stopped — copying the quiescent files directly")
+                ready = None
+                if self.config.edition == EDITION_BEDROCK:
+                    worlds = mc_dir / "worlds"
+                    if worlds.is_dir():
+                        ready = [(p, p.stat().st_size)
+                                 for p in worlds.rglob("*") if p.is_file()] or None
+            else:
+                ready = self.backend.files_ready(status)
             ready_map = None
             if ready is None:
-                # Java: the server may still be flushing to disk after save-all,
-                # so wait for the filesystem to settle before zipping.
-                wait_for_settle(mc_dir, backup_dir, log_fn=status,
-                                exclude_names=self.backup_exclude_names)
+                if not offline:
+                    # Java: the server may still be flushing to disk after
+                    # save-all, so wait for the filesystem to settle first.
+                    wait_for_settle(mc_dir, backup_dir, log_fn=status,
+                                    exclude_names=self.backup_exclude_names)
             else:
                 ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
                              for p, n in ready}
@@ -352,8 +372,11 @@ class Server:
             size_mb = final_path.stat().st_size / (1024 * 1024)
             status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
         finally:
-            # Step 3: Always resume normal saving, even if zip fails
-            self.backend.end_save(status)
+            # Step 3: Always resume normal saving, even if zip fails (unless
+            # nothing was frozen — offline skipped begin_save, and a `save
+            # resume` would be typed into the pane's shell prompt).
+            if not offline:
+                self.backend.end_save(status)
 
         # Step 4: Copy off-server if configured (e.g., rsync to NAS/cloud)
         run_copy_command(final_path, self.config.backup_copy_cmd, log_fn=status)
@@ -610,11 +633,22 @@ class Server:
         warn = self.config.restore_warning_seconds
         down = relaunched = False
         try:
+            # 0. Establish whether the server process is actually running
+            #    BEFORE any console injection. If a previous stop hung and the
+            #    admin killed the server by hand, its mux pane is a shell
+            #    prompt — `say`/`stop`/`save` lines injected now would run as
+            #    SHELL commands. Confirmed down means: skip the warning and the
+            #    stop, take any pre-restore backup offline, and restore
+            #    directly. False/None (running/unknown) keeps the normal path.
+            already_down = backend.probe_stopped(timeout=10) is True
+            if already_down:
+                say("Server is already stopped — restoring directly.")
+
             # 1. In-game warning + countdown — best-effort, and only when the
             #    server is actually running (is_online, not is_available: a
             #    down server can't be broadcast to, and a failed broadcast must
             #    never abort the restore we're about to do anyway).
-            if warn > 0 and backend.is_online():
+            if warn > 0 and not already_down and backend.is_online():
                 try:
                     backend.broadcast(f"Server restoring in {warn}s — you will "
                                       "be disconnected. Reconnect shortly.")
@@ -630,19 +664,32 @@ class Server:
             if self.config.pre_restore_backup:
                 say("Taking a pre-restore backup of the current world...")
                 try:
-                    self.run_backup(status_cb=say)
+                    self.run_backup(status_cb=say, offline=already_down)
                 except Exception as e:
                     say(f"Pre-restore backup failed, aborting restore: {e}")
                     return
 
             # 3. Stop and confirm the server is fully down.
-            say("Stopping the server...")
-            backend.stop_server(say)
-            if not backend.wait_until_stopped(timeout=120):
-                say("Server did not shut down in time — aborting. It was not "
-                    "relaunched (avoiding a double start); check it manually.")
-                return
-            down = True
+            if already_down:
+                down = True
+            else:
+                say("Stopping the server...")
+                backend.stop_server(say)
+                if not backend.wait_until_stopped(timeout=120):
+                    # BDS is known to occasionally hang during shutdown: it
+                    # acknowledges `stop` ("Stopping server...") and never
+                    # exits. The world is about to be replaced anyway, so
+                    # escalate the way an admin would — Ctrl-C on its console —
+                    # instead of leaving a wedged process behind.
+                    say("Server did not shut down in time — interrupting it "
+                        "(Ctrl-C)...")
+                    if not backend.force_stop(say):
+                        say("Server still did not shut down — aborting. It was "
+                            "not relaunched (avoiding a double start); check "
+                            "it manually.")
+                        return
+                    say("Server exited after interrupt")
+                down = True
 
             # 4. Replace the world with the restored chain while it's down.
             say("Restoring world files...")
