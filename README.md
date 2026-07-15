@@ -581,6 +581,23 @@ it sends **Ctrl-C** to the console pane (up to three times) and continues once
 the exit is confirmed; only if that also fails does it abort and ask you to
 check the server manually.
 
+**Backup integrity.** Backup zips are written atomically: built at
+`<name>.zip.tmp`, CRC-verified in full, and only then renamed into place — a
+bot killed mid-backup (OOM, reboot) leaves harmless debris that is cleaned on
+the next backup, never a truncated `.zip` silently poisoning the chain. The
+chain manifest only advances after that verification, so a backup that never
+finished is automatically re-captured in full by the next incremental.
+`/restore` re-verifies every zip the chosen point needs **twice before
+anything is touched** — at selection (a corrupt point is refused with the
+filename) and again at confirm, together with a disk-space estimate — so a
+bad backup or a full disk aborts the restore while the server is still up and
+the world untouched. If a restore still fails after the world was replaced,
+the server is deliberately **left stopped** (the world on disk is incomplete;
+`/start` overrides) and incremental backups are suspended until the next full
+backup. Chain discovery only accepts zips whose filename matches this server's
+name exactly — to quarantine a bad backup, rename it (e.g. a `corrupt_`
+prefix) and it drops out of every chain.
+
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
 **Java** additionally needs `mux.session` + `mux.start_cmd` set (see

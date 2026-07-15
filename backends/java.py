@@ -434,15 +434,22 @@ class JavaBackend(ServerBackend):
             for f in self.config.backup_dir.iterdir():
                 if not f.is_file() or f.suffix != ".zip":
                     continue
+                # Exact server-name match: the patterns' leading wildcard
+                # would otherwise accept a foreign or quarantined zip (e.g.
+                # corrupt_<name>_incr_...) as this server's backup.
                 ts_str = label = None
                 m_incr = RE_INCR.match(f.name)
                 if m_incr:
+                    if m_incr.group(1) != self.config.minecraft_dir.name:
+                        continue
                     ts_str = m_incr.group(3)
                     cur = chain_id and m_incr.group(2) == chain_id
                     label = "incremental backup" if cur else "incremental backup (old chain)"
                 else:
                     m_full = RE_FULL.match(f.name)
                     if m_full:
+                        if m_full.group(1) != self.config.minecraft_dir.name:
+                            continue
                         ts_str = m_full.group(2)
                         cur = chain_id and f.name == base_full
                         label = "full backup" if cur else "full backup (old chain)"

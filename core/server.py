@@ -23,7 +23,8 @@ from core.state import load_achievements, load_deaths, uuid_by_name
 from core.presence import reconcile_online
 from utils.backup_utils import (
     CHAIN_MARKER_NAME, META_FILES,
-    build_file_manifest, new_chain_id, run_copy_command, wait_for_settle,
+    backup_tmp_path, build_file_manifest, clean_stale_tmp, finalize_backup_zip,
+    new_chain_id, run_copy_command, wait_for_settle,
 )
 from utils.config import backup_exclude_names, EDITION_BEDROCK
 from utils import restore_core
@@ -301,6 +302,7 @@ class Server:
             raise RuntimeError("Server backend not available")
 
         backup_dir.mkdir(parents=True, exist_ok=True)
+        clean_stale_tmp(backup_dir, log_fn=status)
 
         # Step 1: Freeze the world and flush pending writes (edition-specific).
         # A stopped server can't (and needn't) freeze: its files are quiescent.
@@ -313,6 +315,9 @@ class Server:
         dir_name = mc_dir.name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_path = backup_dir / f"{dir_name}_{timestamp}.zip"
+        # Built at <name>.zip.tmp, then CRC-verified and renamed into place —
+        # a crash mid-write leaves invisible debris, never a bad .zip.
+        tmp_path = backup_tmp_path(final_path)
         backup_dir_resolved = backup_dir.resolve()
 
         try:
@@ -345,7 +350,7 @@ class Server:
                              for p, n in ready}
 
             status(f"Zipping {mc_dir} ...")
-            with zipfile.ZipFile(final_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for dirpath, _dirnames, filenames in os.walk(mc_dir):
                     dp = Path(dirpath)
                     # Skip the backup directory if it's inside the server dir
@@ -369,6 +374,7 @@ class Server:
                         _add_world_file_to_zip(zf, fp, rel, ready_map)
                 # Bedrock: embed the full player-data sidecar (baseline).
                 self.write_player_sidecar(zf, ready, full_backup=True, log=status)
+            finalize_backup_zip(tmp_path, final_path, log_fn=status)
             size_mb = final_path.stat().st_size / (1024 * 1024)
             status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
         finally:
@@ -387,6 +393,10 @@ class Server:
         # subsequent incremental backups. The chain marker is written to the
         # server directory so the bot can detect if the server state is replaced
         # while it's offline.
+        # INVARIANT: chain state only advances after finalize_backup_zip
+        # verified and renamed the zip. A crash before that leaves the old
+        # chain intact, so nothing ever references a backup that doesn't
+        # (verifiably) exist. Do not reorder.
         try:
             chain_id = new_chain_id(backup_dir)
             fresh_files = build_file_manifest(mc_dir, backup_dir,
@@ -457,6 +467,7 @@ class Server:
 
             backup_dir.mkdir(parents=True, exist_ok=True)
             inc_log = lambda msg: self.log.info("Incremental backup: %s", msg)
+            clean_stale_tmp(backup_dir, log_fn=inc_log)
 
             # Freeze the world state and flush pending writes (edition-specific)
             # — ensures we zip consistent file state, not partially-written files.
@@ -480,13 +491,18 @@ class Server:
                                  for p, n in ready}
                 changed, deleted = _diff_manifest(old_files, new_manifest)
 
-                # Build the incremental zip with chain ID in the filename
+                # Build the incremental zip with chain ID in the filename.
+                # Built at .zip.tmp, then CRC-verified and renamed into place:
+                # the 20260711_181302 incident was a bot killed mid-write here
+                # (during the sidecar), leaving a truncated .zip that silently
+                # poisoned the chain until a restore hit it days later.
                 dir_name = mc_dir.name
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 zip_name = f"{dir_name}_incr_{chain_id}_{timestamp}"
                 zip_path = backup_dir / f"{zip_name}.zip"
+                tmp_path = backup_tmp_path(zip_path)
 
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     # Add changed/added files. On Bedrock, listed files are
                     # truncated to their snapshot length and stale unlisted db/
                     # files skipped.
@@ -505,11 +521,18 @@ class Server:
                     # Bedrock: embed the changed-only player-data sidecar.
                     self.write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
 
+                finalize_backup_zip(tmp_path, zip_path, log_fn=inc_log)
                 size_mb = zip_path.stat().st_size / (1024 * 1024)
                 self.log.info("Incremental backup saved: %s (%.1f MB, %d files)",
                             zip_path.name, size_mb, len(changed))
 
-                # Update the manifest: same chain, but new mtime baseline
+                # Update the manifest: same chain, but new mtime baseline.
+                # INVARIANT: the manifest only advances after finalize verified
+                # and renamed the zip. A crash/verification failure before this
+                # line leaves the old baseline, so the NEXT incremental
+                # re-captures everything this one held (a superset) — a lost or
+                # discarded incremental self-heals instead of leaving a hole in
+                # the chain. Do not reorder.
                 self.save_manifest(new_manifest, chain_id=chain_id, base_full=base_full)
 
             finally:
@@ -624,16 +647,37 @@ class Server:
         files with the restored chain, then relaunch. Assumes the caller holds
         ``backup_lock``. ``say`` reports progress to the chat.
 
-        Fail-safe: if the server is taken down but the restore or relaunch
-        errors, the ``finally`` brings it back up (or tells the admin how).
-        Nothing is relaunched unless we confirmed the server was fully down, so
-        a stuck stop can't cause a double start.
+        Fail-safes: every zip the restore needs is CRC-verified (and the disk
+        space estimated) BEFORE the server is stopped or any world file
+        touched. If the world was replaced but the restore still failed, the
+        server is left STOPPED — the world on disk is incomplete, and bringing
+        it up would let players onto (and BDS write into) a broken state — and
+        the chain manifest is invalidated so no incrementals are taken against
+        a world that doesn't match it. Only when the restore succeeded does
+        the ``finally`` retry an unconfirmed relaunch. Nothing is relaunched
+        unless we confirmed the server was fully down, so a stuck stop can't
+        cause a double start.
         """
         backend = self.backend
         warn = self.config.restore_warning_seconds
-        down = relaunched = False
+        down = safe_abort = restored = relaunched = False
         try:
-            # 0. Establish whether the server process is actually running
+            # 0. Validate the chain BEFORE touching anything — a corrupt zip
+            #    or too-little disk space must surface while the server is
+            #    still up and the world untouched, not mid-restore after the
+            #    wipe (both happened in the wild; the world was left partial).
+            n_files = 1 + (0 if point_idx == -1 else point_idx + 1)
+            say(f"Validating {n_files} backup file(s)...")
+            problems = restore_core.validate_chain_files(chain, point_idx)
+            if problems:
+                say("Restore aborted — corrupt backup file(s), the server and "
+                    "world were not touched:\n  " + "\n  ".join(problems))
+                return
+            restore_core.check_disk_space(
+                chain, point_idx, self.config.minecraft_dir,
+                self.config.backup_dir, True, say)
+
+            # 0.5. Establish whether the server process is actually running
             #    BEFORE any console injection. If a previous stop hung and the
             #    admin killed the server by hand, its mux pane is a shell
             #    prompt — `say`/`stop`/`save` lines injected now would run as
@@ -701,6 +745,7 @@ class Server:
                 manifest_path=self.manifest_path,
                 preserve_names=self.backup_exclude_names,
                 log_fn=say)
+            restored = True
 
             # 5. Relaunch and confirm ready.
             say("Restarting the server...")
@@ -716,21 +761,47 @@ class Server:
             else:
                 say("Restore applied but relaunch was not confirmed. Start the "
                     f"server manually:\n  {self.config.mux_start_cmd}")
+        except restore_core.PreflightError as e:
+            # Refused before any world file was touched (corrupt zip, disk
+            # space): the world is coherent, so the finally may bring the
+            # server back up and the chain stays valid.
+            safe_abort = True
+            say(f"World restore aborted (world untouched): {e}")
         except Exception as e:
             self.log.exception("World restore failed")
             say(f"World restore failed: {e}")
+            if down and not restored:
+                # The wipe may have happened: the world on disk no longer
+                # matches the chain manifest. Invalidate it (same mechanism as
+                # the startup marker check) so no incremental extends a chain
+                # that doesn't describe reality.
+                self.save_manifest({}, chain_id="", base_full="")
+                say("Incremental backups are suspended until the next full "
+                    "backup (/backup) — the world no longer matches the "
+                    "backup chain.")
         finally:
-            # If we took the server down but never got it back up (restore error,
-            # or a relaunch we didn't confirm), try once more so it isn't left
-            # offline. Skip when it never confirmed down (avoids a double start).
             if down and not relaunched:
-                say("Bringing the server back up...")
-                if backend.relaunch(say):
-                    self.reattach_log_watch()
-                    reconcile_online(self, reason="after world restore")
+                if restored or safe_abort:
+                    # The world is coherent (restore succeeded but the
+                    # relaunch wasn't confirmed, or a pre-flight abort never
+                    # touched it) — try once more before leaving it to the
+                    # admin.
+                    say("Bringing the server back up...")
+                    if backend.relaunch(say):
+                        self.reattach_log_watch()
+                        reconcile_online(self, reason="after world restore")
+                    else:
+                        say("Could not relaunch. Start the server manually:\n  "
+                            f"{self.config.mux_start_cmd}")
                 else:
-                    say("Could not relaunch. Start the server manually:\n  "
-                        f"{self.config.mux_start_cmd}")
+                    # Restore FAILED after the server came down: the world on
+                    # disk is incomplete. Deliberately do NOT bring the server
+                    # back up — players would join (and BDS write into) a
+                    # broken world. The admin decides: fix and /restore again,
+                    # or /start to accept the partial state.
+                    say("⚠️ The server was left STOPPED: the world on disk is "
+                        "incomplete. Fix the problem and run /restore again, "
+                        "or /start to bring it up anyway.")
 
 
 
