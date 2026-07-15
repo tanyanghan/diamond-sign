@@ -300,21 +300,22 @@ class ServerBackend(ABC):
         (something still owns the console; treat the server as running), or
         None (no mux to probe through; state unknown).
 
-        Layered, most-trustworthy signal first:
+        Two signals, definitive one first:
 
-        1. Pane process tree (``ConsoleMultiplexer.pane_at_prompt``): a pane
-           shell with NO children is a bare prompt — instant, injection-free,
-           and cannot be faked by a running server. Trusted only in the
-           "stopped" direction: byobu-style wrapper shells can hold a child
-           even at a prompt (seen in the wild), so "busy" is NOT proof of a
-           running server.
-        2. ``is_online()``: a live server answers its console/port. If it
-           responds, it is definitively running.
-        3. Sentinel echo (``_confirm_console_free``): pane looked busy (or
-           unknown) yet the server did not respond — contradictory. The
-           sentinel settles who owns the console: only a shell can write the
-           nonce file; a running server logs one unknown command, harmless.
-           ``timeout`` applies to this step.
+        1. ``is_online()``: a live server answers its console/port (Bedrock:
+           ``list`` echoed into console.log; Java: the RCON port accepts). A
+           response is definitive "running" — no further probing.
+        2. Sentinel echo (``_confirm_console_free``): the server did not
+           respond, so send a line only a shell can satisfy — write a nonce
+           to a file. The file appearing proves a shell owns the console
+           (stopped); silence within ``timeout`` means something unresponsive
+           still holds it (treat as running; do NOT inject).
+
+        A pane-process-tree check ("shell has no children == prompt") was
+        tried as a faster first signal and removed: the pane shell can hold
+        resident children at a prompt — in the wild it was a hung Ubuntu
+        command-not-found handler spawned by earlier blind injections — so
+        "has children" proves nothing (see backends/mux.py).
 
         Every decision is logged, so a misread is diagnosable from the bot
         log. Lifecycle paths (stop, restore, the save dance) must call this
@@ -324,22 +325,16 @@ class ServerBackend(ABC):
         mux = getattr(self, "_mux", None)
         if mux is None:
             return None
-        at_prompt = mux.pane_at_prompt()
-        if at_prompt is True:
-            logger.info("[%s] Probe: pane is a bare shell prompt -> server "
-                        "stopped", self.config.name)
-            return True
         try:
             online = self.is_online()
         except Exception:
             online = False
         if online:
-            logger.info("[%s] Probe: pane busy and server responding -> "
-                        "running", self.config.name)
+            logger.info("[%s] Probe: server responding -> running",
+                        self.config.name)
             return False
-        logger.info("[%s] Probe: pane %s but server not responding — "
-                    "sentinel probe decides...", self.config.name,
-                    "busy" if at_prompt is False else "state unknown")
+        logger.info("[%s] Probe: server not responding — sentinel probe "
+                    "decides...", self.config.name)
         result = self._confirm_console_free(timeout, log_fn=log_fn)
         logger.info("[%s] Probe: sentinel verdict: %s", self.config.name,
                     {True: "console free -> server stopped",

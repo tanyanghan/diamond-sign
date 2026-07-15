@@ -568,10 +568,10 @@ Tune it with `backup.pre_restore_backup` (take a recoverable snapshot of the
 current world before wiping — default off) and `backup.restore_warning_seconds`.
 
 **Server state is checked first.** Before injecting any console command,
-`/restore` probes whether the server process is actually running: it checks the
-console pane's process tree (a pane shell with no children is a bare prompt —
-instant and injection-free), falling back to a shell-safe sentinel echo when
-that can't be read. If the server is **already stopped** (it crashed,
+`/restore` probes whether the server process is actually running: a server
+that answers its console/port (`list` / the RCON port) is running; a silent
+one gets a shell-safe sentinel echo — a line only a shell prompt can satisfy —
+to prove who owns the console. If the server is **already stopped** (it crashed,
 or you killed a hung shutdown by hand), the warning and stop are skipped, any
 pre-restore backup is taken offline from the quiescent files, and the restore
 proceeds directly — nothing gets typed into the shell prompt that now owns the
