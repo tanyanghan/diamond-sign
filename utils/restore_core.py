@@ -18,6 +18,7 @@ not depend on ``backup_manifest.json`` or the chain marker.
 """
 
 import json
+import logging
 import os
 import shutil
 import stat
@@ -27,8 +28,11 @@ from pathlib import Path
 
 from .backup_utils import (
     CHAIN_MARKER_NAME, META_FILES, RE_FULL, RE_INCR,
-    build_file_manifest, new_chain_id, run_copy_command,
+    backup_tmp_path, build_file_manifest, finalize_backup_zip, new_chain_id,
+    run_copy_command, validate_backup_zip,
 )
+
+logger = logging.getLogger("diamondsign")
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +69,28 @@ def _apply_zip_mode(info: zipfile.ZipInfo, path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Chain discovery
 # ---------------------------------------------------------------------------
-def scan_backups(backup_dir: Path) -> tuple:
+def scan_backups(backup_dir: Path, server_name: str | None = None) -> tuple:
     """Scan ``backup_dir`` for full and incremental backup zips.
 
     Returns ``(fulls, incrs)`` where ``fulls`` is ``{filename: entry}`` and
     ``incrs`` is a list of entries. Each entry has path/server/timestamp/size,
     and incrementals also carry ``chain_id`` parsed from the filename.
+
+    When ``server_name`` is given, only zips whose filename's server-name
+    component matches it EXACTLY are included. The patterns' leading wildcard
+    otherwise swallows any prefix — a quarantined
+    ``corrupt_mc-bedrock_incr_<chain>_<ts>.zip`` parses as server
+    ``corrupt_mc-bedrock`` and, since chains group by chain ID alone, would
+    silently rejoin the chain it was renamed to escape. Skips are logged so a
+    deliberately renamed file is visibly excluded, not silently.
     """
+    def name_mismatch(f, parsed: str) -> bool:
+        if server_name is not None and parsed != server_name:
+            logger.info("Ignoring %s: server-name prefix %r does not match %r",
+                        f.name, parsed, server_name)
+            return True
+        return False
+
     fulls = {}
     incrs = []
     for f in backup_dir.iterdir():
@@ -81,6 +100,8 @@ def scan_backups(backup_dir: Path) -> tuple:
         # match an incremental filename without this ordering).
         m = RE_INCR.match(f.name)
         if m:
+            if name_mismatch(f, m.group(1)):
+                continue
             incrs.append({
                 "path": f, "server": m.group(1), "chain_id": m.group(2),
                 "timestamp": m.group(3), "size": f.stat().st_size,
@@ -88,6 +109,8 @@ def scan_backups(backup_dir: Path) -> tuple:
             continue
         m = RE_FULL.match(f.name)
         if m:
+            if name_mismatch(f, m.group(1)):
+                continue
             fulls[f.name] = {
                 "path": f, "server": m.group(1), "timestamp": m.group(2),
                 "size": f.stat().st_size,
@@ -143,10 +166,52 @@ def group_by_chain(fulls: dict, incrs: list) -> list:
     return chains
 
 
-def discover_chains(backup_dir: Path) -> list:
-    """Convenience: ``scan_backups`` + ``group_by_chain`` for ``backup_dir``."""
-    fulls, incrs = scan_backups(backup_dir)
+def discover_chains(backup_dir: Path, server_name: str | None = None) -> list:
+    """Convenience: ``scan_backups`` + ``group_by_chain`` for ``backup_dir``.
+
+    Callers with server context pass ``server_name`` (the server directory's
+    basename — the same name backups are created with) so foreign or
+    quarantined zips can't join the chain; see ``scan_backups``.
+    """
+    fulls, incrs = scan_backups(backup_dir, server_name)
     return group_by_chain(fulls, incrs)
+
+
+def validate_chain_files(chain: dict, point_idx: int) -> list[str]:
+    """CRC-verify every zip needed to restore ``chain`` up to ``point_idx``.
+
+    Returns ``["<filename>: <problem>", ...]`` — empty when the whole segment
+    is healthy. Run BEFORE touching the world: a truncated incremental
+    discovered mid-restore (after the wipe) once left a server running on a
+    4-day-old partial world.
+    """
+    to_check = [chain["full"]["path"]]
+    if point_idx >= 0:
+        to_check += [i["path"] for i in chain["incrementals"][:point_idx + 1]]
+    problems = []
+    for path in to_check:
+        problem = validate_backup_zip(path)
+        if problem is not None:
+            problems.append(f"{path.name}: {problem}")
+    return problems
+
+
+def estimate_restore_bytes(chain: dict, point_idx: int) -> tuple[int, int]:
+    """Estimate the disk space a restore needs, from zip central directories.
+
+    Returns ``(world_bytes, merge_bytes)``: the uncompressed size of the full
+    backup plus every incremental up to ``point_idx`` (an upper bound on the
+    restored world — overwrites make the true size smaller), and the
+    uncompressed incrementals alone (the merged-incremental staging tree).
+    Cheap: reads only each zip's central directory, no data.
+    """
+    def uncompressed(path: Path) -> int:
+        with zipfile.ZipFile(path, "r") as zf:
+            return sum(i.file_size for i in zf.infolist())
+
+    incrs = 0 if point_idx == -1 else sum(
+        uncompressed(i["path"]) for i in chain["incrementals"][:point_idx + 1])
+    return uncompressed(chain["full"]["path"]) + incrs, incrs
 
 
 def list_restore_points(chains: list) -> list:
@@ -187,6 +252,60 @@ def list_restore_points(chains: list) -> list:
 # ---------------------------------------------------------------------------
 # Restore
 # ---------------------------------------------------------------------------
+class PreflightError(RuntimeError):
+    """A restore refused to start — raised BEFORE any world file is touched
+    (corrupt zip in the chain, not enough disk space). Callers can treat this
+    as fully safe: the world is coherent and the server may be brought back
+    up, unlike a mid-restore failure after the wipe."""
+
+
+def check_disk_space(chain: dict, point_idx: int, target_dir: Path,
+                     backup_dir: Path, establish_chain: bool, log) -> None:
+    """Abort (raise PreflightError) if the restore can't fit on disk.
+
+    The restore writes the uncompressed world into ``target_dir`` and — when
+    establishing a chain from an incremental point — an uncompressed staging
+    tree plus the merged zip under ``backup_dir``. Requirements on the same
+    filesystem (st_dev) are summed. Estimates are upper bounds (overwrites
+    across incrementals shrink the real footprint) and the check runs before
+    the wipe frees the old world's space, so it is conservative in the safe
+    direction. Note: ``disk_usage`` sees filesystem free space, not user
+    quotas — a quota can still fail a restore this check passed.
+    """
+    world_bytes, merge_bytes = estimate_restore_bytes(chain, point_idx)
+    # Staging tree + merged zip (zip ≤ tree; deflate only shrinks).
+    staging = merge_bytes * 2 if (point_idx >= 0 and establish_chain) else 0
+
+    def existing(path: Path) -> Path:
+        # The target dir may not exist yet (restore into a fresh directory
+        # creates it later); measure its nearest existing ancestor's fs.
+        path = path.resolve()
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        return path
+
+    need = {}  # st_dev -> [bytes, [labels]]
+    for path, size, label in ((target_dir, world_bytes, "world"),
+                              (backup_dir, staging, "merge staging")):
+        if size <= 0:
+            continue
+        path = existing(path)
+        dev = os.stat(path).st_dev
+        entry = need.setdefault(dev, [0, [], path])
+        entry[0] += size
+        entry[1].append(label)
+    for size, labels, path in need.values():
+        free = shutil.disk_usage(path).free
+        if free < size + 128 * 1024 * 1024:  # headroom for margin of error
+            raise PreflightError(
+                f"not enough disk space for {' + '.join(labels)} on "
+                f"{path}: need ~{format_size(size)}, "
+                f"{format_size(free)} free — world untouched. Free up space "
+                "and retry (the estimate is an upper bound).")
+    log(f"Disk space OK (world ~{format_size(world_bytes)}, "
+        f"staging ~{format_size(staging)})")
+
+
 def _wipe_target(target_dir: Path, preserve_names, backup_dir: Path,
                  log) -> None:
     """Clear ``target_dir`` before extracting a full snapshot, keeping bot
@@ -239,6 +358,18 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
     full_zip = chain["full"]["path"]
     incrementals = [] if point_idx == -1 else chain["incrementals"][:point_idx + 1]
 
+    if not dry_run:
+        # Never touch the world on a chain that can't complete. Both checks
+        # run BEFORE the wipe: a truncated zip or full disk discovered
+        # mid-apply once left a server on a days-old partial world.
+        problems = validate_chain_files(chain, point_idx)
+        if problems:
+            raise PreflightError(
+                "backup validation failed — world untouched:\n  "
+                + "\n  ".join(problems))
+        check_disk_space(chain, point_idx, target_dir, backup_dir,
+                         establish_chain, log)
+
     if dry_run:
         with zipfile.ZipFile(full_zip, "r") as zf:
             full_n = len(zf.namelist())
@@ -274,12 +405,27 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
 
     # Step 2: apply incrementals in order. When establishing a chain, also
     # accumulate changed files in a temp tree to build one merged incremental.
-    tmp = Path(tempfile.mkdtemp()) if (incrementals and establish_chain) else None
+    # The tree holds every distinct changed file across ALL applied
+    # incrementals uncompressed — multi-GB for a long chain — so it lives
+    # under backup_dir (big disk, already excluded from backups/manifest),
+    # NOT the system tmp dir: /tmp is a small tmpfs on typical hosts and a
+    # long chain overflowed it in the wild.
+    tmp = (Path(tempfile.mkdtemp(prefix=".restore_merge_", dir=str(backup_dir)))
+           if (incrementals and establish_chain) else None)
     merged_deletions: list = []
     re_added: set = set()
     try:
-        for incr in incrementals:
-            log(f"Applying incremental {incr['path'].name} ...")
+        total = len(incrementals)
+        report_step = max(1, (total + 9) // 10)  # ceil(total/10)
+        for i, incr in enumerate(incrementals, 1):
+            # Per-file detail goes to the bot log only (it's the forensic
+            # trail that identified a corrupt zip in the wild); the chat sees
+            # ~10% milestones — one message per zip flooded Telegram/Slack on
+            # long chains.
+            logger.info("Applying incremental %s (%d/%d)",
+                        incr["path"].name, i, total)
+            if i == 1 or i == total or i % report_step == 0:
+                log(f"Applying incremental {i} of {total} ...")
             with zipfile.ZipFile(incr["path"], "r") as zf:
                 dest_roots = (target_dir, tmp) if tmp is not None else (target_dir,)
                 for name in zf.namelist():
@@ -322,8 +468,9 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
             restore_ts = incrementals[point_idx]["timestamp"]
             merged_name = f"{chain['full']['server']}_incr_{chain_id}_{restore_ts}.zip"
             merged_path = backup_dir / merged_name
+            merged_tmp = backup_tmp_path(merged_path)
             log(f"Creating merged incremental {merged_name} ...")
-            with zipfile.ZipFile(merged_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(merged_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
                 for dirpath, _dirnames, filenames in os.walk(tmp):
                     dp = Path(dirpath)
                     for fn in filenames:
@@ -335,6 +482,7 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
                                 json.dumps(final_deletions, indent=2))
                 zf.writestr("_meta.json", json.dumps({
                     "chain_id": chain_id, "base_full": full_zip.name}))
+            finalize_backup_zip(merged_tmp, merged_path, log_fn=log)
             run_copy_command(merged_path, copy_cmd, log_fn=log_fn)
 
         # Chain marker in the world dir.

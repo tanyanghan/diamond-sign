@@ -15,7 +15,6 @@ import re
 import subprocess
 import threading
 import time
-from pathlib import Path
 
 logger = logging.getLogger("diamondsign")
 
@@ -65,34 +64,12 @@ class ConsoleMultiplexer:
         keystroke, not a command line."""
         raise NotImplementedError
 
-    def pane_at_prompt(self) -> bool | None:
-        """Whether the pane is sitting at a bare shell prompt — i.e. anything
-        injected now would be typed into the SHELL, not the server.
-
-        Reads the kernel process tree: the pane's shell with no child
-        processes IS a prompt; any child (the server, or a wrapper script
-        running it) means the pane is busy. Instant and injection-free, and —
-        unlike tmux's ``pane_current_command``, which reports ``bash`` while a
-        wrapper script runs the server — it cannot be fooled by wrappers,
-        because the wrapper itself is a child.
-
-        Returns True (prompt), False (something is running in the pane), or
-        None when undeterminable (no per-window pid query on this mux, pid
-        vanished mid-check, /proc and pgrep both unavailable) — callers then
-        fall back to the sentinel-echo probe.
-        """
-        pid = self._pane_shell_pid()
-        if pid is None:
-            return None
-        has_children = _pid_has_children(pid)
-        if has_children is None:
-            return None
-        return not has_children
-
-    def _pane_shell_pid(self) -> int | None:
-        """PID of the shell owning the target pane/window, or None if this
-        multiplexer can't be queried for it (then pane_at_prompt is unknown)."""
-        return None
+    # NOTE: a pane-process-tree check ("shell has no children == bare prompt")
+    # was tried here as a fast stopped-server probe and removed: in the wild
+    # (2026-07-15) the pane's shell held a resident child even at the prompt
+    # (suspended job / lingering pipe reader / nested shell), so "has
+    # children" is no proof of a running server. Liveness is decided by the
+    # backend instead: is_online() + the sentinel echo (base.probe_stopped).
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(target={self.target!r})"
@@ -108,27 +85,6 @@ def _run(args: list[str]) -> subprocess.CompletedProcess | None:
     except subprocess.TimeoutExpired:
         logger.warning("mux: command timed out: %s", " ".join(args))
         return None
-
-
-def _pid_has_children(pid: int) -> bool | None:
-    """Whether ``pid`` has any child processes; None if undeterminable.
-
-    Primary: /proc/<pid>/task/<tid>/children (world-readable; standard on
-    modern kernels). Fallback: ``pgrep -P`` for kernels built without
-    CONFIG_PROC_CHILDREN. A pid that vanished mid-check reports None so the
-    caller re-resolves rather than trusting a stale answer.
-    """
-    try:
-        for tid in Path(f"/proc/{pid}/task").iterdir():
-            if (tid / "children").read_text().strip():
-                return True
-        return False
-    except OSError:
-        pass
-    res = _run(["pgrep", "-P", str(pid)])
-    if res is None or res.returncode not in (0, 1):
-        return None
-    return res.returncode == 0  # 0 = matched (children), 1 = none
 
 
 class TmuxMux(ConsoleMultiplexer):
@@ -167,18 +123,6 @@ class TmuxMux(ConsoleMultiplexer):
         with _send_lock:
             _run(["tmux", "send-keys", "-t", self.target, "C-c"])
             time.sleep(_SETTLE_SECONDS)
-
-    def _pane_shell_pid(self) -> int | None:
-        # `-t` accepts the same session[:window[.pane]] target as send-keys, so
-        # the pid is read from exactly the pane commands are injected into.
-        res = _run(["tmux", "display-message", "-p", "-t", self.target,
-                    "#{pane_pid}"])
-        if res is None or res.returncode != 0:
-            return None
-        try:
-            return int(res.stdout.strip())
-        except ValueError:
-            return None
 
 
 # screen -ls lines look like: "\t12345.mc\t(Detached)"

@@ -777,9 +777,15 @@ def register_commands(router, auth: dict) -> None:
                 f"{ctx.platform}:{ctx.user_id}")
         sub = ctx.args[0] if ctx.args else None
 
+        # Discovery is pinned to this server's name (the world dir basename
+        # backups are created with): a renamed/quarantined zip like
+        # corrupt_<name>_incr_<chain>_<ts>.zip must not rejoin the chain.
+        server_name = server.config.minecraft_dir.name
+
         def discover():
             return restore_core.list_restore_points(
-                restore_core.discover_chains(server.config.backup_dir))
+                restore_core.discover_chains(server.config.backup_dir,
+                                             server_name))
 
         # Bare /restore or "/restore more": (re)show the paged list.
         if sub is None or sub.lower() == "more":
@@ -814,9 +820,22 @@ def register_commands(router, auth: dict) -> None:
             ctx.reply(f"Invalid selection: {n}. Choose 1-{len(points)}.")
             return
         point = points[n - 1]
-        chains = restore_core.discover_chains(server.config.backup_dir)
+        chains = restore_core.discover_chains(server.config.backup_dir,
+                                              server_name)
 
         if not confirm:
+            # Verify every zip this point needs BEFORE offering the confirm
+            # step — a corrupt backup must surface while choosing, not after
+            # the world is wiped. (restore_world re-validates at confirm.)
+            problems = restore_core.validate_chain_files(
+                chains[point["chain_idx"]], point["point_idx"])
+            if problems:
+                server.log.warning("Restore: point %d unusable: %s",
+                                   n, "; ".join(problems))
+                ctx.reply(f"Point {n} cannot be restored — corrupt backup "
+                          "file(s):\n  " + "\n  ".join(problems)
+                          + "\nChoose another restore point.")
+                return
             _set_pending_world_restore(pkey, stage="selected", selected_n=n)
             server.log.info("Restore: [%s] on [%s] selected point %d ([%s] %s)",
                             ctx.sender_label, ctx.chat_label, n,

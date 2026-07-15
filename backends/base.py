@@ -14,12 +14,15 @@ Line parsing and the shared player-state bookkeeping deliberately stay in
 command transport, the save/flush sequence, and server-side queries.
 """
 
+import logging
 import re
 import secrets
 import shlex
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+logger = logging.getLogger("diamondsign")
 
 # Minecraft formatting codes: the section sign (§, U+00A7) followed by one
 # color/style char. They render as garbage in a chat message, so strip them
@@ -297,25 +300,47 @@ class ServerBackend(ABC):
         (something still owns the console; treat the server as running), or
         None (no mux to probe through; state unknown).
 
-        Primary signal: the pane's shell has no child processes (see
-        ``ConsoleMultiplexer.pane_at_prompt``) — instant, injection-free, and
-        immune to wrapper start scripts. Only when that is undeterminable
-        (screen, /proc+pgrep unavailable) fall back to the sentinel echo of
-        ``_confirm_console_free``, whose one injected line is harmless in
-        either state (a running server logs it as an unknown command; a shell
-        just writes the file). ``timeout`` applies to that fallback only.
+        Two signals, definitive one first:
 
-        Lifecycle paths (stop, restore, the save dance) must call this before
-        injecting: after a hung shutdown that an admin resolved by hand, the
-        pane is a prompt and blind injection executes there.
+        1. ``is_online()``: a live server answers its console/port (Bedrock:
+           ``list`` echoed into console.log; Java: the RCON port accepts). A
+           response is definitive "running" — no further probing.
+        2. Sentinel echo (``_confirm_console_free``): the server did not
+           respond, so send a line only a shell can satisfy — write a nonce
+           to a file. The file appearing proves a shell owns the console
+           (stopped); silence within ``timeout`` means something unresponsive
+           still holds it (treat as running; do NOT inject).
+
+        A pane-process-tree check ("shell has no children == prompt") was
+        tried as a faster first signal and removed: the pane shell can hold
+        resident children at a prompt — in the wild it was a hung Ubuntu
+        command-not-found handler spawned by earlier blind injections — so
+        "has children" proves nothing (see backends/mux.py).
+
+        Every decision is logged, so a misread is diagnosable from the bot
+        log. Lifecycle paths (stop, restore, the save dance) must call this
+        before injecting: after a hung shutdown that an admin resolved by
+        hand, the pane is a prompt and blind injection executes there.
         """
         mux = getattr(self, "_mux", None)
         if mux is None:
             return None
-        at_prompt = mux.pane_at_prompt()
-        if at_prompt is not None:
-            return at_prompt
-        return self._confirm_console_free(timeout, log_fn=log_fn)
+        try:
+            online = self.is_online()
+        except Exception:
+            online = False
+        if online:
+            logger.info("[%s] Probe: server responding -> running",
+                        self.config.name)
+            return False
+        logger.info("[%s] Probe: server not responding — sentinel probe "
+                    "decides...", self.config.name)
+        result = self._confirm_console_free(timeout, log_fn=log_fn)
+        logger.info("[%s] Probe: sentinel verdict: %s", self.config.name,
+                    {True: "console free -> server stopped",
+                     False: "console owned -> treating as running",
+                     None: "no mux -> unknown"}[result])
+        return result
 
     def force_stop(self, log_fn=None) -> bool:
         """Last-resort stop for a server that acknowledged ``stop`` but never

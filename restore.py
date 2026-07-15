@@ -231,19 +231,20 @@ def _select_server(app, server_arg):
 
 def _resolve_paths(args):
     """Return (backup_dir, target_dir, manifest_path, exclude_names, copy_cmd,
-    preserve_names, establish_chain).
+    preserve_names, establish_chain, server_name).
 
     Files-only legacy mode (``--backup-dir`` + ``--target-dir`` with no
     ``--server``) restores an arbitrary backup dir with no config and no chain
     reset. Otherwise a server is resolved from diamondsign.json — picked
     interactively from a numbered list when ``--server`` isn't given — and its
     backup dir / server dir / manifest / excludes are used (each dir still
-    overridable by the matching flag)."""
+    overridable by the matching flag). ``server_name`` pins chain discovery to
+    that server's own zips (None in files-only mode: no server context)."""
     if args.backup_dir and args.target_dir and not args.server:
         # Legacy files-only restore: no server context, so we can't safely
         # rebuild a per-server manifest/marker — just extract the chain's files.
         return (Path(args.backup_dir), Path(args.target_dir), None, set(), "",
-                set(), False)
+                set(), False, None)
     try:
         app = load_config()
     except ConfigError as e:
@@ -255,7 +256,8 @@ def _resolve_paths(args):
     exclude = backup_exclude_names(server)
     establish = target_dir.resolve() == server.minecraft_dir.resolve()
     return (backup_dir, target_dir, server.data_dir / "backup_manifest.json",
-            exclude, server.backup_copy_cmd, exclude, establish)
+            exclude, server.backup_copy_cmd, exclude, establish,
+            server.minecraft_dir.name)
 
 
 def main():
@@ -271,13 +273,13 @@ def main():
     args = parser.parse_args()
 
     (backup_dir, target_dir, manifest_path, exclude, copy_cmd,
-     preserve, establish) = _resolve_paths(args)
+     preserve, establish, server_name) = _resolve_paths(args)
 
     if not backup_dir.exists():
         print(f"Error: backup directory not found: {backup_dir}", file=sys.stderr)
         sys.exit(1)
 
-    chains = restore_core.discover_chains(backup_dir)
+    chains = restore_core.discover_chains(backup_dir, server_name)
     if not chains:
         print("No restorable backup chains found (need at least one full backup).")
         sys.exit(1)

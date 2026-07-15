@@ -48,6 +48,7 @@ import re
 import secrets
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 
 # Name of the chain marker file placed in the Minecraft server directory.
@@ -224,3 +225,77 @@ def run_copy_command(file_path: Path, cmd_template: str, log_fn=None) -> None:
         log("Copy command timed out after 10 minutes")
     except Exception as e:
         log(f"Copy command error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Zip integrity (atomic creation + verification)
+# ---------------------------------------------------------------------------
+# A bot process killed mid-write (OOM, reboot) used to leave a truncated file
+# under its final .zip name, silently poisoning the chain until a restore hit
+# it — after the world was already wiped. Backups are therefore built at
+# <name>.zip.tmp and only renamed into place after a full verification pass.
+# .zip.tmp files are invisible to chain discovery (it requires the .zip
+# suffix), so a crash leaves harmless debris instead of a bad backup.
+
+TMP_SUFFIX = ".tmp"  # appended to the final .zip name during creation
+
+
+def backup_tmp_path(final_path: Path) -> Path:
+    """The in-progress path a backup zip is built at before finalize."""
+    return final_path.with_name(final_path.name + TMP_SUFFIX)
+
+
+def validate_backup_zip(path: Path) -> str | None:
+    """Fully verify a backup zip. Returns a problem description, or None.
+
+    Opening the archive catches a missing/garbled central directory (the
+    signature of a truncated write); ``testzip`` then CRC-checks every entry,
+    catching corruption inside the data itself.
+    """
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                return f"CRC check failed on entry '{bad}'"
+    except zipfile.BadZipFile as e:
+        return f"not a valid zip ({e})"
+    except OSError as e:
+        return f"unreadable ({e})"
+    return None
+
+
+def finalize_backup_zip(tmp_path: Path, final_path: Path, log_fn=None) -> None:
+    """Verify a just-written backup zip and atomically move it into place.
+
+    Every backup writer funnels through here, so a zip either passes a full
+    CRC pass and appears under its final name, or the backup fails loudly now
+    — never a bad zip discovered days later by a restore.
+    """
+    problem = validate_backup_zip(tmp_path)
+    if problem is not None:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"backup verification failed for {final_path.name}: {problem}")
+    os.replace(tmp_path, final_path)
+    if log_fn:
+        log_fn(f"Verified {final_path.name} (CRC pass)")
+
+
+def clean_stale_tmp(backup_dir: Path, log_fn=None) -> None:
+    """Remove leftover *.zip.tmp files (debris from a crash mid-write).
+
+    Called at the start of each backup; the caller holds the per-server
+    backup lock, so no live writer's tmp file can be swept here.
+    """
+    if not backup_dir.exists():
+        return
+    for f in backup_dir.glob(f"*.zip{TMP_SUFFIX}"):
+        try:
+            f.unlink()
+            if log_fn:
+                log_fn(f"Removed stale partial backup {f.name}")
+        except OSError:
+            pass

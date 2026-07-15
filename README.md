@@ -568,10 +568,10 @@ Tune it with `backup.pre_restore_backup` (take a recoverable snapshot of the
 current world before wiping — default off) and `backup.restore_warning_seconds`.
 
 **Server state is checked first.** Before injecting any console command,
-`/restore` probes whether the server process is actually running: it checks the
-console pane's process tree (a pane shell with no children is a bare prompt —
-instant and injection-free), falling back to a shell-safe sentinel echo when
-that can't be read. If the server is **already stopped** (it crashed,
+`/restore` probes whether the server process is actually running: a server
+that answers its console/port (`list` / the RCON port) is running; a silent
+one gets a shell-safe sentinel echo — a line only a shell prompt can satisfy —
+to prove who owns the console. If the server is **already stopped** (it crashed,
 or you killed a hung shutdown by hand), the warning and stop are skipped, any
 pre-restore backup is taken offline from the quiescent files, and the restore
 proceeds directly — nothing gets typed into the shell prompt that now owns the
@@ -580,6 +580,23 @@ occasionally hangs during shutdown), the bot escalates the way an admin would:
 it sends **Ctrl-C** to the console pane (up to three times) and continues once
 the exit is confirmed; only if that also fails does it abort and ask you to
 check the server manually.
+
+**Backup integrity.** Backup zips are written atomically: built at
+`<name>.zip.tmp`, CRC-verified in full, and only then renamed into place — a
+bot killed mid-backup (OOM, reboot) leaves harmless debris that is cleaned on
+the next backup, never a truncated `.zip` silently poisoning the chain. The
+chain manifest only advances after that verification, so a backup that never
+finished is automatically re-captured in full by the next incremental.
+`/restore` re-verifies every zip the chosen point needs **twice before
+anything is touched** — at selection (a corrupt point is refused with the
+filename) and again at confirm, together with a disk-space estimate — so a
+bad backup or a full disk aborts the restore while the server is still up and
+the world untouched. If a restore still fails after the world was replaced,
+the server is deliberately **left stopped** (the world on disk is incomplete;
+`/start` overrides) and incremental backups are suspended until the next full
+backup. Chain discovery only accepts zips whose filename matches this server's
+name exactly — to quarantine a bad backup, rename it (e.g. a `corrupt_`
+prefix) and it drops out of every chain.
 
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
