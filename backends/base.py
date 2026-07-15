@@ -287,6 +287,63 @@ class ServerBackend(ABC):
         log("Console did not return to a shell prompt in time")
         return False
 
+    def probe_stopped(self, timeout: float = 10, log_fn=None) -> bool | None:
+        """Establish whether the server process has ALREADY exited, safely in
+        either state — unlike ``is_online``, whose Bedrock probe types ``list``
+        into the pane and so must not run blind.
+
+        Returns True (confirmed stopped: the pane is a shell prompt — any
+        server command injected now would run as a SHELL command), False
+        (something still owns the console; treat the server as running), or
+        None (no mux to probe through; state unknown).
+
+        Primary signal: the pane's shell has no child processes (see
+        ``ConsoleMultiplexer.pane_at_prompt``) — instant, injection-free, and
+        immune to wrapper start scripts. Only when that is undeterminable
+        (screen, /proc+pgrep unavailable) fall back to the sentinel echo of
+        ``_confirm_console_free``, whose one injected line is harmless in
+        either state (a running server logs it as an unknown command; a shell
+        just writes the file). ``timeout`` applies to that fallback only.
+
+        Lifecycle paths (stop, restore, the save dance) must call this before
+        injecting: after a hung shutdown that an admin resolved by hand, the
+        pane is a prompt and blind injection executes there.
+        """
+        mux = getattr(self, "_mux", None)
+        if mux is None:
+            return None
+        at_prompt = mux.pane_at_prompt()
+        if at_prompt is not None:
+            return at_prompt
+        return self._confirm_console_free(timeout, log_fn=log_fn)
+
+    def force_stop(self, log_fn=None) -> bool:
+        """Last-resort stop for a server that acknowledged ``stop`` but never
+        exited (BDS is known to occasionally hang during shutdown): send
+        Ctrl-C (SIGINT) to its console pane — exactly what an admin does by
+        hand — and confirm the pane returned to a shell prompt. Retries the
+        interrupt a few times; True only when the exit is confirmed.
+
+        Only appropriate when losing unflushed state is acceptable (e.g. a
+        world restore is about to replace the files anyway) — callers make
+        that call.
+        """
+        mux = getattr(self, "_mux", None)
+        if mux is None:
+            return False
+
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+
+        for attempt in range(1, 4):
+            log(f"Interrupting the server (Ctrl-C, attempt {attempt}/3)...")
+            mux.interrupt()
+            if self._confirm_console_free(20, log_fn=None):
+                return True
+        log("Server did not exit after Ctrl-C")
+        return False
+
     def relaunch(self, log_fn=None) -> bool:
         """Relaunch the server and return once it reports ready."""
         raise NotSupported("relaunch")

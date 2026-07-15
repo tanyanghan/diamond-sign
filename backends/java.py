@@ -121,6 +121,15 @@ class JavaBackend(ServerBackend):
         except OSError:
             return False
 
+    def probe_stopped(self, timeout: float = 10, log_fn=None) -> bool | None:
+        """A responding RCON port means the JVM is up — fast and with no
+        console injection at all. A closed port does NOT prove the process
+        exited (the listener can close while worlds are still flushing), so
+        only then fall back to the console-free sentinel probe."""
+        if self.is_online():
+            return False
+        return super().probe_stopped(timeout, log_fn=log_fn)
+
     # --- command transport ---
     def send_command(self, cmd: str) -> str:
         """Send an RCON command and return the response.

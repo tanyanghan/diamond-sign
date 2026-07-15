@@ -567,6 +567,20 @@ world:
 Tune it with `backup.pre_restore_backup` (take a recoverable snapshot of the
 current world before wiping — default off) and `backup.restore_warning_seconds`.
 
+**Server state is checked first.** Before injecting any console command,
+`/restore` probes whether the server process is actually running: it checks the
+console pane's process tree (a pane shell with no children is a bare prompt —
+instant and injection-free), falling back to a shell-safe sentinel echo when
+that can't be read. If the server is **already stopped** (it crashed,
+or you killed a hung shutdown by hand), the warning and stop are skipped, any
+pre-restore backup is taken offline from the quiescent files, and the restore
+proceeds directly — nothing gets typed into the shell prompt that now owns the
+console pane. If the server acknowledges `stop` but never exits (BDS
+occasionally hangs during shutdown), the bot escalates the way an admin would:
+it sends **Ctrl-C** to the console pane (up to three times) and continues once
+the exit is confirmed; only if that also fails does it abort and ask you to
+check the server manually.
+
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
 **Java** additionally needs `mux.session` + `mux.start_cmd` set (see
