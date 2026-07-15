@@ -189,14 +189,14 @@ class BedrockBackend(ServerBackend):
         self._mux.send(cmd)
         return ""
 
-    def capture_command(self, full_cmd: str, timeout: float = 3.0) -> str:
-        """Send a command and read its response back from console.log.
+    def _capture_raw(self, full_cmd: str, timeout: float = 3.0) -> str:
+        """Send a command and return the RAW console.log output it produced.
 
         BDS injection is fire-and-forget, so we record the log's current end,
-        send the command, then poll until the new content stops growing (or the
-        timeout elapses). Only prefixed server lines (``[.. INFO] …``) are kept —
-        the bare echo of the typed command is dropped.
-        """
+        send the command, then poll until the new content stops growing (or
+        the timeout elapses). EOF-anchored: only output the server writes
+        AFTER the send counts, so a stopped server yields "" — never a stale
+        response replayed from the log's history."""
         log_path = self.config.log_path
         with _capture_lock:
             try:
@@ -217,7 +217,13 @@ class BedrockBackend(ServerBackend):
                 if new and new == data:
                     break  # output has settled -> response complete
                 data = new
-        return _format_console_response(data.decode("utf-8", errors="replace"))
+        return data.decode("utf-8", errors="replace")
+
+    def capture_command(self, full_cmd: str, timeout: float = 3.0) -> str:
+        """Send a command and read its response back from console.log. Only
+        prefixed server lines (``[.. INFO] …``) are kept — the bare echo of
+        the typed command is dropped."""
+        return _format_console_response(self._capture_raw(full_cmd, timeout))
 
     def _send_confirmed(self, cmd: str, success_phrase: str, timeout: float = 30,
                         retries: int = 3, log=None) -> bool:
@@ -383,9 +389,31 @@ class BedrockBackend(ServerBackend):
 
     # --- server-side queries ---
     def query_online_players(self) -> list[str]:
-        self.send_command("list")
-        time.sleep(1)
-        return self._scan_list_output()
+        """Ask the server who is online via ``list``. Raises when the server
+        doesn't answer (base contract: raises on transport failure).
+
+        Parses only output written AFTER the command (EOF-anchored raw
+        capture). The old implementation scanned the console.log TAIL,
+        history included — against a stopped server that replayed the last
+        response from when it was still up, reporting "no players online"
+        (or worse, stale player names) instead of failing. The names line is
+        unprefixed in BDS output, so the raw capture is parsed here rather
+        than the prefixed-lines-only ``capture_command``."""
+        text = self._capture_raw("list", timeout=5.0)
+        lines = text.splitlines()
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = _strip_prefix(lines[i])
+            m = _RE_LIST_HEADER.search(stripped)
+            if m:
+                if int(m.group(1)) == 0:
+                    return []
+                # Names follow the ':' on this line, or on the next line.
+                after = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+                if not after and i + 1 < len(lines):
+                    after = _strip_prefix(lines[i + 1])
+                return [n.strip() for n in after.split(", ") if n.strip()]
+        raise RuntimeError("no response to 'list' — the server appears to be "
+                           "offline")
 
     def is_player_online(self, username: str) -> bool:
         target = username.lower()
@@ -739,18 +767,3 @@ class BedrockBackend(ServerBackend):
         logger.warning("Bedrock: save query listed missing file: %s", rel)
         return None
 
-    def _scan_list_output(self) -> list[str]:
-        """Parse the most recent `list` response from console.log."""
-        lines = self._tail()
-        for i in range(len(lines) - 1, -1, -1):
-            stripped = _strip_prefix(lines[i])
-            m = _RE_LIST_HEADER.search(stripped)
-            if m:
-                if int(m.group(1)) == 0:
-                    return []
-                # Names follow the ':' on this line, or on the next line.
-                after = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
-                if not after and i + 1 < len(lines):
-                    after = _strip_prefix(lines[i + 1])
-                return [n.strip() for n in after.split(", ") if n.strip()]
-        return []

@@ -260,8 +260,20 @@ def _capture_initial_online(server, bot) -> None:
     try:
         online = backend.query_online_players()
     except Exception as e:
-        # Server not reachable yet — it may be booting. Wait activity-aware
-        # (extends while the log grows), then retry once it's online.
+        # No answer. Establish WHY before waiting: a server that is simply
+        # not running is answered decisively by the probe in seconds —
+        # without it, the 2-minute is_online poll below types `list` into
+        # the idle shell prompt every few seconds.
+        if backend.probe_stopped(timeout=10) is True:
+            logger.warning("[%s] Server is not running (its console is a "
+                           "shell prompt).", server.config.name)
+            bot.alert_admins(
+                f"⚠️ {server.config.name} is not running.\n"
+                "Presence, backups and /list are unavailable until it is "
+                "started (/start).")
+            return
+        # Console is owned but silent — the server may be booting. Wait
+        # activity-aware (extends while the log grows), then retry.
         server.log.info("Online query failed (%s); waiting for the server to "
                         "come up...", e)
         if backend.wait_until_online(log_fn=server.log.info):
