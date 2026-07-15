@@ -83,8 +83,12 @@ class ConsoleMultiplexer:
         """
         pid = self._pane_shell_pid()
         if pid is None:
+            logger.warning("mux: could not resolve the pane shell pid for "
+                           "%s — pane state unknown", self.target)
             return None
         has_children = _pid_has_children(pid)
+        logger.info("mux: pane %s shell pid %d has_children=%s",
+                    self.target, pid, has_children)
         if has_children is None:
             return None
         return not has_children
@@ -174,6 +178,10 @@ class TmuxMux(ConsoleMultiplexer):
         res = _run(["tmux", "display-message", "-p", "-t", self.target,
                     "#{pane_pid}"])
         if res is None or res.returncode != 0:
+            if res is not None:
+                logger.warning("mux: tmux display-message -t %s failed "
+                               "(rc=%d): %s", self.target, res.returncode,
+                               res.stderr.strip())
             return None
         try:
             return int(res.stdout.strip())
