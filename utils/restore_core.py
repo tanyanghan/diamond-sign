@@ -276,11 +276,20 @@ def check_disk_space(chain: dict, point_idx: int, target_dir: Path,
     # Staging tree + merged zip (zip ≤ tree; deflate only shrinks).
     staging = merge_bytes * 2 if (point_idx >= 0 and establish_chain) else 0
 
+    def existing(path: Path) -> Path:
+        # The target dir may not exist yet (restore into a fresh directory
+        # creates it later); measure its nearest existing ancestor's fs.
+        path = path.resolve()
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        return path
+
     need = {}  # st_dev -> [bytes, [labels]]
     for path, size, label in ((target_dir, world_bytes, "world"),
                               (backup_dir, staging, "merge staging")):
         if size <= 0:
             continue
+        path = existing(path)
         dev = os.stat(path).st_dev
         entry = need.setdefault(dev, [0, [], path])
         entry[0] += size
@@ -406,8 +415,17 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
     merged_deletions: list = []
     re_added: set = set()
     try:
-        for incr in incrementals:
-            log(f"Applying incremental {incr['path'].name} ...")
+        total = len(incrementals)
+        report_step = max(1, (total + 9) // 10)  # ceil(total/10)
+        for i, incr in enumerate(incrementals, 1):
+            # Per-file detail goes to the bot log only (it's the forensic
+            # trail that identified a corrupt zip in the wild); the chat sees
+            # ~10% milestones — one message per zip flooded Telegram/Slack on
+            # long chains.
+            logger.info("Applying incremental %s (%d/%d)",
+                        incr["path"].name, i, total)
+            if i == 1 or i == total or i % report_step == 0:
+                log(f"Applying incremental {i} of {total} ...")
             with zipfile.ZipFile(incr["path"], "r") as zf:
                 dest_roots = (target_dir, tmp) if tmp is not None else (target_dir,)
                 for name in zf.namelist():
