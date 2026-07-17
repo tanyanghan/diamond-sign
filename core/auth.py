@@ -28,7 +28,9 @@ def _normalize_ns(ns: dict) -> dict:
     once a bot fronts several servers); single-server bots ignore it and
     announce to every authorized chat. ``chat_names`` records each authorized
     chat's human name (group/channel title) — learned + refreshed from inbound
-    messages — so logs and /listchats show names, not raw IDs.
+    messages — so logs and /chats show names, not raw IDs. ``paused_chats``
+    are authorized chats whose outbound announcements are muted
+    (/chats pause <N>); commands from them still work.
     """
     admin = ns.get("admin_user_id")
     return {
@@ -38,6 +40,7 @@ def _normalize_ns(ns: dict) -> dict:
                          for c, s in (ns.get("chat_servers") or {}).items()},
         "chat_names": {str(c): str(n)
                        for c, n in (ns.get("chat_names") or {}).items()},
+        "paused_chats": [str(c) for c in ns.get("paused_chats", [])],
     }
 
 
@@ -82,8 +85,9 @@ def auth_ns(auth: dict, platform: str) -> dict:
     ns = auth.setdefault(
         platform,
         {"admin_user_id": None, "authorized_chat_ids": [], "chat_servers": {},
-         "chat_names": {}})
-    ns.setdefault("chat_names", {})  # older docs predate chat_names
+         "chat_names": {}, "paused_chats": []})
+    ns.setdefault("chat_names", {})    # older docs predate chat_names
+    ns.setdefault("paused_chats", [])  # ...and paused_chats
     return ns
 
 

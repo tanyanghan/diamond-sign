@@ -343,9 +343,10 @@ def register_commands(router, auth: dict) -> None:
             if len(ctx.bot.servers) > 1:
                 lines.append("/use [number|server] — list/pick the server your commands act on")
             lines += [
-                "/authorize <chat_id> — whitelist a chat",
-                "/revoke <chat_id> — remove a chat from whitelist",
-                "/listchats — list authorized chats",
+                "/chats — list authorized chats (numbered)",
+                "/chats authorize <chat_id> — whitelist a chat",
+                "/chats revoke <chat_id> — remove a chat from whitelist",
+                "/chats pause|resume <N> — mute/unmute announcements to a chat",
             ]
             if backend.supports(EVENT_ACHIEVEMENT):
                 lines.append("/scan_achievements — scan all logs for achievements")
@@ -376,7 +377,7 @@ def register_commands(router, auth: dict) -> None:
             server = ctx.bot.resolve_target_server(ctx)
             if server is None:
                 ctx.reply("This chat isn't bound to a server. Ask an admin to "
-                          "/authorize it for one.")
+                          "authorize it for one (/chats authorize).")
                 return
             servers = [server]
         reply = "\n".join(_status_line(s) for s in servers)
@@ -930,23 +931,28 @@ def register_commands(router, auth: dict) -> None:
     router.register("use", cmd_use, private_only=True, admin_only=True,
                     needs_server=False)
 
-    # --- /authorize ---
-    def cmd_authorize(ctx):
+    # --- /chats (list / authorize / revoke / pause / resume) ---
+    # One umbrella for chat administration. /chat_id stays separate on
+    # purpose: it is PUBLIC (an unauthorized group runs it to learn its ID so
+    # the admin can then `/chats authorize` it), while everything here is
+    # admin-DM-only.
+
+    def _chats_authorize(ctx, args):
         multi = len(ctx.bot.servers) > 1
-        usage = ("Usage: /authorize <chat_id> <server>" if multi
-                 else "Usage: /authorize <chat_id>")
-        if not ctx.args:
+        usage = ("Usage: /chats authorize <chat_id> <server>" if multi
+                 else "Usage: /chats authorize <chat_id>")
+        if not args:
             ctx.reply(usage)
             return
-        target_id = str(ctx.args[0]).strip()
+        target_id = str(args[0]).strip()
         # Resolve the target server: single-server bots auto-bind to the sole
         # server; multi-server bots require an explicit <server> arg so the
         # channel's events aren't silently misrouted.
-        if len(ctx.args) >= 2:
-            server = ctx.bot.find_server(ctx.args[1])
+        if len(args) >= 2:
+            server = ctx.bot.find_server(args[1])
             if server is None:
                 names = ", ".join(sorted(ctx.bot.by_name)) or "(none)"
-                ctx.reply(f"Unknown server '{ctx.args[1]}'.\nServers: {names}")
+                ctx.reply(f"Unknown server '{args[1]}'.\nServers: {names}")
                 return
         elif multi:
             names = ", ".join(sorted(ctx.bot.by_name))
@@ -960,20 +966,17 @@ def register_commands(router, auth: dict) -> None:
                 ns["authorized_chat_ids"].append(target_id)
             ns["chat_servers"][target_id] = server.config.key
             save_auth(ctx.bot.auth_doc, AUTH_PATH)
-        ctx.bot.log.info("Authorize: chat %s -> %s by [%s] on [%s]",
+        ctx.bot.log.info("Chats: authorize %s -> %s by [%s] on [%s]",
                          ctx.bot.chat_display(ctx.platform, target_id),
                          server.config.name, ctx.sender_label, ctx.chat_label)
         ctx.reply(f"Chat {target_id} is now authorized for "
                   f"{server.config.name}.")
-    router.register("authorize", cmd_authorize, private_only=True,
-                    admin_only=True, needs_server=False)
 
-    # --- /revoke ---
-    def cmd_revoke(ctx):
-        if not ctx.args:
-            ctx.reply("Usage: /revoke <chat_id>")
+    def _chats_revoke(ctx, args):
+        if not args:
+            ctx.reply("Usage: /chats revoke <chat_id>")
             return
-        target_id = str(ctx.args[0]).strip()
+        target_id = str(args[0]).strip()
         with auth_lock:
             ns = auth_ns(auth, ctx.platform)
             display = ctx.bot.chat_display(ctx.platform, target_id)
@@ -982,39 +985,96 @@ def register_commands(router, auth: dict) -> None:
             if was_authed:
                 ns["authorized_chat_ids"].remove(target_id)
                 ns.get("chat_names", {}).pop(target_id, None)
+                # Drop any pause state too — a re-authorized chat starts fresh.
+                if target_id in ns.get("paused_chats", []):
+                    ns["paused_chats"].remove(target_id)
             if was_authed or was_bound:
                 save_auth(ctx.bot.auth_doc, AUTH_PATH)
-                ctx.bot.log.info("Revoke: chat %s by [%s] on [%s]",
+                ctx.bot.log.info("Chats: revoke %s by [%s] on [%s]",
                                  display, ctx.sender_label, ctx.chat_label)
                 ctx.reply(f"Chat {target_id} has been revoked.")
             else:
                 ctx.reply(f"Chat {target_id} was not authorized.")
-    router.register("revoke", cmd_revoke, private_only=True,
-                    admin_only=True, needs_server=False)
 
-    # --- /listchats ---
-    def cmd_listchats(ctx):
-        _cmd_log(ctx, "ListChats")
-        ns = auth.get(ctx.platform) or {}
-        ids = ns.get("authorized_chat_ids", [])
+    def _chats_pause_resume(ctx, args, sub):
+        # Numbers refer to the /chats listing — the (stable)
+        # authorized_chat_ids list for THIS platform.
+        ids = (auth.get(ctx.platform) or {}).get("authorized_chat_ids", [])
         if not ids:
             ctx.reply("No authorized chats.")
             return
-        binding = ns.get("chat_servers", {})
+        if not args or not args[0].isdigit():
+            ctx.reply(f"Usage: /chats {sub} <chat number> "
+                      "(numbers as shown by /chats)")
+            return
+        n = int(args[0])
+        if not (1 <= n <= len(ids)):
+            ctx.reply(f"Invalid chat number: {n}. Choose 1-{len(ids)}.")
+            return
+        cid = ids[n - 1]
+        display = ctx.bot.chat_display(ctx.platform, cid)
+        with auth_lock:
+            paused = auth_ns(auth, ctx.platform)["paused_chats"]
+            if sub == "pause":
+                if cid in paused:
+                    ctx.reply(f"{display} is already paused.")
+                    return
+                paused.append(cid)
+            else:
+                if cid not in paused:
+                    ctx.reply(f"{display} is not paused.")
+                    return
+                paused.remove(cid)
+            save_auth(ctx.bot.auth_doc, AUTH_PATH)
+        ctx.bot.log.info("Chats: %s %s by [%s] on [%s]",
+                         sub, display, ctx.sender_label, ctx.chat_label)
+        ctx.reply(f"{display} announcements "
+                  + ("paused. Commands from it still work; resume with "
+                     f"/chats resume {n}." if sub == "pause" else "resumed."))
+
+    def _chats_list(ctx):
+        ns = auth.get(ctx.platform) or {}
+        ids = ns.get("authorized_chat_ids", [])
+        if not ids:
+            ctx.reply("No authorized chats. Add one with "
+                      "/chats authorize <chat_id>.")
+            return
         names = ns.get("chat_names", {})
+        binding = ns.get("chat_servers", {})
+        paused = ns.get("paused_chats", [])
         multi = len(ctx.bot.servers) > 1
-        lines = ["Authorized chats:"]
-        for cid in ids:
+        lines = ["Authorized chats (mute one with /chats pause <N>):"]
+        for i, cid in enumerate(ids, 1):
             name = names.get(cid)
             who = f"{name} ({cid})" if name else cid
+            mark = "  [PAUSED]" if cid in paused else ""
             if multi:
                 srv = ctx.bot.by_key.get(binding.get(cid))
                 label = srv.config.name if srv else (binding.get(cid) or "(unbound)")
-                lines.append(f"  {who} -> {label}")
+                lines.append(f"  {i}. {who} -> {label}{mark}")
             else:
-                lines.append(f"  {who}")
+                lines.append(f"  {i}. {who}{mark}")
         ctx.reply("\n".join(lines))
-    router.register("listchats", cmd_listchats, private_only=True,
+
+    _CHATS_USAGE = ("Usage: /chats  |  /chats authorize <chat_id>"
+                    "  |  /chats revoke <chat_id>"
+                    "  |  /chats pause <N>  |  /chats resume <N>")
+
+    def cmd_chats(ctx):
+        _cmd_log(ctx, "Chats", f" (args={ctx.args})" if ctx.args else "")
+        sub = ctx.args[0].lower() if ctx.args else None
+        rest = ctx.args[1:]
+        if sub is None:
+            _chats_list(ctx)
+        elif sub == "authorize":
+            _chats_authorize(ctx, rest)
+        elif sub == "revoke":
+            _chats_revoke(ctx, rest)
+        elif sub in ("pause", "resume"):
+            _chats_pause_resume(ctx, rest, sub)
+        else:
+            ctx.reply(_CHATS_USAGE)
+    router.register("chats", cmd_chats, private_only=True,
                     admin_only=True, needs_server=False)
 
 

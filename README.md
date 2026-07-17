@@ -116,7 +116,7 @@ identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
         {
           "name": "survival",            // UNIQUE across the whole file, and used
                                          // verbatim as the data-dir key and the
-                                         // /use & /authorize argument — so it must
+                                         // /use & /chats authorize argument — so it must
                                          // be filesystem-safe: letters, digits,
                                          // '.', '_', '-' (NO spaces). Defaults to
                                          // the world's level-name (slugified).
@@ -170,6 +170,34 @@ Long-polling — no public URL needed. Create a bot with
 [@BotFather](https://t.me/BotFather) and put the token in the bot's
 `telegram.bot_token`, with `"telegram"` in `platforms`.
 
+To get the `/` command menu in Telegram, send `/setcommands` to @BotFather,
+pick your bot, and paste this list (keep it in sync with the Slack manifest
+below when commands change):
+
+```
+status - Show server status and who's online
+list - List known players
+stats - Player statistics
+playtime - Playtime leaderboard
+achievements - Player achievements
+deaths - Death history
+death_summary - Deaths grouped by cause
+scan_achievements - Scan logs for achievements
+scan_deaths - Scan logs for deaths
+backup - Trigger a backup now
+allowlist - Manage the allow/whitelist
+restore_player - Restore one player
+restore - Restore the whole world (stops + restarts the server)
+start - Start the server if it's offline
+chat_id - Show this chat's ID
+use - Pick the server your commands act on
+chats - List/authorize/revoke/pause chats
+help - Show commands
+```
+
+(Telegram uses the native `/status` and `/help`; only Slack needs the
+`/online`/`/commands` renames explained below.)
+
 ### Slack
 
 Uses **Socket Mode** (an outbound websocket), so no public URL or webhook is
@@ -213,9 +241,7 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
       { "command": "/start", "description": "Start the server if it's offline", "should_escape": false },
       { "command": "/chat_id", "description": "Show this chat's ID", "should_escape": false },
       { "command": "/use", "description": "Pick the server your commands act on", "should_escape": false },
-      { "command": "/authorize", "description": "Whitelist a chat", "should_escape": false },
-      { "command": "/revoke", "description": "Remove a chat", "should_escape": false },
-      { "command": "/listchats", "description": "List authorized chats", "should_escape": false },
+      { "command": "/chats", "description": "List/authorize/revoke/pause chats", "should_escape": false },
       { "command": "/commands", "description": "Show commands", "should_escape": false }
     ]
   },
@@ -238,8 +264,8 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
 > like the Telegram `/status` and `/help`. All other commands are identical
 > across platforms.
 
-Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/authorize` and
-`auth.json` handle automatically.
+Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/chats authorize`
+and `auth.json` handle automatically.
 
 ---
 
@@ -360,8 +386,8 @@ One process runs **any mix of bots × servers** from `diamondsign.json`:
 - **One bot, many servers** — add more entries to a bot's `servers`. The bot
   routes each server's events to the chats **bound** to that server, and
   server-scoped commands (`/backup`, `/restore`, …) target a server you pick with
-  **`/use <server>`** (or the channel's binding). `/authorize <chat_id> <server>`
-  binds a chat to a server. (`/status` is the exception: in an admin DM it lists
+  **`/use <server>`** (or the channel's binding). `/chats authorize <chat_id>
+  <server>` binds a chat to a server. (`/status` is the exception: in an admin DM it lists
   every server the bot fronts, so it never needs `/use`.)
 - **Many bots** — add more entries to `bots` (e.g. a separate Telegram bot per
   community). Each bot has its own tokens, its own admin, and its own slice of
@@ -388,14 +414,19 @@ stored namespaced in `auth.json`). On each platform you use:
    command such as `/status`).
 2. In the group/channel you want notifications in, send `/chat_id` to get its ID
    (works even before the chat is authorised; on Slack, invite the bot first).
-3. In a DM to the bot, send `/authorize <chat_id>` to whitelist it. On a
-   **multi-server** bot, add the target server: `/authorize <chat_id> <server>` —
-   that binds the chat so it receives *that* server's announcements.
+3. In a DM to the bot, send `/chats authorize <chat_id>` to whitelist it. On a
+   **multi-server** bot, add the target server: `/chats authorize <chat_id>
+   <server>` — that binds the chat so it receives *that* server's announcements.
 
 The bot then broadcasts each server's announcements (join/leave, deaths, …) to the
-chats bound to it, and answers commands in whichever chat they're sent.
-`/listchats` shows the authorised chats (with names and their bound server);
-`/revoke <chat_id>` removes one.
+chats bound to it, and answers commands in whichever chat they're sent. All chat
+administration lives under one command: `/chats` shows the authorised chats as a
+numbered list (with names and their bound server); `/chats revoke <chat_id>`
+removes one. `/chats pause <N>` mutes the bot's announcements to chat number `N`
+without revoking it — commands sent from the chat still work — and
+`/chats resume <N>` unmutes it. Paused chats show `[PAUSED]` in the listing, the
+state survives bot restarts (stored in `auth.json`), and revoking a chat clears
+its pause state.
 
 ---
 
@@ -412,9 +443,10 @@ chats bound to it, and answers commands in whichever chat they're sent.
 | `/death_summary` | Deaths grouped by cause with per-player counts |
 | `/chat_id` | Show the current chat's ID |
 | `/use [<server>]` | *(Admin)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only) |
-| `/authorize <chat_id> [<server>]` | *(Admin)* Whitelist a chat; on a multi-server bot bind it to `<server>` |
-| `/revoke <chat_id>` | *(Admin)* Remove a chat from the whitelist |
-| `/listchats` | *(Admin)* List authorised chats (name + bound server) |
+| `/chats` | *(Admin)* List authorised chats, numbered (name + bound server + pause state) |
+| `/chats authorize <chat_id> [<server>]` | *(Admin)* Whitelist a chat; on a multi-server bot bind it to `<server>` |
+| `/chats revoke <chat_id>` | *(Admin)* Remove a chat from the whitelist |
+| `/chats pause\|resume <N>` | *(Admin)* Mute/unmute the bot's announcements to chat `N` (commands from it still work) |
 | `/scan_achievements` | *(Admin)* Scan all log files for achievements |
 | `/scan_deaths` | *(Admin)* Scan all log files for deaths |
 | `/backup` | *(Admin)* Trigger a server backup now |
