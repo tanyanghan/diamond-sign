@@ -170,6 +170,34 @@ Long-polling — no public URL needed. Create a bot with
 [@BotFather](https://t.me/BotFather) and put the token in the bot's
 `telegram.bot_token`, with `"telegram"` in `platforms`.
 
+To get the `/` command menu in Telegram, send `/setcommands` to @BotFather,
+pick your bot, and paste this list (keep it in sync with the Slack manifest
+below when commands change):
+
+```
+status - Show server status and who's online
+list - List known players
+stats - Player statistics
+playtime - Playtime leaderboard
+achievements - Player achievements
+deaths - Death history
+death_summary - Deaths grouped by cause
+scan_achievements - Scan logs for achievements
+scan_deaths - Scan logs for deaths
+backup - Trigger a backup now
+allowlist - Manage the allow/whitelist
+restore_player - Restore one player
+restore - Restore the whole world (stops + restarts the server)
+start - Start the server if it's offline
+chat_id - Show this chat's ID
+use - Pick the server your commands act on
+chats - List/authorize/revoke/pause chats
+help - Show commands
+```
+
+(Telegram uses the native `/status` and `/help`; only Slack needs the
+`/online`/`/commands` renames explained below.)
+
 ### Slack
 
 Uses **Socket Mode** (an outbound websocket), so no public URL or webhook is
