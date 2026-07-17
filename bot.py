@@ -209,9 +209,13 @@ class Bot:
     def _server_chats(self, adapter, server):
         """Yield the authorized chat IDs on ``adapter`` that should receive
         ``server``'s announcements: all of them for a single-server bot, else
-        only those bound to the server's key."""
+        only those bound to the server's key. Chats paused via
+        /chats pause are skipped — they stay authorized (commands from
+        them still work) but receive no announcements until resumed."""
         ns = self.auth.get(adapter.name) or {}
-        chat_ids = ns.get("authorized_chat_ids", [])
+        paused = set(ns.get("paused_chats", []))
+        chat_ids = [c for c in ns.get("authorized_chat_ids", [])
+                    if c not in paused]
         if len(self.servers) == 1:
             yield from chat_ids
             return

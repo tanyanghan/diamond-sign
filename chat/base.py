@@ -140,7 +140,7 @@ class CommandRouter:
         ctx.bot = self._bot
 
         # Learn/refresh this chat's human name (for readable audit logs and
-        # /listchats). Runs on every inbound message so a group rename is caught.
+        # /chats). Runs on every inbound message so a group rename is caught.
         if self._bot is not None:
             self._bot.note_chat_name(ctx)
 

@@ -288,7 +288,7 @@ def validate_config(app: AppConfig) -> list:
                                 "set \"name\"")
             elif _slug(s.name) != s.name:
                 # The name is used verbatim as the data-dir key, the chat->server
-                # binding, and the /use & /authorize argument, so it must be
+                # binding, and the /use & /chats authorize argument, so it must be
                 # filesystem- and command-token-safe: letters, digits, '.', '_',
                 # '-' only, no spaces.
                 problems.append(
