@@ -85,6 +85,9 @@ _RE_LIST_HEADER = re.compile(r'There are (\d+)/\d+ players online:?')
 # `save query` readiness marker. The "path:bytes, ..." list follows on the
 # next (unprefixed) line(s).
 _SAVE_READY = "Files are now ready to be copied"
+# BDS error meaning its previous save/resume never finished internally — a
+# fresh snapshot will not be produced; the backup must abort, not poll on.
+_SAVE_INCOMPLETE = "A previous save has not been completed"
 # BDS log line prefix, e.g. "[2026-06-24 02:03:56:398 INFO] ".
 _RE_LOG_PREFIX = re.compile(r'^\[[^\]]*\]\s*')
 
@@ -286,15 +289,32 @@ class BedrockBackend(ServerBackend):
         Each file must be copied truncated to its reported byte length — BDS
         keeps writing past the snapshot point, and only the first N bytes of
         each file are part of the consistent snapshot.
+
+        EOF-anchored: only console output written AFTER this call counts. The
+        2026-07-16 incident: BDS never produced a fresh ready marker (it
+        errored "A previous save has not been completed"), the old tail scan
+        replayed the PREVIOUS backup's 5-minute-old listing — 7 of its 24
+        files already compacted away — and the bot built a snapshot from an
+        internally inconsistent LevelDB file set, which is both a silently
+        corrupt backup (CRC can't catch it) and pathological input to the
+        sidecar's LevelDB open. That BDS error is now a hard abort (the
+        caller's finally sends `save resume`; the next cycle retries), and a
+        listing that references missing files aborts likewise.
         """
         def log(msg):
             if log_fn:
                 log_fn(msg)
         log("Querying save state...")
+        anchor = self._log_size()
         for _ in range(60):  # ~60 s budget
             self.send_command("save query")
             time.sleep(1)
-            files = self._scan_query_output()
+            text = self._read_log_from(anchor)
+            if _SAVE_INCOMPLETE in text:
+                raise RuntimeError(
+                    f"BDS reported '{_SAVE_INCOMPLETE}' — aborting this "
+                    "backup (save will be resumed; the next cycle retries)")
+            files = self._parse_query_listing(text)
             if files is not None:
                 log(f"Snapshot ready: {len(files)} file(s)")
                 return files
@@ -702,24 +722,32 @@ class BedrockBackend(ServerBackend):
                        "relaunching (avoids a double start). Check the server.")
 
     # --- console.log parsing helpers ---
-    def _tail(self, max_bytes: int = 65536) -> list[str]:
-        """Return the last lines of console.log (empty if missing)."""
+    def _log_size(self) -> int:
+        """Current byte size of console.log (0 if missing) — the EOF anchor
+        for reads that must only see output written after this moment."""
+        try:
+            return self.config.log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _read_log_from(self, start: int) -> str:
+        """Raw console.log content from byte offset ``start`` to EOF."""
         try:
             with open(self.config.log_path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - max_bytes))
-                data = f.read()
-            return data.decode("utf-8", errors="replace").splitlines()
+                f.seek(start)
+                return f.read().decode("utf-8", errors="replace")
         except FileNotFoundError:
-            return []
+            return ""
         except OSError:
             logger.exception("Bedrock: failed to read %s", self.config.log_path)
-            return []
+            return ""
 
-    def _scan_query_output(self):
-        """Find the most recent `save query` result. Returns [(Path, bytes)] when
-        the snapshot is ready, else None.
+    def _parse_query_listing(self, text: str):
+        """Parse a `save query` ready listing out of fresh console output.
+        Returns [(Path, bytes)] when the snapshot is ready, else None. Raises
+        if the listing references files that don't exist on disk — that means
+        it is not a description of the current world (stale or inconsistent),
+        and a backup built from it would be silently corrupt.
 
         Console layout (the list is on its own unprefixed line after the marker):
             [.. INFO] Data saved. Files are now ready to be copied.
@@ -728,7 +756,11 @@ class BedrockBackend(ServerBackend):
         split on its LAST colon (path : byte-length). Paths are relative to the
         world's parent (the `worlds/` directory).
         """
-        lines = self._tail()
+        lines = text.splitlines()
+        # Drop a trailing partial line (no newline yet): parsing a token cut
+        # mid-write would yield a wrong path or a wrong truncation length.
+        if lines and not text.endswith(("\n", "\r")):
+            lines = lines[:-1]
         idx = None
         for i in range(len(lines) - 1, -1, -1):
             if _SAVE_READY in lines[i]:
@@ -739,6 +771,7 @@ class BedrockBackend(ServerBackend):
         # The listing is the unprefixed line(s) after the marker; a new log
         # message (starts with "[") or a blank line ends it.
         result = []
+        missing = []
         for line in lines[idx + 1:]:
             s = line.strip()
             if not s or s.startswith("["):
@@ -751,19 +784,25 @@ class BedrockBackend(ServerBackend):
                 if not sep or not length.strip().isdigit():
                     continue
                 path = self._resolve_listed_path(rel.strip())
-                if path is not None:
+                if path is None:
+                    missing.append(rel.strip())
+                else:
                     result.append((path, int(length.strip())))
+        if missing:
+            raise RuntimeError(
+                f"save query listed {len(missing)} missing file(s) (e.g. "
+                f"{', '.join(missing[:3])}) — the listing does not describe "
+                "the current world; aborting backup")
         return result or None
 
     def _resolve_listed_path(self, rel: str):
         """Resolve a `save query` path (e.g. "Bedrock level/db/003678.ldb",
         relative to the worlds/ directory) to an absolute path under
-        minecraft_dir."""
+        minecraft_dir. None if the file doesn't exist (caller decides)."""
         mc = self.config.minecraft_dir
         for base in (mc / "worlds", mc):
             p = base / rel
             if p.exists():
                 return p
-        logger.warning("Bedrock: save query listed missing file: %s", rel)
         return None
 
