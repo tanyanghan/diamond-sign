@@ -271,13 +271,16 @@ class Server:
         if not db_files:
             return
         try:
-            # Temp db copy goes to the backup dir (real disk), NOT the system
-            # tmp: /tmp is a tmpfs on the deployment host, where the copy's
-            # bytes are RAM taken at the backup's peak-memory moment — and
-            # both OOM kills (2026-07-11/16) hit exactly this step. RSS is
-            # logged around the build so the next incident carries data.
+            # The build runs in a short-lived SUBPROCESS: the amulet/LevelDB
+            # native layer retains memory across in-process open/close cycles
+            # (~5.5 GB after 26h of 5-minute backups; three OOM kills landed
+            # here), and a child returns its whole address space to the OS on
+            # exit. Its temp db copy goes to the backup dir (real disk), not
+            # the system tmp — a tmpfs on the deployment host, where staged
+            # bytes are RAM taken at the peak-memory moment. RSS logged so
+            # any residual growth in the main process stays visible.
             rss_before = _process_rss_mb()
-            sidecar = bedrock_player.build_sidecar_from_files(
+            sidecar = bedrock_player.build_sidecar_subprocess(
                 db_files, tmp_dir=self.config.backup_dir)
             prev = {} if full_backup else self.load_player_state()
             filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
