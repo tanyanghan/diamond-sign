@@ -681,11 +681,21 @@ class BedrockBackend(ServerBackend):
                 self.stop_server(status)
                 stopped = True
                 if not self.wait_until_stopped(timeout=120):
-                    status("⚠️ Server did not fully stop in time. "
-                           "Aborting; check the server manually.")
-                    return
+                    # This BDS build intermittently hangs during shutdown
+                    # (acknowledges `stop`, never exits). Escalate the way an
+                    # admin would: Ctrl-C on its console. Safe for the kept
+                    # world — an interrupt-forced exit is a crash, and
+                    # LevelDB's write-ahead log makes BDS crash-consistent
+                    # (it replays on the next open, same as a power loss).
+                    status("Server did not shut down in time — interrupting "
+                           "it (Ctrl-C)...")
+                    if not self.force_stop(status):
+                        status("⚠️ Server still did not stop. "
+                               "Aborting; check the server manually.")
+                        return
+                    status("Server exited after interrupt")
                 db_unlocked = True
-                status("Server stopped cleanly; world db free")
+                status("Server stopped; world db free")
 
             # 4. Resolve the live data key (per-server), back it up, overwrite.
             db_path = bedrock_player.world_db_path(self.config.minecraft_dir)
