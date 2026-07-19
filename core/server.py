@@ -31,6 +31,21 @@ from utils import restore_core
 
 logger = logging.getLogger("diamondsign")
 
+
+def _process_rss_mb() -> float | None:
+    """This process's resident set size in MB (Linux /proc; None elsewhere).
+    Used to instrument the backup's memory-heavy steps after two OOM kills
+    landed there with no data on whether the bot itself ballooned."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except OSError:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
@@ -256,13 +271,26 @@ class Server:
         if not db_files:
             return
         try:
-            sidecar = bedrock_player.build_sidecar_from_files(db_files)
+            # The build runs in a short-lived SUBPROCESS: the amulet/LevelDB
+            # native layer retains memory across in-process open/close cycles
+            # (~5.5 GB after 26h of 5-minute backups; three OOM kills landed
+            # here), and a child returns its whole address space to the OS on
+            # exit. Its temp db copy goes to the backup dir (real disk), not
+            # the system tmp — a tmpfs on the deployment host, where staged
+            # bytes are RAM taken at the peak-memory moment. RSS logged so
+            # any residual growth in the main process stays visible.
+            rss_before = _process_rss_mb()
+            sidecar = bedrock_player.build_sidecar_subprocess(
+                db_files, tmp_dir=self.config.backup_dir)
             prev = {} if full_backup else self.load_player_state()
             filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
             zf.writestr(bedrock_player.SIDECAR_NAME, json.dumps(filtered))
             self.save_player_state(new_hashes)
+            rss_after = _process_rss_mb()
+            rss_note = (f", RSS {rss_before:.0f}->{rss_after:.0f} MB"
+                        if rss_before and rss_after else "")
             log(f"Player sidecar: {len(filtered['players'])} player(s) "
-                f"({len(new_hashes)} total)")
+                f"({len(new_hashes)} total{rss_note})")
             self.maybe_learn_player(filtered, log)
         except Exception as e:
             self.log.exception("Player sidecar generation failed")

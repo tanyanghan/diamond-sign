@@ -46,6 +46,7 @@ updated to reflect the new state.
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
 import zipfile
@@ -285,7 +286,9 @@ def finalize_backup_zip(tmp_path: Path, final_path: Path, log_fn=None) -> None:
 
 
 def clean_stale_tmp(backup_dir: Path, log_fn=None) -> None:
-    """Remove leftover *.zip.tmp files (debris from a crash mid-write).
+    """Remove crash debris from the backup dir: leftover *.zip.tmp files and
+    orphaned mcn_sidecar_* temp-db dirs (the sidecar build stages its db copy
+    here — real disk, not the tmpfs system tmp).
 
     Called at the start of each backup; the caller holds the per-server
     backup lock, so no live writer's tmp file can be swept here.
@@ -299,3 +302,8 @@ def clean_stale_tmp(backup_dir: Path, log_fn=None) -> None:
                 log_fn(f"Removed stale partial backup {f.name}")
         except OSError:
             pass
+    for d in backup_dir.glob("mcn_sidecar_*"):
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            if log_fn:
+                log_fn(f"Removed stale sidecar temp dir {d.name}")

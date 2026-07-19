@@ -17,6 +17,8 @@ wheels; only the functions that touch the db require them.
 import hashlib
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -160,14 +162,21 @@ def build_player_sidecar(db) -> dict:
     }
 
 
-def build_sidecar_from_files(db_files) -> dict:
+def build_sidecar_from_files(db_files, tmp_dir=None) -> dict:
     """Build the sidecar from a save-query file set.
 
     ``db_files`` is an iterable of ``(abs_path, max_bytes)`` for the world db
     files (the live db is locked, so we copy each truncated to its snapshot
     length into a temp dir — a consistent, openable db — then read it).
+
+    ``tmp_dir`` hosts that temp copy. Callers should pass a real-disk
+    directory (e.g. the backup dir): the default system tmp is a tmpfs on
+    typical hosts, where every byte written is RAM taken at exactly the
+    backup's peak-memory moment (the OOM kills hit this step).
     """
-    tmp = Path(tempfile.mkdtemp(prefix="mcn_sidecar_"))
+    tmp = Path(tempfile.mkdtemp(
+        prefix="mcn_sidecar_",
+        dir=str(tmp_dir) if tmp_dir is not None else None))
     try:
         for path, max_bytes in db_files:
             with open(path, "rb") as src:
@@ -179,6 +188,54 @@ def build_sidecar_from_files(db_files) -> dict:
             db.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Command that launches the sidecar-build worker subprocess (module runs
+# itself; see __main__ at the bottom). A module constant so tests can swap in
+# a stub worker.
+_WORKER_ARGS = [sys.executable, "-m", "utils.bedrock_player"]
+
+
+def build_sidecar_subprocess(db_files, tmp_dir=None, timeout: float = 180) -> dict:
+    """Build the sidecar in a short-lived subprocess and return it.
+
+    Isolation, not parallelism: the amulet/LevelDB native layer retains
+    memory across in-process open/close cycles — after ~26h of 5-minute
+    incremental backups the bot reached ~5.5 GB of anonymous memory and was
+    OOM-killed (2026-07-18; the 07-11 and 07-16 kills were the same growth).
+    A child process gives every build a fresh address space and returns all
+    of it to the OS on exit, whatever the native layer leaks.
+
+    Same inputs/outputs as ``build_sidecar_from_files`` (which the worker
+    calls); raises RuntimeError on worker failure or timeout.
+    """
+    req = json.dumps({"files": [[str(p), int(n)] for p, n in db_files],
+                      "tmp_dir": str(tmp_dir) if tmp_dir is not None else None})
+    try:
+        res = subprocess.run(
+            _WORKER_ARGS, input=req, capture_output=True, text=True,
+            timeout=timeout, cwd=str(Path(__file__).resolve().parent.parent))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"sidecar worker timed out after {timeout:.0f}s")
+    if res.returncode != 0:
+        raise RuntimeError("sidecar worker failed (rc="
+                           f"{res.returncode}): {res.stderr.strip()[-500:]}")
+    try:
+        return json.loads(res.stdout)
+    except ValueError:
+        raise RuntimeError("sidecar worker produced unparseable output: "
+                           f"{res.stdout[:200]!r}")
+
+
+def _sidecar_worker_main() -> None:
+    """Worker entry (``python -m utils.bedrock_player``): read the request
+    JSON ({files: [[path, max_bytes], ...], tmp_dir}) on stdin, build the
+    sidecar in THIS process, write it as JSON to stdout, exit. Any exception
+    escapes to a non-zero exit with the traceback on stderr."""
+    req = json.load(sys.stdin)
+    files = [(Path(p), int(n)) for p, n in req["files"]]
+    tmp_dir = req.get("tmp_dir")
+    json.dump(build_sidecar_from_files(files, tmp_dir=tmp_dir), sys.stdout)
 
 
 def filter_sidecar_changed(sidecar: dict, prev_hashes: dict) -> tuple:
@@ -225,3 +282,7 @@ def resolve_from_sidecar(sidecar: dict, identity_uuid: str):
     if not entry:
         return None
     return server_key, sidecar_value(entry)
+
+
+if __name__ == "__main__":
+    _sidecar_worker_main()
