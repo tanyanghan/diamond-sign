@@ -160,14 +160,21 @@ def build_player_sidecar(db) -> dict:
     }
 
 
-def build_sidecar_from_files(db_files) -> dict:
+def build_sidecar_from_files(db_files, tmp_dir=None) -> dict:
     """Build the sidecar from a save-query file set.
 
     ``db_files`` is an iterable of ``(abs_path, max_bytes)`` for the world db
     files (the live db is locked, so we copy each truncated to its snapshot
     length into a temp dir — a consistent, openable db — then read it).
+
+    ``tmp_dir`` hosts that temp copy. Callers should pass a real-disk
+    directory (e.g. the backup dir): the default system tmp is a tmpfs on
+    typical hosts, where every byte written is RAM taken at exactly the
+    backup's peak-memory moment (the OOM kills hit this step).
     """
-    tmp = Path(tempfile.mkdtemp(prefix="mcn_sidecar_"))
+    tmp = Path(tempfile.mkdtemp(
+        prefix="mcn_sidecar_",
+        dir=str(tmp_dir) if tmp_dir is not None else None))
     try:
         for path, max_bytes in db_files:
             with open(path, "rb") as src:
