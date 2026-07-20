@@ -24,6 +24,7 @@ import shutil
 import stat
 import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from .backup_utils import (
@@ -306,6 +307,97 @@ def check_disk_space(chain: dict, point_idx: int, target_dir: Path,
         f"staging ~{format_size(staging)})")
 
 
+def _tree_bytes(root: Path) -> int:
+    """Total bytes of all files under ``root`` (the merge staging tree)."""
+    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+
+
+def _world_walk(target_dir: Path, backup_dir: Path, exclude_names):
+    """Yield the restored world's files — the set a full backup would zip:
+    skips backup-format entries (META_FILES), the chain marker, per-server
+    excludes, and the backup_dir subtree if it lives inside the world dir.
+    Mirrors the skip set of ``build_file_manifest``/``run_backup``."""
+    skip = {CHAIN_MARKER_NAME} | META_FILES | set(exclude_names or ())
+    backup_resolved = backup_dir.resolve() if backup_dir else None
+    for dirpath, _dirnames, filenames in os.walk(target_dir):
+        dp = Path(dirpath)
+        if backup_resolved is not None:
+            try:
+                dp.resolve().relative_to(backup_resolved)
+                continue
+            except ValueError:
+                pass
+        for fn in filenames:
+            if fn in skip:
+                continue
+            yield dp / fn
+
+
+def _world_bytes(target_dir: Path, backup_dir: Path, exclude_names) -> int:
+    """Total bytes a full backup of the restored world would contain."""
+    total = 0
+    for fp in _world_walk(target_dir, backup_dir, exclude_names):
+        try:
+            total += fp.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _write_full_of_restored(target_dir: Path, backup_dir: Path, server: str,
+                            restore_ts: str, exclude_names, log) -> str:
+    """Zip the restored world as a NEW full backup and return its filename.
+
+    Used when the merged incremental would rival a full in size (Bedrock's
+    LevelDB churn): the chain re-bases on this zip instead. Named with the
+    restore point's timestamp so /restore listings show the point in time it
+    represents (falls back to now on a name collision). Atomic + verified
+    like every backup zip. A Bedrock player sidecar is embedded when possible
+    — the restored db files are quiescent at full length — via the
+    memory-isolated worker; failure to build one (e.g. amulet absent on a
+    bare restore.py host) is logged and never fails the restore, matching
+    write_player_sidecar's contract.
+    """
+    full_name = f"{server}_{restore_ts}.zip"
+    if (backup_dir / full_name).exists():
+        full_name = f"{server}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    full_path = backup_dir / full_name
+    full_tmp = backup_tmp_path(full_path)
+    log(f"Creating full backup {full_name} from the restored world ...")
+    with zipfile.ZipFile(full_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fp in _world_walk(target_dir, backup_dir, exclude_names):
+            rel = str(fp.relative_to(target_dir)).replace("\\", "/")
+            zf.write(fp, rel)
+        try:
+            sidecar = _restored_world_sidecar(target_dir, backup_dir)
+            if sidecar is not None:
+                zf.writestr("_players.json", json.dumps(sidecar))
+                log(f"Player sidecar: {len(sidecar.get('players', {}))} "
+                    "player(s)")
+        except Exception as e:
+            log(f"Player sidecar skipped ({e})")
+    finalize_backup_zip(full_tmp, full_path, log_fn=log)
+    return full_name
+
+
+def _restored_world_sidecar(target_dir: Path, backup_dir: Path):
+    """Build the _players.json sidecar from the restored world's LevelDB, or
+    None when there is no Bedrock world layout (Java). The server is stopped
+    and the files are quiescent at full length, so unlike a live backup no
+    save-query truncation is needed."""
+    db_files = []
+    worlds = target_dir / "worlds"
+    if worlds.is_dir():
+        for db in worlds.glob("*/db"):
+            db_files += [(p, p.stat().st_size)
+                         for p in db.iterdir() if p.is_file()]
+    if not db_files:
+        return None
+    from . import bedrock_player
+    return bedrock_player.build_sidecar_subprocess(db_files,
+                                                   tmp_dir=backup_dir)
+
+
 def _wipe_target(target_dir: Path, preserve_names, backup_dir: Path,
                  log) -> None:
     """Clear ``target_dir`` before extracting a full snapshot, keeping bot
@@ -445,13 +537,25 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
                         if tmp is not None:
                             merged_deletions.append(rel_path)
                             re_added.discard(rel_path)
-                        del_path = target_dir / rel_path
-                        if del_path.exists():
-                            del_path.unlink()
-                            parent = del_path.parent
-                            while parent != target_dir and not any(parent.iterdir()):
-                                parent.rmdir()
-                                parent = parent.parent
+                        # Remove from the restored world AND the merge staging
+                        # tree. Staging must mirror the NET state: a deleted
+                        # file's content left in the tree rides into the merged
+                        # zip as dead weight — on Bedrock (LevelDB renames
+                        # everything on compaction) that once compounded
+                        # hundreds of 10-15 MB incrementals into a 1.6 GB
+                        # merged zip for a ~100 MB world. A file deleted then
+                        # re-added later is rewritten into staging by the later
+                        # incremental, so only genuinely-dead content is lost.
+                        roots = ((target_dir, tmp) if tmp is not None
+                                 else (target_dir,))
+                        for root in roots:
+                            del_path = root / rel_path
+                            if del_path.exists():
+                                del_path.unlink()
+                                parent = del_path.parent
+                                while parent != root and not any(parent.iterdir()):
+                                    parent.rmdir()
+                                    parent = parent.parent
 
         if not establish_chain:
             log(f"Restored {full_zip.name} + {len(incrementals)} incremental(s) "
@@ -461,29 +565,54 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
                     "chain_id": None, "merged": None, "files": None}
 
         # Step 3: establish a fresh chain so the bot can resume incrementals.
+        # The new chain's base artifact is EITHER a merged incremental (riding
+        # on the old full) or a brand-new full backup of the restored world —
+        # whichever is smaller. The merged form exists to keep future restores
+        # small (Java: ~100 MB merged vs a 3.5 GB full), but on Bedrock LevelDB
+        # renames every file within days, so the trimmed merge converges to the
+        # whole world and a restore through it does strictly more work than one
+        # fresh full. Decided by measured size, not edition, so it adapts.
         chain_id = new_chain_id(backup_dir)
-        merged_name = None
+        merged_name = new_full_name = None
+        base_full_name = full_zip.name
         if tmp is not None:
-            final_deletions = [p for p in merged_deletions if p not in re_added]
             restore_ts = incrementals[point_idx]["timestamp"]
-            merged_name = f"{chain['full']['server']}_incr_{chain_id}_{restore_ts}.zip"
-            merged_path = backup_dir / merged_name
-            merged_tmp = backup_tmp_path(merged_path)
-            log(f"Creating merged incremental {merged_name} ...")
-            with zipfile.ZipFile(merged_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                for dirpath, _dirnames, filenames in os.walk(tmp):
-                    dp = Path(dirpath)
-                    for fn in filenames:
-                        fp = dp / fn
-                        rel = str(fp.relative_to(tmp)).replace("\\", "/")
-                        zf.write(fp, rel)
-                if final_deletions:
-                    zf.writestr("_deletions.json",
-                                json.dumps(final_deletions, indent=2))
-                zf.writestr("_meta.json", json.dumps({
-                    "chain_id": chain_id, "base_full": full_zip.name}))
-            finalize_backup_zip(merged_tmp, merged_path, log_fn=log)
-            run_copy_command(merged_path, copy_cmd, log_fn=log_fn)
+            staging_bytes = _tree_bytes(tmp)
+            world_bytes = _world_bytes(target_dir, backup_dir, exclude_names)
+            if staging_bytes >= 0.5 * world_bytes:
+                # Merged would save less than half a full while forcing a
+                # two-zip restore: re-base the chain on a fresh full instead.
+                log(f"Merged incremental would be ~{format_size(staging_bytes)} "
+                    f"vs ~{format_size(world_bytes)} world — re-basing on a "
+                    "new full backup instead")
+                new_full_name = _write_full_of_restored(
+                    target_dir, backup_dir, chain["full"]["server"],
+                    restore_ts, exclude_names, log)
+                base_full_name = new_full_name
+                run_copy_command(backup_dir / new_full_name, copy_cmd,
+                                 log_fn=log_fn)
+            else:
+                final_deletions = [p for p in merged_deletions
+                                   if p not in re_added]
+                merged_name = (f"{chain['full']['server']}_incr_{chain_id}_"
+                               f"{restore_ts}.zip")
+                merged_path = backup_dir / merged_name
+                merged_tmp = backup_tmp_path(merged_path)
+                log(f"Creating merged incremental {merged_name} ...")
+                with zipfile.ZipFile(merged_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for dirpath, _dirnames, filenames in os.walk(tmp):
+                        dp = Path(dirpath)
+                        for fn in filenames:
+                            fp = dp / fn
+                            rel = str(fp.relative_to(tmp)).replace("\\", "/")
+                            zf.write(fp, rel)
+                    if final_deletions:
+                        zf.writestr("_deletions.json",
+                                    json.dumps(final_deletions, indent=2))
+                    zf.writestr("_meta.json", json.dumps({
+                        "chain_id": chain_id, "base_full": full_zip.name}))
+                finalize_backup_zip(merged_tmp, merged_path, log_fn=log)
+                run_copy_command(merged_path, copy_cmd, log_fn=log_fn)
 
         # Chain marker in the world dir.
         marker_root = marker_dir or target_dir
@@ -496,12 +625,14 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
         files = build_file_manifest(target_dir, backup_dir, exclude_names)
         if manifest_path is not None:
             manifest_path.write_text(json.dumps(
-                {"chain_id": chain_id, "base_full": full_zip.name, "files": files}))
+                {"chain_id": chain_id, "base_full": base_full_name,
+                 "files": files}))
         log(f"New chain {chain_id} established ({len(files)} files, "
-            f"base {full_zip.name})")
+            f"base {base_full_name})")
         return {"full": full_zip.name,
                 "incrementals": [i["path"].name for i in incrementals],
-                "chain_id": chain_id, "merged": merged_name, "files": len(files)}
+                "chain_id": chain_id, "merged": merged_name,
+                "new_full": new_full_name, "files": len(files)}
     finally:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)

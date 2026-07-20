@@ -654,8 +654,14 @@ list of servers** to choose from (a single-server config is auto-selected);
 groups incrementals into chains, shows restore points, and extracts the full
 backup and applies each incremental up to your pick. In server mode (in-place) it
 rebuilds the manifest and writes a fresh `.diamondsign_chain`; restoring to an
-incremental point also writes a single **merged incremental** so the new chain
-needs only the original full + that one file. The `--backup-dir P --target-dir Q`
+incremental point also consolidates the applied incrementals into a single new
+artifact so the new chain stays small — **whichever form is smaller**: a
+**merged incremental** (Java's usual case — small in-place changes against a
+multi-GB full) or a **new full backup** of the restored world (Bedrock's usual
+case — LevelDB renames every file within days, so a merge would rival the whole
+world in size while still requiring the old full underneath it). The choice is
+made by measured size, not edition; a re-based full also embeds the Bedrock
+player sidecar when the amulet libraries are available. The `--backup-dir P --target-dir Q`
 files-only mode (no server context) extracts files only — no chain reset.
 
 If you restore by other means (manual copy, other tools), delete that server's
