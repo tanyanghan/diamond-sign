@@ -137,7 +137,8 @@ def group_by_chain(fulls: dict, incrs: list) -> list:
     Returns a list of ``{chain_id, full, incrementals}`` dicts (incrementals
     sorted chronologically). Chains whose base full is missing are skipped;
     standalone fulls appear with ``chain_id=None`` and no incrementals. Sorted by
-    full timestamp then first-incremental timestamp.
+    full timestamp then LATEST-incremental timestamp (how recently the chain
+    was active — not when it started; see sort_key).
     """
     chain_map = {}
     for incr in incrs:
@@ -160,8 +161,18 @@ def group_by_chain(fulls: dict, incrs: list) -> list:
             chains.append({"chain_id": None, "full": entry, "incrementals": []})
 
     def sort_key(c):
+        # Two chains can share the same base full (a merged-incremental
+        # restore keeps riding on the original full instead of cutting a new
+        # one), tying the primary key — so the tie-break must reflect which
+        # chain is more CURRENT. chain_incrs[-1] (latest, since already
+        # sorted ascending) is the chain's most recent activity; chain_incrs
+        # [0] (earliest/chain-start) was used previously and is wrong — a
+        # chain that merely started a few minutes later than another, but
+        # then went stale while the other kept taking real incrementals for
+        # hours, sorted as "newer" and displayed above the actually-current
+        # chain in /restore.
         ts = c["full"]["timestamp"]
-        return (ts, c["incrementals"][0]["timestamp"] if c["incrementals"] else "")
+        return (ts, c["incrementals"][-1]["timestamp"] if c["incrementals"] else "")
 
     chains.sort(key=sort_key)
     return chains
