@@ -646,6 +646,14 @@ bot's environment before starting it: each checkpoint then also names the
 top 3 source lines by currently-traced allocation size via `tracemalloc`.
 Leave it unset in normal operation — `tracemalloc` has real overhead.
 
+That investigation traced a repeatable RSS increase to CRC-verifying a
+Bedrock zip's many small entries — proven (via the flat `objects` count
+across the increase) to be native allocator memory, not a Python reference
+leak — so a `malloc_trim(0)` call now runs right after that step on every
+backup, full and incremental, logging `malloc_trim: RSS <before>-><after>
+MB` so its effect is directly visible. No-op on platforms without glibc's
+`malloc_trim` (macOS, Windows, musl).
+
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
 **Java** additionally needs `mux.session` + `mux.start_cmd` set (see

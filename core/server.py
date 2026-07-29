@@ -24,7 +24,8 @@ from core.presence import reconcile_online
 from utils.backup_utils import (
     CHAIN_MARKER_NAME, META_FILES,
     backup_tmp_path, build_file_manifest, clean_stale_tmp, finalize_backup_zip,
-    log_mem, new_chain_id, process_rss_mb, run_copy_command, wait_for_settle,
+    log_mem, new_chain_id, process_rss_mb, run_copy_command, trim_memory,
+    wait_for_settle,
 )
 from utils.config import backup_exclude_names, EDITION_BEDROCK
 from utils import restore_core
@@ -394,6 +395,12 @@ class Server:
             # which phase grew.
             log_mem("full:zipped", status)
             finalize_backup_zip(tmp_path, final_path, log_fn=status)
+            # CRC-verifying a Bedrock zip (many small entries) was found to
+            # leave native allocator memory behind that Python's GC can't
+            # reach (log_mem's object count already returns to baseline —
+            # this is glibc arena growth, not a reference leak). Ask for it
+            # back right where it was created.
+            trim_memory(status)
             log_mem("full:finalized", status)
             size_mb = final_path.stat().st_size / (1024 * 1024)
             status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
@@ -543,6 +550,11 @@ class Server:
                     self.write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
 
                 finalize_backup_zip(tmp_path, zip_path, log_fn=inc_log)
+                # Same trim as the full-backup path, for consistency — the
+                # incremental zips verified here were small in the
+                # investigation and showed little cost, but this keeps both
+                # paths uniform rather than special-casing one of them.
+                trim_memory(inc_log)
                 size_mb = zip_path.stat().st_size / (1024 * 1024)
                 self.log.info("Incremental backup saved: %s (%.1f MB, %d files)",
                             zip_path.name, size_mb, len(changed))

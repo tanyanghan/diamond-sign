@@ -43,6 +43,8 @@ which files changed. After each backup (full or incremental), the manifest is
 updated to reflect the new state.
 """
 
+import ctypes
+import ctypes.util
 import gc
 import os
 import re
@@ -114,6 +116,63 @@ def log_mem(tag: str, log_fn=None) -> None:
                 f"{s.size / 1024:.0f}KB" for s in top)
             parts.append(f"top=[{top_str}]")
     log_fn(" ".join(parts))
+
+
+def _load_malloc_trim():
+    """Return glibc's malloc_trim as a bound ctypes function, or None if this
+    platform doesn't have it (macOS, Windows, musl libc) — any failure mode
+    (no libc, CDLL open failure, symbol absent) collapses to None so callers
+    never need their own try/except.
+
+    malloc_trim is glibc-specific, so this only even attempts a load on
+    POSIX — on Windows, ``ctypes.CDLL(None)`` (the POSIX "no path" fallback
+    that opens the main program's own symbol table via dlopen(NULL)) raises
+    TypeError rather than a clean OSError, since LoadLibrary has no
+    equivalent "give me myself" call.
+    """
+    if os.name != "posix":
+        return None
+    try:
+        path = ctypes.util.find_library("c")
+        lib = ctypes.CDLL(path) if path else ctypes.CDLL(None)
+        _ = lib.malloc_trim  # raises AttributeError if the symbol is absent
+        return lib
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+_libc = _load_malloc_trim()
+
+
+def trim_memory(log_fn=None) -> None:
+    """Ask glibc to return freed heap pages to the OS (``malloc_trim(0)``).
+
+    2026-07-29 investigation: a Bedrock full backup's CRC-verification step
+    (``finalize_backup_zip``'s ``testzip()``, which opens and decompresses
+    many small zip entries — Bedrock zips have far more, smaller files than
+    Java's) left a reproducible +5 to +7 MB RSS increase per call, three
+    times in one test. ``log_mem``'s object count proved this was NOT
+    retained Python references — the count returned to baseline by the very
+    next backup call each time — so the growth is native allocator memory
+    that Python freed but glibc never handed back to the OS. This asks it
+    to, right after that step.
+
+    No-op on platforms without ``malloc_trim`` (macOS, Windows, musl): the
+    growth this targets is glibc-arena-specific, so there's nothing to trim
+    there and this safely does nothing. Always logs (when given a log_fn),
+    not just on a detected change, so a backup log directly answers "did
+    this help" without needing DIAMONDSIGN_MEMTRACE.
+    """
+    if _libc is None:
+        return
+    before = process_rss_mb()
+    _libc.malloc_trim(ctypes.c_int(0))
+    if log_fn is None:
+        return
+    after = process_rss_mb()
+    if before is not None and after is not None:
+        log_fn(f"malloc_trim: RSS {before:.0f}->{after:.0f} MB")
+
 
 # Name of the chain marker file placed in the Minecraft server directory.
 # This file is excluded from all backup zips — it's metadata about the
