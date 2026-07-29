@@ -43,6 +43,7 @@ which files changed. After each backup (full or incremental), the manifest is
 updated to reflect the new state.
 """
 
+import gc
 import os
 import re
 import secrets
@@ -51,6 +52,68 @@ import subprocess
 import time
 import zipfile
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Memory diagnostics
+# ---------------------------------------------------------------------------
+# Added after repeated OOM kills (2026-07-11/16/18) traced to the Bedrock
+# player-sidecar build (fixed: PR #14 isolated it in a subprocess) and a
+# slower, still-unexplained multi-day RSS creep that survived that fix. The
+# existing single before/after-sidecar RSS line can't say WHICH phase of a
+# backup is responsible, or whether growth is live Python objects (a real
+# reference leak, fixable in this code) vs. native/allocator memory (e.g. an
+# un-isolated zipfile/subprocess buffer that glibc's malloc never hands back
+# to the OS — fixable with malloc_trim or subprocess isolation instead).
+# log_mem() answers both questions cheaply (RSS + live object count, always
+# on) and, when DIAMONDSIGN_MEMTRACE=1 is set before the bot starts, points
+# at the exact allocating source lines via tracemalloc (opt-in: tracemalloc
+# has real overhead, so it must never run by default).
+_MEMTRACE = os.environ.get("DIAMONDSIGN_MEMTRACE") == "1"
+if _MEMTRACE:
+    import tracemalloc
+    tracemalloc.start(10)
+
+
+def process_rss_mb() -> float | None:
+    """This process's resident set size in MB (Linux /proc; None elsewhere)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except OSError:
+        pass
+    return None
+
+
+def log_mem(tag: str, log_fn=None) -> None:
+    """Log a named memory checkpoint: RSS, live Python object count, and (only
+    with DIAMONDSIGN_MEMTRACE=1) the top-3 allocating source lines by current
+    traced size.
+
+    How to read a sequence of these across one backup: if RSS climbs while
+    ``objects`` stays flat, the growth is native/allocator memory — a buffer
+    (zipfile deflate, a captured subprocess pipe) that Python freed but glibc
+    kept mapped; malloc_trim or moving the work to a subprocess is the fix. If
+    ``objects`` climbs in step with RSS, something in THIS process is holding
+    Python references — enable DIAMONDSIGN_MEMTRACE and restart to see exactly
+    which source line via the ``top=`` field.
+    """
+    if log_fn is None:
+        return
+    parts = [f"[{tag}]"]
+    rss = process_rss_mb()
+    if rss is not None:
+        parts.append(f"RSS={rss:.0f}MB")
+    parts.append(f"objects={len(gc.get_objects())}")
+    if _MEMTRACE and tracemalloc.is_tracing():
+        top = tracemalloc.take_snapshot().statistics("lineno")[:3]
+        if top:
+            top_str = ", ".join(
+                f"{Path(s.traceback[0].filename).name}:{s.traceback[0].lineno}="
+                f"{s.size / 1024:.0f}KB" for s in top)
+            parts.append(f"top=[{top_str}]")
+    log_fn(" ".join(parts))
 
 # Name of the chain marker file placed in the Minecraft server directory.
 # This file is excluded from all backup zips — it's metadata about the
@@ -215,10 +278,17 @@ def run_copy_command(file_path: Path, cmd_template: str, log_fn=None) -> None:
     copy_cmd = cmd_template.replace("{file}", str(file_path))
     log("Running copy command...")
     try:
+        # capture_output=True buffers stdout/stderr FULLY in memory before
+        # subprocess.run returns — a copy command that prints a lot (e.g.
+        # rsync --progress over many files) can allocate a large temporary
+        # string here. Logged so a memory-growth investigation can see
+        # whether this is a contributor without guessing.
         result = subprocess.run(copy_cmd, shell=True, capture_output=True,
                                 text=True, timeout=600)
+        out_bytes = len(result.stdout) + len(result.stderr)
         if result.returncode == 0:
-            log("Copy command completed successfully")
+            log(f"Copy command completed successfully "
+                f"({out_bytes} byte(s) of output captured)")
         else:
             log(f"Copy command failed (rc={result.returncode}): "
                 f"{result.stderr.strip()}")

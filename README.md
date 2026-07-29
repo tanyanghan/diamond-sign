@@ -630,6 +630,22 @@ backup. Chain discovery only accepts zips whose filename matches this server's
 name exactly — to quarantine a bad backup, rename it (e.g. a `corrupt_`
 prefix) and it drops out of every chain.
 
+**Memory diagnostics.** Every backup logs a memory checkpoint at each phase
+(`[full:start]`, `[full:zipped]`, `[full:finalized]`, `[full:copied]` for a
+full backup; `[incr:copied]` for an incremental) with the process's RSS and
+live Python object count — e.g. `Backup: [full:zipped] RSS=127MB
+objects=48213`. Read a sequence of these across one backup: if RSS climbs
+while `objects` stays flat, the growth is native/allocator memory (a buffer
+the process freed but the OS-level allocator kept mapped — e.g. zipfile
+deflate work or a copy command's captured output); if `objects` climbs too,
+something in this process is holding Python references. `run_copy_command`
+also logs how many bytes of output it captured (a copy command that prints a
+lot, like `rsync --progress` over many files, buffers all of it in memory
+before returning). For a deeper look, set `DIAMONDSIGN_MEMTRACE=1` in the
+bot's environment before starting it: each checkpoint then also names the
+top 3 source lines by currently-traced allocation size via `tracemalloc`.
+Leave it unset in normal operation — `tracemalloc` has real overhead.
+
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
 **Java** additionally needs `mux.session` + `mux.start_cmd` set (see
