@@ -13,6 +13,7 @@ import time
 from watchdog.events import FileSystemEventHandler
 
 from core.logparse import parse_line
+from utils.logtail import split_complete_lines
 
 
 class LogLineWaiter:
@@ -157,11 +158,29 @@ class LogWatcher(FileSystemEventHandler):
         with self._lock:
             self._check_rotation()
             try:
-                with open(self._path, "r", encoding="utf-8", errors="replace") as f:
+                with open(self._path, "rb") as f:
                     f.seek(self._pos)
-                    new_data = f.read()
-                    self._pos = f.tell()
-                for line in new_data.splitlines():
+                    new_bytes = f.read()
+                # Only consume up to the last newline — see utils.logtail.
+                # self._pos must not advance past a trailing partial line
+                # (the writer's next flush hasn't landed on disk yet): doing
+                # so would drop its still-unwritten completion into its own
+                # too-short fragment on the NEXT event, splitting one real
+                # log line across two reads so neither half matches a
+                # waiter's phrase. (2026-07-30: a 'save resume' confirmation
+                # was missed exactly this way — BDS's "Changes to the world
+                # are resumed." line landed in two writes under load from a
+                # burst of concurrent chat lines, and the bot silently
+                # re-sent a command BDS had already executed, producing "A
+                # previous save has not been completed" on the redundant
+                # resume.) Binary read + manual decode so the split can be
+                # computed at an exact byte offset — text-mode seek()/tell()
+                # cookies aren't safe to split mid-read like this.
+                complete, _leftover = split_complete_lines(new_bytes)
+                if not complete:
+                    return  # no complete line yet; wait for the next event
+                self._pos += len(complete)
+                for line in complete.decode("utf-8", errors="replace").splitlines():
                     # Check RCON confirmation waiters
                     self._check_waiters(line)
                     # Server (re)start -> resync online status (debounced).
