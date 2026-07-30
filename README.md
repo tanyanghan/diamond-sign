@@ -649,10 +649,15 @@ Leave it unset in normal operation — `tracemalloc` has real overhead.
 That investigation traced a repeatable RSS increase to CRC-verifying a
 Bedrock zip's many small entries — proven (via the flat `objects` count
 across the increase) to be native allocator memory, not a Python reference
-leak — so a `malloc_trim(0)` call now runs right after that step on every
-backup, full and incremental, logging `malloc_trim: RSS <before>-><after>
-MB` so its effect is directly visible. No-op on platforms without glibc's
-`malloc_trim` (macOS, Windows, musl).
+leak — so a `gc.collect()` + `malloc_trim(0)` call now runs right after that
+step on every backup, full and incremental, logging `malloc_trim: RSS
+<before>-><after> MB` so its effect is directly visible. Follow-up: a fresh
+process's first call for each server reclaimed nothing (the zipfile
+machinery's first run leaves reference cycles only the cyclic GC breaks, on
+its own schedule); a second call minutes later reclaimed 2-3 MB every time.
+`gc.collect()` forces that sweep immediately instead of waiting for a second
+call. No-op on platforms without glibc's `malloc_trim` (macOS, Windows,
+musl).
 
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.

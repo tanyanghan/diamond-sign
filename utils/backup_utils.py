@@ -145,7 +145,8 @@ _libc = _load_malloc_trim()
 
 
 def trim_memory(log_fn=None) -> None:
-    """Ask glibc to return freed heap pages to the OS (``malloc_trim(0)``).
+    """Force a GC pass, then ask glibc to return freed heap pages to the OS
+    (``gc.collect()`` + ``malloc_trim(0)``).
 
     2026-07-29 investigation: a Bedrock full backup's CRC-verification step
     (``finalize_backup_zip``'s ``testzip()``, which opens and decompresses
@@ -157,15 +158,31 @@ def trim_memory(log_fn=None) -> None:
     that Python freed but glibc never handed back to the OS. This asks it
     to, right after that step.
 
+    2026-07-29 follow-up: the first ``malloc_trim`` call after a fresh bot
+    start reclaimed nothing (0 MB) on every server; the SECOND call for the
+    same server (minutes later, same process) reclaimed 2-3 MB every time.
+    ``malloc_trim`` can only return memory that's already free — the
+    zipfile/decompressor machinery's first run through a fresh process
+    likely leaves reference CYCLES that only Python's cyclic GC (not plain
+    refcounting) breaks, and that collector runs on its own schedule, not
+    synchronously when a function returns. A second call to the same code
+    path found that first run's garbage already swept and had real free
+    space to hand back. ``gc.collect()`` forces that sweep immediately
+    instead of waiting for a second call — sub-100ms on a process this
+    size, negligible next to a backup that already takes seconds.
+
     No-op on platforms without ``malloc_trim`` (macOS, Windows, musl): the
     growth this targets is glibc-arena-specific, so there's nothing to trim
-    there and this safely does nothing. Always logs (when given a log_fn),
-    not just on a detected change, so a backup log directly answers "did
-    this help" without needing DIAMONDSIGN_MEMTRACE.
+    there and this safely does nothing (gc.collect() still runs — cheap and
+    harmless everywhere, but skipped too since it only matters paired with
+    the trim it enables). Always logs (when given a log_fn), not just on a
+    detected change, so a backup log directly answers "did this help"
+    without needing DIAMONDSIGN_MEMTRACE.
     """
     if _libc is None:
         return
     before = process_rss_mb()
+    gc.collect()
     _libc.malloc_trim(ctypes.c_int(0))
     if log_fn is None:
         return
