@@ -43,6 +43,9 @@ which files changed. After each backup (full or incremental), the manifest is
 updated to reflect the new state.
 """
 
+import ctypes
+import ctypes.util
+import gc
 import os
 import re
 import secrets
@@ -51,6 +54,142 @@ import subprocess
 import time
 import zipfile
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Memory diagnostics
+# ---------------------------------------------------------------------------
+# Added after repeated OOM kills (2026-07-11/16/18) traced to the Bedrock
+# player-sidecar build (fixed: PR #14 isolated it in a subprocess) and a
+# slower, still-unexplained multi-day RSS creep that survived that fix. The
+# existing single before/after-sidecar RSS line can't say WHICH phase of a
+# backup is responsible, or whether growth is live Python objects (a real
+# reference leak, fixable in this code) vs. native/allocator memory (e.g. an
+# un-isolated zipfile/subprocess buffer that glibc's malloc never hands back
+# to the OS — fixable with malloc_trim or subprocess isolation instead).
+# log_mem() answers both questions cheaply (RSS + live object count, always
+# on) and, when DIAMONDSIGN_MEMTRACE=1 is set before the bot starts, points
+# at the exact allocating source lines via tracemalloc (opt-in: tracemalloc
+# has real overhead, so it must never run by default).
+_MEMTRACE = os.environ.get("DIAMONDSIGN_MEMTRACE") == "1"
+if _MEMTRACE:
+    import tracemalloc
+    tracemalloc.start(10)
+
+
+def process_rss_mb() -> float | None:
+    """This process's resident set size in MB (Linux /proc; None elsewhere)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except OSError:
+        pass
+    return None
+
+
+def log_mem(tag: str, log_fn=None) -> None:
+    """Log a named memory checkpoint: RSS, live Python object count, and (only
+    with DIAMONDSIGN_MEMTRACE=1) the top-3 allocating source lines by current
+    traced size.
+
+    How to read a sequence of these across one backup: if RSS climbs while
+    ``objects`` stays flat, the growth is native/allocator memory — a buffer
+    (zipfile deflate, a captured subprocess pipe) that Python freed but glibc
+    kept mapped; malloc_trim or moving the work to a subprocess is the fix. If
+    ``objects`` climbs in step with RSS, something in THIS process is holding
+    Python references — enable DIAMONDSIGN_MEMTRACE and restart to see exactly
+    which source line via the ``top=`` field.
+    """
+    if log_fn is None:
+        return
+    parts = [f"[{tag}]"]
+    rss = process_rss_mb()
+    if rss is not None:
+        parts.append(f"RSS={rss:.0f}MB")
+    parts.append(f"objects={len(gc.get_objects())}")
+    if _MEMTRACE and tracemalloc.is_tracing():
+        top = tracemalloc.take_snapshot().statistics("lineno")[:3]
+        if top:
+            top_str = ", ".join(
+                f"{Path(s.traceback[0].filename).name}:{s.traceback[0].lineno}="
+                f"{s.size / 1024:.0f}KB" for s in top)
+            parts.append(f"top=[{top_str}]")
+    log_fn(" ".join(parts))
+
+
+def _load_malloc_trim():
+    """Return glibc's malloc_trim as a bound ctypes function, or None if this
+    platform doesn't have it (macOS, Windows, musl libc) — any failure mode
+    (no libc, CDLL open failure, symbol absent) collapses to None so callers
+    never need their own try/except.
+
+    malloc_trim is glibc-specific, so this only even attempts a load on
+    POSIX — on Windows, ``ctypes.CDLL(None)`` (the POSIX "no path" fallback
+    that opens the main program's own symbol table via dlopen(NULL)) raises
+    TypeError rather than a clean OSError, since LoadLibrary has no
+    equivalent "give me myself" call.
+    """
+    if os.name != "posix":
+        return None
+    try:
+        path = ctypes.util.find_library("c")
+        lib = ctypes.CDLL(path) if path else ctypes.CDLL(None)
+        _ = lib.malloc_trim  # raises AttributeError if the symbol is absent
+        return lib
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+_libc = _load_malloc_trim()
+
+
+def trim_memory(log_fn=None) -> None:
+    """Force a GC pass, then ask glibc to return freed heap pages to the OS
+    (``gc.collect()`` + ``malloc_trim(0)``).
+
+    2026-07-29 investigation: a Bedrock full backup's CRC-verification step
+    (``finalize_backup_zip``'s ``testzip()``, which opens and decompresses
+    many small zip entries — Bedrock zips have far more, smaller files than
+    Java's) left a reproducible +5 to +7 MB RSS increase per call, three
+    times in one test. ``log_mem``'s object count proved this was NOT
+    retained Python references — the count returned to baseline by the very
+    next backup call each time — so the growth is native allocator memory
+    that Python freed but glibc never handed back to the OS. This asks it
+    to, right after that step.
+
+    2026-07-29 follow-up: the first ``malloc_trim`` call after a fresh bot
+    start reclaimed nothing (0 MB) on every server; the SECOND call for the
+    same server (minutes later, same process) reclaimed 2-3 MB every time.
+    ``malloc_trim`` can only return memory that's already free — the
+    zipfile/decompressor machinery's first run through a fresh process
+    likely leaves reference CYCLES that only Python's cyclic GC (not plain
+    refcounting) breaks, and that collector runs on its own schedule, not
+    synchronously when a function returns. A second call to the same code
+    path found that first run's garbage already swept and had real free
+    space to hand back. ``gc.collect()`` forces that sweep immediately
+    instead of waiting for a second call — sub-100ms on a process this
+    size, negligible next to a backup that already takes seconds.
+
+    No-op on platforms without ``malloc_trim`` (macOS, Windows, musl): the
+    growth this targets is glibc-arena-specific, so there's nothing to trim
+    there and this safely does nothing (gc.collect() still runs — cheap and
+    harmless everywhere, but skipped too since it only matters paired with
+    the trim it enables). Always logs (when given a log_fn), not just on a
+    detected change, so a backup log directly answers "did this help"
+    without needing DIAMONDSIGN_MEMTRACE.
+    """
+    if _libc is None:
+        return
+    before = process_rss_mb()
+    gc.collect()
+    _libc.malloc_trim(ctypes.c_int(0))
+    if log_fn is None:
+        return
+    after = process_rss_mb()
+    if before is not None and after is not None:
+        log_fn(f"malloc_trim: RSS {before:.0f}->{after:.0f} MB")
+
 
 # Name of the chain marker file placed in the Minecraft server directory.
 # This file is excluded from all backup zips — it's metadata about the
@@ -215,10 +354,17 @@ def run_copy_command(file_path: Path, cmd_template: str, log_fn=None) -> None:
     copy_cmd = cmd_template.replace("{file}", str(file_path))
     log("Running copy command...")
     try:
+        # capture_output=True buffers stdout/stderr FULLY in memory before
+        # subprocess.run returns — a copy command that prints a lot (e.g.
+        # rsync --progress over many files) can allocate a large temporary
+        # string here. Logged so a memory-growth investigation can see
+        # whether this is a contributor without guessing.
         result = subprocess.run(copy_cmd, shell=True, capture_output=True,
                                 text=True, timeout=600)
+        out_bytes = len(result.stdout) + len(result.stderr)
         if result.returncode == 0:
-            log("Copy command completed successfully")
+            log(f"Copy command completed successfully "
+                f"({out_bytes} byte(s) of output captured)")
         else:
             log(f"Copy command failed (rc={result.returncode}): "
                 f"{result.stderr.strip()}")
