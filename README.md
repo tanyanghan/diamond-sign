@@ -630,6 +630,35 @@ backup. Chain discovery only accepts zips whose filename matches this server's
 name exactly — to quarantine a bad backup, rename it (e.g. a `corrupt_`
 prefix) and it drops out of every chain.
 
+**Memory diagnostics.** Every backup logs a memory checkpoint at each phase
+(`[full:start]`, `[full:zipped]`, `[full:finalized]`, `[full:copied]` for a
+full backup; `[incr:copied]` for an incremental) with the process's RSS and
+live Python object count — e.g. `Backup: [full:zipped] RSS=127MB
+objects=48213`. Read a sequence of these across one backup: if RSS climbs
+while `objects` stays flat, the growth is native/allocator memory (a buffer
+the process freed but the OS-level allocator kept mapped — e.g. zipfile
+deflate work or a copy command's captured output); if `objects` climbs too,
+something in this process is holding Python references. `run_copy_command`
+also logs how many bytes of output it captured (a copy command that prints a
+lot, like `rsync --progress` over many files, buffers all of it in memory
+before returning). For a deeper look, set `DIAMONDSIGN_MEMTRACE=1` in the
+bot's environment before starting it: each checkpoint then also names the
+top 3 source lines by currently-traced allocation size via `tracemalloc`.
+Leave it unset in normal operation — `tracemalloc` has real overhead.
+
+That investigation traced a repeatable RSS increase to CRC-verifying a
+Bedrock zip's many small entries — proven (via the flat `objects` count
+across the increase) to be native allocator memory, not a Python reference
+leak — so a `gc.collect()` + `malloc_trim(0)` call now runs right after that
+step on every backup, full and incremental, logging `malloc_trim: RSS
+<before>-><after> MB` so its effect is directly visible. Follow-up: a fresh
+process's first call for each server reclaimed nothing (the zipfile
+machinery's first run leaves reference cycles only the cyclic GC breaks, on
+its own schedule); a second call minutes later reclaimed 2-3 MB every time.
+`gc.collect()` forces that sweep immediately instead of waiting for a second
+call. No-op on platforms without glibc's `malloc_trim` (macOS, Windows,
+musl).
+
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
 **Java** additionally needs `mux.session` + `mux.start_cmd` set (see

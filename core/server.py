@@ -24,26 +24,13 @@ from core.presence import reconcile_online
 from utils.backup_utils import (
     CHAIN_MARKER_NAME, META_FILES,
     backup_tmp_path, build_file_manifest, clean_stale_tmp, finalize_backup_zip,
-    new_chain_id, run_copy_command, wait_for_settle,
+    log_mem, new_chain_id, process_rss_mb, run_copy_command, trim_memory,
+    wait_for_settle,
 )
 from utils.config import backup_exclude_names, EDITION_BEDROCK
 from utils import restore_core
 
 logger = logging.getLogger("diamondsign")
-
-
-def _process_rss_mb() -> float | None:
-    """This process's resident set size in MB (Linux /proc; None elsewhere).
-    Used to instrument the backup's memory-heavy steps after two OOM kills
-    landed there with no data on whether the bot itself ballooned."""
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024  # kB -> MB
-    except OSError:
-        pass
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -279,14 +266,14 @@ class Server:
             # the system tmp — a tmpfs on the deployment host, where staged
             # bytes are RAM taken at the peak-memory moment. RSS logged so
             # any residual growth in the main process stays visible.
-            rss_before = _process_rss_mb()
+            rss_before = process_rss_mb()
             sidecar = bedrock_player.build_sidecar_subprocess(
                 db_files, tmp_dir=self.config.backup_dir)
             prev = {} if full_backup else self.load_player_state()
             filtered, new_hashes = bedrock_player.filter_sidecar_changed(sidecar, prev)
             zf.writestr(bedrock_player.SIDECAR_NAME, json.dumps(filtered))
             self.save_player_state(new_hashes)
-            rss_after = _process_rss_mb()
+            rss_after = process_rss_mb()
             rss_note = (f", RSS {rss_before:.0f}->{rss_after:.0f} MB"
                         if rss_before and rss_after else "")
             log(f"Player sidecar: {len(filtered['players'])} player(s) "
@@ -331,6 +318,7 @@ class Server:
 
         backup_dir.mkdir(parents=True, exist_ok=True)
         clean_stale_tmp(backup_dir, log_fn=status)
+        log_mem("full:start", status)
 
         # Step 1: Freeze the world and flush pending writes (edition-specific).
         # A stopped server can't (and needn't) freeze: its files are quiescent.
@@ -402,7 +390,18 @@ class Server:
                         _add_world_file_to_zip(zf, fp, rel, ready_map)
                 # Bedrock: embed the full player-data sidecar (baseline).
                 self.write_player_sidecar(zf, ready, full_backup=True, log=status)
+            # Isolates the raw file-write loop + sidecar from what follows
+            # (CRC verify, offsite copy) — a jump here vs. later localizes
+            # which phase grew.
+            log_mem("full:zipped", status)
             finalize_backup_zip(tmp_path, final_path, log_fn=status)
+            # CRC-verifying a Bedrock zip (many small entries) was found to
+            # leave native allocator memory behind that Python's GC can't
+            # reach (log_mem's object count already returns to baseline —
+            # this is glibc arena growth, not a reference leak). Ask for it
+            # back right where it was created.
+            trim_memory(status)
+            log_mem("full:finalized", status)
             size_mb = final_path.stat().st_size / (1024 * 1024)
             status(f"Backup saved: {final_path.name} ({size_mb:.1f} MB)")
         finally:
@@ -414,6 +413,7 @@ class Server:
 
         # Step 4: Copy off-server if configured (e.g., rsync to NAS/cloud)
         run_copy_command(final_path, self.config.backup_copy_cmd, log_fn=status)
+        log_mem("full:copied", status)
 
         # Step 5: Start a new incremental chain
         # Every full backup starts a fresh chain. The manifest records the mtime
@@ -550,6 +550,11 @@ class Server:
                     self.write_player_sidecar(zf, ready, full_backup=False, log=inc_log)
 
                 finalize_backup_zip(tmp_path, zip_path, log_fn=inc_log)
+                # Same trim as the full-backup path, for consistency — the
+                # incremental zips verified here were small in the
+                # investigation and showed little cost, but this keeps both
+                # paths uniform rather than special-casing one of them.
+                trim_memory(inc_log)
                 size_mb = zip_path.stat().st_size / (1024 * 1024)
                 self.log.info("Incremental backup saved: %s (%.1f MB, %d files)",
                             zip_path.name, size_mb, len(changed))
@@ -574,6 +579,12 @@ class Server:
             # Copy off-server if configured
             run_copy_command(zip_path, self.config.backup_copy_cmd,
                              log_fn=lambda msg: self.log.info("Incremental backup: %s", msg))
+            # Single extra checkpoint (not one per phase, unlike the full-
+            # backup path): this runs every 5 min, so more granularity here
+            # would multiply production log volume for comparatively small
+            # per-call zips. Tests the same run_copy_command hypothesis on
+            # the hot path; enable DIAMONDSIGN_MEMTRACE for finer detail.
+            log_mem("incr:copied", inc_log)
 
             return str(zip_path)
 
