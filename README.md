@@ -659,6 +659,17 @@ its own schedule); a second call minutes later reclaimed 2-3 MB every time.
 call. No-op on platforms without glibc's `malloc_trim` (macOS, Windows,
 musl).
 
+**Command confirmations survive split writes.** Every console command
+diamond-sign sends and waits on (`save hold`/`save resume`, `stop`, `Server
+started`, …) is confirmed by watching the server's log for a specific phrase.
+If the server's writer flushes that line in two pieces — under load from a
+burst of concurrent events, for instance — the tailer holds the boundary at
+the last complete line and picks the rest up on the next read, rather than
+processing (and discarding) a half-written line and silently missing the
+phrase. Without this, a genuine confirmation could go undetected and trigger
+an unnecessary retry — including a redundant `save resume` that BDS then
+rejects with "A previous save has not been completed".
+
 **Restart transport.** `/restore` must stop and restart the server. **Bedrock**
 already runs under tmux/screen with a start command, so it works out of the box.
 **Java** additionally needs `mux.session` + `mux.start_cmd` set (see

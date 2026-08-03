@@ -24,6 +24,7 @@ import time
 from datetime import datetime
 
 from utils.backup_utils import RE_FULL, RE_INCR
+from utils.logtail import split_complete_lines
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH,
     CAP_PLAYER_RESTORE, CAP_STATS,
@@ -309,7 +310,13 @@ class BedrockBackend(ServerBackend):
         for _ in range(60):  # ~60 s budget
             self.send_command("save query")
             time.sleep(1)
-            text = self._read_log_from(anchor)
+            # Re-read the SAME anchor->EOF range every iteration (not an
+            # incrementally-advancing position), so a trailing partial line
+            # can simply be dropped here — see utils.logtail — with no data
+            # lost: once the writer finishes flushing it, the next poll's
+            # re-read from this same anchor picks it up whole.
+            complete, _leftover = split_complete_lines(self._read_log_from(anchor))
+            text = complete.decode("utf-8", errors="replace")
             if _SAVE_INCOMPLETE in text:
                 raise RuntimeError(
                     f"BDS reported '{_SAVE_INCOMPLETE}' — aborting this "
@@ -740,17 +747,22 @@ class BedrockBackend(ServerBackend):
         except OSError:
             return 0
 
-    def _read_log_from(self, start: int) -> str:
-        """Raw console.log content from byte offset ``start`` to EOF."""
+    def _read_log_from(self, start: int) -> bytes:
+        """Raw console.log bytes from byte offset ``start`` to EOF.
+
+        Returns bytes (not decoded text): callers must run this through
+        ``utils.logtail.split_complete_lines`` first and decode only the
+        complete portion, so a trailing partial line is never parsed.
+        """
         try:
             with open(self.config.log_path, "rb") as f:
                 f.seek(start)
-                return f.read().decode("utf-8", errors="replace")
+                return f.read()
         except FileNotFoundError:
-            return ""
+            return b""
         except OSError:
             logger.exception("Bedrock: failed to read %s", self.config.log_path)
-            return ""
+            return b""
 
     def _parse_query_listing(self, text: str):
         """Parse a `save query` ready listing out of fresh console output.
@@ -758,6 +770,11 @@ class BedrockBackend(ServerBackend):
         if the listing references files that don't exist on disk — that means
         it is not a description of the current world (stale or inconsistent),
         and a backup built from it would be silently corrupt.
+
+        ``text`` must already be complete-lines-only (the caller runs the raw
+        read through ``utils.logtail.split_complete_lines`` first) — a
+        trailing partial line would parse a token cut mid-write into a wrong
+        path or a wrong truncation length.
 
         Console layout (the list is on its own unprefixed line after the marker):
             [.. INFO] Data saved. Files are now ready to be copied.
@@ -767,10 +784,6 @@ class BedrockBackend(ServerBackend):
         world's parent (the `worlds/` directory).
         """
         lines = text.splitlines()
-        # Drop a trailing partial line (no newline yet): parsing a token cut
-        # mid-write would yield a wrong path or a wrong truncation length.
-        if lines and not text.endswith(("\n", "\r")):
-            lines = lines[:-1]
         idx = None
         for i in range(len(lines) - 1, -1, -1):
             if _SAVE_READY in lines[i]:
