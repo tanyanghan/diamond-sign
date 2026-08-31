@@ -173,6 +173,11 @@ class ServerBackend(ABC):
         # is clean (Bedrock's captured output is already plain).
         return strip_minecraft_formatting(self.capture_command(cmd, timeout=timeout))
 
+    # Whether seed_command() needs the server running. True here because the
+    # base implementation asks the console (Java/RCON); Bedrock overrides it
+    # to False, reading level.dat instead.
+    SEED_NEEDS_ONLINE = True
+
     def seed_command(self, timeout: float = 5.0) -> str:
         """Ask the server for its world seed and return the console response.
 

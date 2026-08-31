@@ -438,13 +438,17 @@ def register_commands(router, auth: dict) -> None:
                          ctx.sender_label, len(entries))
     router.register("list", cmd_list)
 
-    # --- /seed (world seed, asked of the running server) ---
+    # --- /seed (world seed: console command on Java, level.dat on Bedrock) ---
     def cmd_seed(ctx):
         _cmd_log(ctx, "Seed")
         server = ctx.server
         backend = server.backend
-        if not backend.is_available():
-            ctx.reply("Server is not reachable right now — try again once it's up.")
+        # Deliberately NOT registered needs_online: only the console-based
+        # implementation (Java/RCON) requires a running server. Bedrock reads
+        # level.dat, so it answers whether the server is up or down.
+        if backend.SEED_NEEDS_ONLINE and not backend.is_online():
+            ctx.reply(f"⚠️ {server.config.name} is offline — /seed needs the "
+                      "server running. Start it with /start.")
             return
 
         # Run in a thread: the Bedrock capture polls console.log for up to a
@@ -464,7 +468,7 @@ def register_commands(router, auth: dict) -> None:
                              monospace=True)
 
         threading.Thread(target=run, daemon=True).start()
-    router.register("seed", cmd_seed, needs_online=True)
+    router.register("seed", cmd_seed)
 
     # --- /achievements ---
     def cmd_achievements(ctx):

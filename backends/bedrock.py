@@ -22,8 +22,10 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from utils.backup_utils import RE_FULL, RE_INCR
+from utils.config import get_level_name
 from utils.logtail import split_complete_lines
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH,
@@ -144,6 +146,108 @@ def _format_console_response(text: str) -> str:
             continue  # behavior-pack event marker (async; not command output)
         lines.append(stripped)
     return "\n".join(lines)
+
+
+# --- world seed (level.dat) -------------------------------------------------
+# BDS has no `seed` console command (Java does, over RCON) -- in game you read
+# the seed off the world settings screen. The value behind that screen is the
+# `RandomSeed` Long in the world's level.dat, so /seed reads it from there.
+#
+# Bedrock's level.dat is NOT Java's gzipped big-endian NBT: it is an 8-byte
+# header (storage version + payload length, both little-endian int32) followed
+# by an UNCOMPRESSED little-endian NBT compound -- the same encoding the player
+# records use (see utils/bedrock_player.py).
+_LEVEL_DAT_HEADER = 8
+_SEED_KEY = "RandomSeed"
+
+
+def _decode_level_dat(raw: bytes):
+    """Parse Bedrock level.dat bytes into an NBT compound (needs amulet_nbt)."""
+    import amulet_nbt
+    attempts = []
+    if len(raw) > _LEVEL_DAT_HEADER:
+        declared = int.from_bytes(raw[4:_LEVEL_DAT_HEADER], "little")
+        body = raw[_LEVEL_DAT_HEADER:]
+        # Trust the header's length field when it agrees with what's on disk,
+        # so trailing padding is dropped; otherwise take the whole tail.
+        attempts.append(body[:declared] if 0 < declared <= len(body) else body)
+    # Some tools hand back the bare NBT with no header at all; try that too
+    # rather than failing on a layout we can still read.
+    attempts.append(raw)
+    last = None
+    for data in attempts:
+        try:
+            return amulet_nbt.load(data, little_endian=True,
+                                   compressed=False).compound
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"could not parse level.dat ({last})")
+
+
+# A top-level named Long is encoded as 0x04 (TAG_Long), the name length as a
+# little-endian int16, the name bytes, then the 8-byte little-endian value.
+_SEED_SIGNATURE = (b"" + len(_SEED_KEY).to_bytes(2, "little")
+                   + _SEED_KEY.encode("utf-8"))
+
+
+def _scan_random_seed(raw: bytes):
+    """Locate RandomSeed by its NBT byte signature, without a parser.
+
+    amulet_nbt is an OPTIONAL dependency here (see requirements.txt: it is
+    left out because amulet-leveldb has no Linux wheels), so a Bedrock host
+    that never set up per-player restore would otherwise get no seed at all.
+    The signature above is specific enough to locate unambiguously in an
+    uncompressed little-endian level.dat, which keeps /seed working there.
+    Returns None if not found.
+    """
+    i = raw.find(_SEED_SIGNATURE)
+    if i == -1:
+        return None
+    start = i + len(_SEED_SIGNATURE)
+    if start + 8 > len(raw):
+        return None
+    return int.from_bytes(raw[start:start + 8], "little", signed=True)
+
+
+def _seed_from_bytes(raw: bytes):
+    """Extract RandomSeed from level.dat bytes, or None. Prefers a real NBT
+    parse; falls back to the byte-signature scan when amulet_nbt is absent or
+    the file does not parse."""
+    comp = None
+    try:
+        comp = _decode_level_dat(raw)
+    except ImportError:
+        pass            # amulet libs not installed on this host
+    except Exception:
+        pass            # unparseable/torn -- the scan may still find it
+    if comp is not None:
+        tag = comp.get(_SEED_KEY)
+        if tag is not None:
+            return int(getattr(tag, "py_int", tag))
+    return _scan_random_seed(raw)
+
+
+def read_level_seed(minecraft_dir) -> int:
+    """Return the world seed from the Bedrock world's level.dat.
+
+    Raises RuntimeError with a chat-ready reason if it cannot be determined.
+    """
+    world = Path(minecraft_dir) / "worlds" / get_level_name(minecraft_dir)
+    # level.dat_old is BDS's own previous-good copy; fall back to it when the
+    # live file is absent or caught mid-rewrite.
+    candidates = [world / "level.dat", world / "level.dat_old"]
+    if not any(c.exists() for c in candidates):
+        raise RuntimeError(f"no level.dat under {world}")
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            seed = _seed_from_bytes(path.read_bytes())
+        except OSError as e:
+            continue
+        if seed is not None:
+            return seed
+    raise RuntimeError(f"no '{_SEED_KEY}' found in level.dat under {world}")
 
 
 class BedrockBackend(ServerBackend):
@@ -413,6 +517,23 @@ class BedrockBackend(ServerBackend):
             if attempt < 3:
                 log(f"Relaunch not confirmed (attempt {attempt}/3), retrying")
         return False
+
+    # Bedrock reads the seed from level.dat rather than the console, so
+    # unlike Java it does not need the server running. It works equally
+    # well with the server UP: the seed is fixed at world creation and
+    # never changes, and BDS only rewrites level.dat occasionally (on
+    # save/shutdown). read_level_seed() falls back to level.dat_old if it
+    # ever catches the live file mid-rewrite.
+    SEED_NEEDS_ONLINE = False
+
+    def seed_command(self, timeout: float = 5.0) -> str:
+        """Return the world seed, read from level.dat.
+
+        Overrides the base RCON-style implementation: BDS has no ``seed``
+        console command. ``timeout`` is accepted for signature compatibility
+        and unused -- this touches a file, not the console.
+        """
+        return f"Seed: {read_level_seed(self.config.minecraft_dir)}"
 
     # --- server-side queries ---
     def query_online_players(self) -> list[str]:
