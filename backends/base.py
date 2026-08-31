@@ -173,6 +173,20 @@ class ServerBackend(ABC):
         # is clean (Bedrock's captured output is already plain).
         return strip_minecraft_formatting(self.capture_command(cmd, timeout=timeout))
 
+    def seed_command(self, timeout: float = 5.0) -> str:
+        """Ask the server for its world seed and return the console response.
+
+        Both editions expose a ``seed`` console command (Java answers over
+        RCON, Bedrock echoes to the captured console log), so this needs no
+        per-edition override. The response is passed back verbatim rather
+        than parsed: the exact wording differs between editions and across
+        versions (Java brackets the value, Bedrock does not), and reporting
+        whatever the server actually said is both simpler and more robust
+        than pattern-matching it. Colour codes are stripped for chat.
+        """
+        return strip_minecraft_formatting(
+            self.capture_command("seed", timeout=timeout))
+
     def broadcast(self, message: str) -> None:
         """Announce ``message`` to all players in-game via the console ``say``
         command. Works on both editions (Java over RCON, Bedrock over the mux).

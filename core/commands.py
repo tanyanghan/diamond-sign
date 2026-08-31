@@ -16,7 +16,6 @@ from pathlib import Path
 
 from backends import CAP_PLAYER_RESTORE, CAP_STATS, EVENT_DEATH, EVENT_ACHIEVEMENT
 from utils import restore_core
-from utils.config import read_server_properties
 from core.auth import AUTH_PATH, auth_lock, save_auth, auth_ns, is_admin
 from core.state import (
     refresh_player_names, register_player, uuid_by_name,
@@ -439,38 +438,33 @@ def register_commands(router, auth: dict) -> None:
                          ctx.sender_label, len(entries))
     router.register("list", cmd_list)
 
-    # --- /seed (world seed, read from server.properties) ---
+    # --- /seed (world seed, asked of the running server) ---
     def cmd_seed(ctx):
         _cmd_log(ctx, "Seed")
         server = ctx.server
-        props = read_server_properties(server.config.minecraft_dir)
-        seed = props.get("level-seed", "").strip()
-        if seed:
-            ctx.reply(f"World seed for {server.config.name}: {seed}")
-            ctx.bot.log.info("Seed: replied to [%s] — %s",
-                             ctx.sender_label, seed)
+        backend = server.backend
+        if not backend.is_available():
+            ctx.reply("Server is not reachable right now — try again once it's up.")
             return
-        # Distinguish "no file" from "file present, key blank": they need
-        # different fixes, and a bare empty reply would be baffling either
-        # way. `level-seed` records the seed the world was CREATED with, so
-        # it is blank whenever the operator let the server pick a random one
-        # — server.properties is never back-filled with the generated value
-        # (that lives in the world's level.dat).
-        if not props:
-            ctx.reply(f"Couldn't read server.properties for "
-                      f"{server.config.name} (missing or unreadable at "
-                      f"{server.config.minecraft_dir}).")
-            ctx.bot.log.info("Seed: replied to [%s] — server.properties "
-                             "missing/unreadable", ctx.sender_label)
-            return
-        ctx.reply(f"No seed recorded for {server.config.name}: 'level-seed' "
-                  "in server.properties is blank, which means the world was "
-                  "generated from a random seed. Run the in-game /seed "
-                  "command to read it from the world itself.")
-        ctx.bot.log.info("Seed: replied to [%s] — level-seed blank",
-                         ctx.sender_label)
-    # Reads a file, so no needs_online: it still answers with the server down.
-    router.register("seed", cmd_seed)
+
+        # Run in a thread: the Bedrock capture polls console.log for up to a
+        # few seconds, and blocking the dispatcher would stall other commands.
+        def run():
+            try:
+                resp = backend.seed_command()
+            except Exception as e:
+                server.log.exception("Seed command failed")
+                ctx.adapter.send(ctx.chat_id, f"Seed command failed: {e}")
+                return
+            resp = resp.strip()
+            server.log.info("Seed: replied to [%s] — %s",
+                            ctx.sender_label, resp or "(no output)")
+            ctx.adapter.send(ctx.chat_id,
+                             resp or "(server returned no output)",
+                             monospace=True)
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("seed", cmd_seed, needs_online=True)
 
     # --- /achievements ---
     def cmd_achievements(ctx):

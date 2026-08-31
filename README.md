@@ -438,7 +438,7 @@ its pause state.
 |---------|-------------|
 | `/status` | Show whether the server is online, and who's playing. In an admin DM it lists every server the bot fronts; in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
-| `/seed` | Show the world seed, read from the server's `server.properties` (`level-seed`) |
+| `/seed` | Show the world seed (runs the server's `seed` console command; needs the server up) |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
 | `/achievements [player]` | Show player achievements with timestamps |
