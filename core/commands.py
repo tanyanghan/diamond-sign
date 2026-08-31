@@ -325,6 +325,7 @@ def register_commands(router, auth: dict) -> None:
             "Available commands:",
             f"{ctx.adapter.command_label('status')} — show online players",
             "/list — list all known players",
+            "/seed — show the world seed",
         ]
         if backend.supports(CAP_STATS):
             lines += [
@@ -436,6 +437,38 @@ def register_commands(router, auth: dict) -> None:
         ctx.bot.log.info("List: replied to [%s] — %d known player(s)",
                          ctx.sender_label, len(entries))
     router.register("list", cmd_list)
+
+    # --- /seed (world seed: console command on Java, level.dat on Bedrock) ---
+    def cmd_seed(ctx):
+        _cmd_log(ctx, "Seed")
+        server = ctx.server
+        backend = server.backend
+        # Deliberately NOT registered needs_online: only the console-based
+        # implementation (Java/RCON) requires a running server. Bedrock reads
+        # level.dat, so it answers whether the server is up or down.
+        if backend.SEED_NEEDS_ONLINE and not backend.is_online():
+            ctx.reply(f"⚠️ {server.config.name} is offline — /seed needs the "
+                      "server running. Start it with /start.")
+            return
+
+        # Run in a thread: the Bedrock capture polls console.log for up to a
+        # few seconds, and blocking the dispatcher would stall other commands.
+        def run():
+            try:
+                resp = backend.seed_command()
+            except Exception as e:
+                server.log.exception("Seed command failed")
+                ctx.adapter.send(ctx.chat_id, f"Seed command failed: {e}")
+                return
+            resp = resp.strip()
+            server.log.info("Seed: replied to [%s] — %s",
+                            ctx.sender_label, resp or "(no output)")
+            ctx.adapter.send(ctx.chat_id,
+                             resp or "(server returned no output)",
+                             monospace=True)
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("seed", cmd_seed)
 
     # --- /achievements ---
     def cmd_achievements(ctx):
