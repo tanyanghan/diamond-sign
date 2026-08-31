@@ -34,6 +34,7 @@ run **multiple bots** at once.
 | Whole-world restore | ✓ — needs `mux` set (below) | ✓ |
 | Per-player restore | ✓ | ✓ |
 | `/allowlist` | ✓ | ✓ |
+| World seed (`/seed`) | ✓ — `seed` over RCON | ✓ — read from `level.dat` (BDS has no `seed` command) |
 | Death notifications | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
 | In-game chat relay | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
 | Achievements | ✓ | ✗ — Xbox-bound, not exposed to servers |
@@ -177,6 +178,7 @@ below when commands change):
 ```
 status - Show server status and who's online
 list - List known players
+seed - Show the world seed
 stats - Player statistics
 playtime - Playtime leaderboard
 achievements - Player achievements
@@ -227,6 +229,7 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
     "slash_commands": [
       { "command": "/online", "description": "Show online players", "should_escape": false },
       { "command": "/list", "description": "List known players", "should_escape": false },
+      { "command": "/seed", "description": "Show the world seed", "should_escape": false },
       { "command": "/stats", "description": "Player statistics", "should_escape": false },
       { "command": "/playtime", "description": "Playtime leaderboard", "should_escape": false },
       { "command": "/achievements", "description": "Player achievements", "should_escape": false },
@@ -436,6 +439,7 @@ its pause state.
 |---------|-------------|
 | `/status` | Show whether the server is online, and who's playing. In an admin DM it lists every server the bot fronts; in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
+| `/seed` | Show the world seed — Java runs the server's `seed` command (needs the server up); Bedrock reads `RandomSeed` from the world's `level.dat` (works either way) |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
 | `/achievements [player]` | Show player achievements with timestamps |
