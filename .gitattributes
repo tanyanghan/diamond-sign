@@ -1,0 +1,19 @@
+# Normalise text files to LF in the repository.
+#
+# The repo was previously mixed: most files were LF, but bot.py,
+# core/server.py and core/commands.py were CRLF. Editing a CRLF file with a
+# tool that writes LF rewrote every line, so an unrelated whole-file diff
+# rode along inside a feature change (and reset `git blame` for that file).
+# Declaring the convention here means git normalises on commit regardless of
+# which editor or OS produced the file.
+#
+# The bot is developed and deployed on Linux; it drives servers over
+# tmux/screen, RCON and POSIX signals, so LF is the right target.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted. The PNG below genuinely
+# contains \r\n byte sequences in its compressed data, so it would be
+# corrupted if it were ever treated as text.
+*.png binary
+*.zip binary
+*.jar binary
