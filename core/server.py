@@ -10,6 +10,8 @@ used only by ``Server``.
 import json
 import logging
 import os
+import shlex
+import shutil
 import threading
 import time
 import zipfile
@@ -680,6 +682,50 @@ class Server:
 
     # --- Whole-world restore (stop -> replace -> restart) -------------------
 
+    def _prepare_relaunch_cwd(self, staged: bool) -> None:
+        """Point the console pane's shell at the server dir before relaunch.
+
+        Only needed after a staged swap. ``mux.start_cmd`` is a static config
+        string: the generated Bedrock default and the documented Java example
+        both begin ``cd <minecraft_dir> &&``, which re-resolves by PATH and so
+        is unaffected by the swap. But a hand-written start_cmd WITHOUT a
+        ``cd`` relies on the pane shell's working directory — and the swap
+        replaced that directory's inode, so the shell is still sitting in the
+        renamed-aside old world and would relaunch the PRE-RESTORE server,
+        silently. An explicit ``cd`` costs nothing and is a no-op when
+        start_cmd already does it.
+
+        Safe to inject: the server is confirmed stopped by the time this runs,
+        so a shell owns the pane, and ``mux.send`` refuses control characters.
+        """
+        if not staged:
+            return
+        mux = getattr(self.backend, "_mux", None)
+        if mux is None:
+            return
+        try:
+            mux.send(f"cd {shlex.quote(self.config.minecraft_dir.as_posix())}")
+        except Exception:
+            self.log.warning("Could not reset the console pane's working "
+                             "directory before relaunch (continuing)")
+
+    def _discard_old_world(self, old_world):
+        """Delete the pre-restore world a staged swap kept aside.
+
+        Only called once the server is confirmed back up: until then that
+        directory is the way back from a restored world that won't boot.
+        Returns None so the caller can clear its handle in one step.
+        """
+        if old_world is None:
+            return None
+        try:
+            shutil.rmtree(old_world, ignore_errors=True)
+            self.log.info("Removed the pre-restore world %s", old_world.name)
+        except Exception:
+            self.log.warning("Could not remove %s (harmless — delete by hand)",
+                             old_world)
+        return None
+
     def restore_world(self, chain: dict, point_idx: int, *, say) -> None:
         """Restore the whole world to a chosen backup point: warn players,
         (optionally) take a pre-restore backup, stop the server, replace its
@@ -699,22 +745,47 @@ class Server:
         """
         backend = self.backend
         warn = self.config.restore_warning_seconds
+        mc_dir = self.config.minecraft_dir
         down = safe_abort = restored = relaunched = False
+        staging = old_world = summary = None
+
+        # Prefer the STAGED path: extract into a sibling directory while the
+        # server is still UP, then stop, swap it in with two renames, start.
+        # Downtime becomes the swap rather than the extraction, and the live
+        # world stays untouched until that swap. Fall back to the in-place
+        # wipe+extract when the layout can't support a rename swap — that
+        # only costs downtime, whereas a swap on an unsuitable layout can
+        # orphan the backup dir or silently change directory permissions.
+        stage, why = restore_core.can_stage_swap(mc_dir, self.config.backup_dir)
+        if stage:
+            staging = mc_dir.parent / f"{mc_dir.name}.restore-staging"
+        else:
+            self.log.info("World restore: staged swap unavailable (%s) — "
+                          "using the in-place path", why)
         try:
-            # 0. Validate the chain BEFORE touching anything — a corrupt zip
-            #    or too-little disk space must surface while the server is
-            #    still up and the world untouched, not mid-restore after the
-            #    wipe (both happened in the wild; the world was left partial).
-            n_files = 1 + (0 if point_idx == -1 else point_idx + 1)
-            say(f"Validating {n_files} backup file(s)...")
-            problems = restore_core.validate_chain_files(chain, point_idx)
-            if problems:
-                say("Restore aborted — corrupt backup file(s), the server and "
-                    "world were not touched:\n  " + "\n  ".join(problems))
-                return
+            # 0. Pre-flight. check_disk_space is cheap (it reads zip central
+            #    directories, no data) and runs either way, against whichever
+            #    directory the world is actually written into.
+            #
+            #    The CRC pass is NOT cheap — ~50s for an 8.4 GB / 84-zip
+            #    chain — and is only needed on the in-place path, where it
+            #    must fail BEFORE the wipe. On the staged path the extraction
+            #    itself CRC-verifies (zipfile raises BadZipFile: Bad CRC-32)
+            #    and does so before anything is touched, so validating up
+            #    front would decompress the whole chain a second time for no
+            #    extra safety.
             restore_core.check_disk_space(
-                chain, point_idx, self.config.minecraft_dir,
+                chain, point_idx, staging or mc_dir,
                 self.config.backup_dir, True, say)
+            if not stage:
+                n_files = 1 + (0 if point_idx == -1 else point_idx + 1)
+                say(f"Validating {n_files} backup file(s)...")
+                problems = restore_core.validate_chain_files(chain, point_idx)
+                if problems:
+                    say("Restore aborted — corrupt backup file(s), the "
+                        "server and world were not touched:\n  "
+                        + "\n  ".join(problems))
+                    return
 
             # 0.5. Establish whether the server process is actually running
             #    BEFORE any console injection. If a previous stop hung and the
@@ -727,10 +798,43 @@ class Server:
             if already_down:
                 say("Server is already stopped — restoring directly.")
 
-            # 1. In-game warning + countdown — best-effort, and only when the
+            # 1. Optional pre-restore backup of the CURRENT world. This runs
+            #    BEFORE the staged extraction on purpose: both it and
+            #    restore_chain write the shared backup_manifest.json, and the
+            #    restore's write has to land last or the manifest would
+            #    describe the pre-restore chain while the world on disk is the
+            #    restored one.
+            if self.config.pre_restore_backup:
+                say("Taking a pre-restore backup of the current world...")
+                try:
+                    self.run_backup(status_cb=say, offline=already_down)
+                except Exception as e:
+                    say(f"Pre-restore backup failed, aborting restore: {e}")
+                    return
+
+            # 2. Staged extraction, with the server still serving players.
+            #    A failure here cannot hurt the live world: nothing has been
+            #    stopped or touched, so the handlers below just report it and
+            #    leave everything running.
+            if stage:
+                say("Preparing the restored world (server still running)...")
+                shutil.rmtree(staging, ignore_errors=True)
+                staging.mkdir(parents=True)
+                summary = restore_core.restore_chain(
+                    chain, point_idx, staging,
+                    backup_dir=self.config.backup_dir,
+                    exclude_names=self.backup_exclude_names,
+                    copy_cmd=self.config.backup_copy_cmd,
+                    manifest_path=self.manifest_path,
+                    preserve_names=self.backup_exclude_names,
+                    log_fn=say, preflight_done=True)
+
+            # 3. In-game warning + countdown — best-effort, and only when the
             #    server is actually running (is_online, not is_available: a
             #    down server can't be broadcast to, and a failed broadcast must
-            #    never abort the restore we're about to do anyway).
+            #    never abort the restore). Deliberately immediately before the
+            #    stop so the countdown means what it says — it used to run
+            #    before a pre-restore backup that can take minutes.
             if warn > 0 and not already_down and backend.is_online():
                 try:
                     backend.broadcast(f"Server restoring in {warn}s — you will "
@@ -743,16 +847,7 @@ class Server:
                     self.log.warning("World restore: in-game warning failed "
                                      "(continuing)")
 
-            # 2. Optional pre-restore backup of the CURRENT world.
-            if self.config.pre_restore_backup:
-                say("Taking a pre-restore backup of the current world...")
-                try:
-                    self.run_backup(status_cb=say, offline=already_down)
-                except Exception as e:
-                    say(f"Pre-restore backup failed, aborting restore: {e}")
-                    return
-
-            # 3. Stop and confirm the server is fully down.
+            # 4. Stop and confirm the server is fully down.
             if already_down:
                 down = True
             else:
@@ -762,40 +857,50 @@ class Server:
                     # BDS is known to occasionally hang during shutdown: it
                     # acknowledges `stop` ("Stopping server...") and never
                     # exits. The world is about to be replaced anyway, so
-                    # escalate the way an admin would — Ctrl-C on its console —
-                    # instead of leaving a wedged process behind.
+                    # escalate the way an admin would — Ctrl-C on its
+                    # console — instead of leaving a wedged process behind.
                     say("Server did not shut down in time — interrupting it "
                         "(Ctrl-C)...")
                     if not backend.force_stop(say):
-                        say("Server still did not shut down — aborting. It was "
-                            "not relaunched (avoiding a double start); check "
-                            "it manually.")
+                        say("Server still did not shut down — aborting. It "
+                            "was not relaunched (avoiding a double start); "
+                            "check it manually.")
                         return
                     say("Server exited after interrupt")
                 down = True
 
-            # 4. Replace the world with the restored chain while it's down.
-            say("Restoring world files...")
-            summary = restore_core.restore_chain(
-                chain, point_idx, self.config.minecraft_dir,
-                backup_dir=self.config.backup_dir,
-                exclude_names=self.backup_exclude_names,
-                copy_cmd=self.config.backup_copy_cmd,
-                manifest_path=self.manifest_path,
-                preserve_names=self.backup_exclude_names,
-                log_fn=say)
+            # 5. Put the restored world in place. Staged: two renames, about
+            #    as long as it takes to say it. In-place: the wipe+extract
+            #    that used to define the outage.
+            if stage:
+                say("Swapping in the restored world...")
+                old_world = restore_core.swap_in_staging(
+                    staging, mc_dir, self.backup_exclude_names, say)
+                staging = None  # consumed by the rename
+            else:
+                say("Restoring world files...")
+                summary = restore_core.restore_chain(
+                    chain, point_idx, mc_dir,
+                    backup_dir=self.config.backup_dir,
+                    exclude_names=self.backup_exclude_names,
+                    copy_cmd=self.config.backup_copy_cmd,
+                    manifest_path=self.manifest_path,
+                    preserve_names=self.backup_exclude_names,
+                    log_fn=say, preflight_done=True)
             restored = True
 
-            # 5. Relaunch and confirm ready.
+            # 6. Relaunch and confirm ready.
             say("Restarting the server...")
+            self._prepare_relaunch_cwd(stage)
             if backend.relaunch(say):
                 relaunched = True
-                # The wipe replaced the server dir; rebind the log watcher to the
-                # recreated log dir before reconciling / awaiting future events.
+                # The server dir was replaced (wiped in place, or swapped for
+                # a new inode); rebind the log watcher before reconciling.
                 self.reattach_log_watch()
                 reconcile_online(self, reason="after world restore")
+                old_world = self._discard_old_world(old_world)
                 chain_note = (f" New chain {summary['chain_id']}."
-                              if summary.get("chain_id") else "")
+                              if summary and summary.get("chain_id") else "")
                 say(f"World restore complete.{chain_note}")
             else:
                 say("Restore applied but relaunch was not confirmed. Start the "
@@ -806,6 +911,19 @@ class Server:
             # server back up and the chain stays valid.
             safe_abort = True
             say(f"World restore aborted (world untouched): {e}")
+        except restore_core.SwapError as e:
+            self.log.exception("World restore swap failed")
+            say(f"World restore failed during the swap: {e}")
+            safe_abort = e.world_intact
+            if e.world_intact:
+                # The live world is the ORIGINAL one again, but the staged
+                # extraction already advanced the shared manifest to the new
+                # chain. Invalidate it so no incremental extends a chain the
+                # world on disk doesn't match.
+                self.save_manifest({}, chain_id="", base_full="")
+                say("Incremental backups are suspended until the next full "
+                    "backup (/backup) — the world no longer matches the "
+                    "backup chain.")
         except Exception as e:
             self.log.exception("World restore failed")
             say(f"World restore failed: {e}")
@@ -819,16 +937,21 @@ class Server:
                     "backup (/backup) — the world no longer matches the "
                     "backup chain.")
         finally:
+            # A half-built staging tree is never useful; drop it so a failed
+            # restore doesn't leave a world-sized directory behind.
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
             if down and not relaunched:
                 if restored or safe_abort:
                     # The world is coherent (restore succeeded but the
-                    # relaunch wasn't confirmed, or a pre-flight abort never
-                    # touched it) — try once more before leaving it to the
-                    # admin.
+                    # relaunch wasn't confirmed, or an abort never touched
+                    # it) — try once more before leaving it to the admin.
                     say("Bringing the server back up...")
+                    self._prepare_relaunch_cwd(stage)
                     if backend.relaunch(say):
                         self.reattach_log_watch()
                         reconcile_online(self, reason="after world restore")
+                        old_world = self._discard_old_world(old_world)
                     else:
                         say("Could not relaunch. Start the server manually:\n  "
                             f"{self.config.mux_start_cmd}")
@@ -838,9 +961,14 @@ class Server:
                     # back up — players would join (and BDS write into) a
                     # broken world. The admin decides: fix and /restore again,
                     # or /start to accept the partial state.
-                    say("⚠️ The server was left STOPPED: the world on disk is "
-                        "incomplete. Fix the problem and run /restore again, "
-                        "or /start to bring it up anyway.")
+                    say("⚠️ The server was left STOPPED: the world on disk "
+                        "is incomplete. Fix the problem and run /restore "
+                        "again, or /start to bring it up anyway.")
+            if old_world is not None:
+                # Kept on purpose: the swap happened but the server never
+                # confirmed a restart, so the previous world is the way back.
+                say(f"Previous world kept at {old_world.name} — delete it "
+                    "once the restored world is confirmed good.")
 
 
 
