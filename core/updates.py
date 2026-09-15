@@ -30,7 +30,8 @@ from pathlib import Path
 
 from core.presence import reconcile_online
 from utils import mc_versions, restore_core
-from core.logparse import parse_version_line
+from core.logparse import (parse_bedrock_version_line,
+                           parse_version_line)
 from utils.config import EDITION_BEDROCK, EDITION_JAVA
 from utils.download import DownloadError, download_file
 from utils.restore_core import _apply_zip_mode
@@ -71,6 +72,11 @@ def available_update(server, *, require_baseline: bool = True):
     if not cfg.updates_enabled:
         return None
     installed = server.load_installed_version()
+    if not installed.get("mc_version"):
+        # Nothing recorded yet. Ask the server directly before falling
+        # back on guesswork about which upstream to poll.
+        if refresh_installed_version(server):
+            installed = server.load_installed_version()
     if cfg.edition == EDITION_BEDROCK:
         release = mc_versions.latest_bedrock()
     else:
@@ -161,6 +167,34 @@ def ensure_downloaded(release, log=None) -> Path:
 _VERSION_SCAN_LINES = 400
 
 
+# How far back to look in a Bedrock console.log. Unlike Java's latest.log it
+# is appended to forever (`tee -a`), so it holds every run's banner and the
+# LAST one is the truth. Scanned backwards from the end and capped, so a
+# server that restarted recently is found immediately and one that has been
+# up for months costs a bounded read rather than a full pass over a
+# multi-hundred-MB file.
+_CONSOLE_TAIL_BYTES = 8 * 1024 * 1024
+
+
+def _recover_bedrock_version(server) -> dict | None:
+    """Last `Version:` banner in the Bedrock console log, or None."""
+    path = server.config.log_path
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > _CONSOLE_TAIL_BYTES:
+                f.seek(size - _CONSOLE_TAIL_BYTES)
+                f.readline()        # drop the partial first line
+            raw = f.read()
+    except OSError:
+        return None
+    for line in reversed(raw.decode("utf-8", errors="replace").splitlines()):
+        parsed = parse_bedrock_version_line(line)
+        if parsed:
+            return parsed
+    return None
+
+
 def recover_server_version(server) -> dict | None:
     """Read the installed version out of the CURRENT log, once, at startup.
 
@@ -176,8 +210,11 @@ def recover_server_version(server) -> dict | None:
     so first-match-wins would label every Paper server vanilla. A line
     carrying a build number is as specific as it gets, so that wins.
     """
-    if server.config.edition != EDITION_JAVA:
-        return None       # Bedrock's version comes from the download URL
+    if server.config.edition == EDITION_BEDROCK:
+        best = _recover_bedrock_version(server)
+        if best:
+            server.record_observed_version(best)
+        return best
     best = None
     try:
         with open(server.config.log_path, encoding="utf-8",
@@ -193,6 +230,51 @@ def recover_server_version(server) -> dict | None:
                     break
     except OSError:
         return None
+    if best:
+        server.record_observed_version(best)
+    return best
+
+
+def refresh_installed_version(server) -> dict | None:
+    """Ask a running Java server what it is, via Paper's `version` command.
+
+    More dependable than waiting for a startup banner: the banner is printed
+    once, usually long before the bot attaches, and Java rotates latest.log
+    out from under it. Paper answers on demand:
+
+        > version
+        Checking version, please wait...
+        This server is running Paper version 26.2-121-main@a2a42c5 (...)
+        You are 2 version(s) behind
+        Previous version: 26.2-117-27af5dd (MC: 26.2)
+
+    The existing banner regex picks the right line out of that and, notably,
+    does NOT match the "Previous version:" line underneath it.
+
+    Vanilla has no such command and answers "Unknown command", which simply
+    yields no match — the caller keeps whatever it already had. Paper also
+    resolves the version asynchronously, so the RCON reply may carry only
+    "Checking version, please wait..."; that is fine, because issuing the
+    command makes the banner appear in the log, where the LogWatcher parses
+    it independently.
+    """
+    cfg = server.config
+    if cfg.edition == EDITION_BEDROCK:
+        return None                     # BDS has no `version` command
+    try:
+        if not server.backend.is_online():
+            return None
+        out = server.backend.capture_command("version", timeout=5)
+    except Exception:
+        logger.debug("[%s] Live version query failed", cfg.name)
+        return None
+    best = None
+    for line in (out or "").splitlines():
+        parsed = parse_version_line(line)
+        if parsed:
+            best = parsed
+            if parsed.get("build") is not None:
+                break
     if best:
         server.record_observed_version(best)
     return best

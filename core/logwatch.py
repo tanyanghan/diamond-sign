@@ -12,7 +12,8 @@ import time
 
 from watchdog.events import FileSystemEventHandler
 
-from core.logparse import parse_line, parse_version_line
+from core.logparse import (parse_bedrock_version_line, parse_line,
+                           parse_version_line)
 from utils.config import EDITION_JAVA
 from utils.logtail import split_complete_lines
 
@@ -141,15 +142,17 @@ class LogWatcher(FileSystemEventHandler):
     def _maybe_version(self, line: str) -> None:
         """Bootstrap the installed-version record from the startup banner.
 
-        Java only: Bedrock's version comes from the download URL that
-        /update records, so there is no need to guess at BDS console
-        wording. Cheap and silent — record_observed_version() ignores
-        anything it already knows, and never overwrites what /update wrote.
+        Both editions print one: Java's "This server is running Paper
+        version ..." / "Starting minecraft server version ...", and BDS's
+        "Version: 1.26.45.1". Cheap and silent — record_observed_version()
+        ignores anything it already knows, and never overwrites what /update
+        wrote.
         """
-        if self._server.config.edition != EDITION_JAVA:
-            return
         try:
-            parsed = parse_version_line(line)
+            if self._server.config.edition == EDITION_JAVA:
+                parsed = parse_version_line(line)
+            else:
+                parsed = parse_bedrock_version_line(line)
             if parsed:
                 self._server.record_observed_version(parsed)
         except Exception:

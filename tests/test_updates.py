@@ -505,6 +505,121 @@ def test_pre_update_backup_is_conditional():
           "explains the staleness risk")
 
 
+def test_version_detection_from_logs():
+    print("version detection from real log lines:")
+    from core.logparse import parse_bedrock_version_line, parse_version_line
+    import core.updates as upd
+
+    # Lines taken verbatim from the operator's own servers.
+    paper = parse_version_line(
+        "[12:38:49 INFO]: This server is running Paper version "
+        "26.2-121-main@a2a42c5 (2026-08-29T11:32:25Z) (Implementing API "
+        "version 26.2.build.121-stable)")
+    check(paper == {"source": "paper", "software": "Paper",
+                    "mc_version": "26.2", "build": 121},
+          f"real Paper banner -> {paper}")
+    bds = parse_bedrock_version_line(
+        "[2026-09-15 12:37:33:754 INFO] Version: 1.26.45.1")
+    check(bds and bds["mc_version"] == "1.26.45.1",
+          "real BDS banner parsed")
+
+    # Neighbouring BDS lines must not be mistaken for the banner.
+    for other in ("[2026-09-15 12:37:33:754 INFO] Build ID: 49559497",
+                  "[2026-09-15 12:37:33:754 INFO] Session ID: 62fce78a-2226",
+                  "[2026-09-15 16:20 INFO] Kamion: my Version: 9.9.9"):
+        check(parse_bedrock_version_line(other) is None,
+              "not mistaken for the banner: " + other.split("] ")[-1][:28])
+
+    lf = chr(10)
+    with tempfile.TemporaryDirectory() as td:
+        # Java: latest.log is recreated per run, and the VANILLA line comes
+        # first even on Paper -- first-match-wins would mislabel it.
+        jlog = Path(td) / "latest.log"
+        jlog.write_text(lf.join([
+            "[12:38:49 INFO]: Starting minecraft server version 26.2",
+            "[12:38:49 INFO]: This server is running Paper version "
+            "26.2-121-main@a2a42c5 (2026-08-29T11:32:25Z)",
+            ""]), encoding="utf-8")
+        srv = types.SimpleNamespace(
+            config=types.SimpleNamespace(edition="java", log_path=jlog),
+            record_observed_version=lambda p: None)
+        got = upd.recover_server_version(srv)
+        check(got and got["source"] == "paper" and got["build"] == 121,
+              "Java backfill prefers the Paper banner over the vanilla line "
+              "printed before it")
+
+        # Bedrock: console.log is appended forever, so the LAST banner wins.
+        blog = Path(td) / "console.log"
+        blog.write_text(lf.join([
+            "[2026-08-01 10:00:00:002 INFO] Version: 1.26.44.1",
+            "[2026-08-01 10:05:00:000 INFO] Player connected: K, xuid: 1",
+            "[2026-09-15 12:37:33:754 INFO] Version: 1.26.45.1",
+            "[2026-09-15 12:39:09:506 INFO] There are 0/10 players online:",
+            ""]), encoding="utf-8")
+        srv2 = types.SimpleNamespace(
+            config=types.SimpleNamespace(edition="bedrock", log_path=blog),
+            record_observed_version=lambda p: None)
+        got2 = upd.recover_server_version(srv2)
+        check(got2 and got2["mc_version"] == "1.26.45.1",
+              "Bedrock backfill takes the most recent run's banner, not the "
+              "first one in an append-only log")
+
+
+def test_up_to_date_bedrock_is_quiet():
+    print("an up-to-date Bedrock server:")
+    import core.updates as upd
+    rel = mv.parse_bedrock_links(BEDROCK_LINKS)          # 1.26.45.1
+    server = types.SimpleNamespace(
+        config=types.SimpleNamespace(updates_enabled=True, edition="bedrock",
+                                     name="Square-Friends"),
+        load_installed_version=lambda: {
+            "source": "bedrock", "mc_version": "1.26.45.1", "build": None})
+    real = mv.latest_bedrock
+    try:
+        mv.latest_bedrock = lambda: rel
+        check(upd.available_update(server) is None,
+              "a server already on the latest version reports nothing "
+              "(this was the false alarm seen in production)")
+    finally:
+        mv.latest_bedrock = real
+
+
+def test_live_version_query():
+    print("live `version` query (Paper):")
+    import core.updates as upd
+    lf = chr(10)
+    out = lf.join([
+        "Checking version, please wait...",
+        "This server is running Paper version 26.2-121-main@a2a42c5 "
+        "(2026-08-29T11:32:25Z) (Implementing API version 26.2.build.121-stable)",
+        "You are 2 version(s) behind",
+        "Download the new version at: https://papermc.io/downloads/paper",
+        "Previous version: 26.2-117-27af5dd (MC: 26.2)"])
+    rec = []
+    srv = types.SimpleNamespace(
+        config=types.SimpleNamespace(edition="java", name="XPS-Java"),
+        backend=types.SimpleNamespace(is_online=lambda: True,
+                                      capture_command=lambda c, timeout=5: out),
+        record_observed_version=rec.append)
+    got = upd.refresh_installed_version(srv)
+    check(got and got["mc_version"] == "26.2" and got["build"] == 121,
+          "picks the running build out of /version output")
+    check(got["build"] != 117,
+          "does NOT pick up the 'Previous version: 26.2-117-...' line "
+          "printed underneath it")
+    check(rec and rec[0] is got, "records what it found")
+
+    # Vanilla has no such command.
+    srv.backend.capture_command = lambda c, timeout=5: "Unknown command: version."
+    check(upd.refresh_installed_version(srv) is None,
+          "vanilla's 'Unknown command' yields nothing rather than a bad parse")
+
+    # A stopped server is never queried.
+    srv.backend.is_online = lambda: False
+    check(upd.refresh_installed_version(srv) is None,
+          "a stopped server is not queried")
+
+
 def test_per_source_user_agent():
     print("per-source User-Agent:")
     from utils.download import BROWSER_USER_AGENT, USER_AGENT
@@ -646,6 +761,9 @@ def main():
                test_extract_preserves_exec_bit, test_extract_rejects_bad_zips,
                test_custom_pack_diff, test_bedrock_swap_end_to_end,
                test_chain_is_rebased_not_preserved,
+               test_version_detection_from_logs,
+               test_up_to_date_bedrock_is_quiet,
+               test_live_version_query,
                test_per_source_user_agent,
                test_no_baseline_stays_quiet,
                test_java_flavor_is_not_guessed,

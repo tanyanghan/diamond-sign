@@ -54,6 +54,24 @@ RE_VANILLA_VERSION = re.compile(
     r'Starting minecraft server version (\S+)')
 
 
+# BDS prints its version in the first few lines of every run:
+#   [2026-09-15 12:37:33:754 INFO] Version: 1.26.45.1
+# Anchored on the whole line so a chat message mentioning a version cannot be
+# mistaken for the banner. BDS has no `version` console command to ask instead
+# (it answers "Unknown command"), so the log is the only source.
+RE_BEDROCK_VERSION = re.compile(
+    r'^\[[^\]]*INFO\]\s*Version:\s*([\d.]+)\s*$')
+
+
+def parse_bedrock_version_line(line: str) -> dict | None:
+    """Extract the BDS version from one console line, or None."""
+    m = RE_BEDROCK_VERSION.match(line.strip())
+    if not m:
+        return None
+    return {"source": "bedrock", "software": "Bedrock Dedicated Server",
+            "mc_version": m.group(1), "build": None}
+
+
 def parse_version_line(line: str) -> dict | None:
     """Extract a server version from one Java startup line, or None.
 
