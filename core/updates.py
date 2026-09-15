@@ -634,6 +634,14 @@ def update_server(server, release, *, say) -> None:
                 if backend.relaunch(say):
                     server.reattach_log_watch()
                     reconcile_online(server, reason="after server update")
+                    if installed_ok:
+                        # The install already retired the old chain, but the
+                        # re-base lives on the success path -- which a
+                        # relaunch that was merely unconfirmed never reaches.
+                        # Without this the server comes back up on the new
+                        # version with no backup chain at all, waiting on a
+                        # manual /backup that nothing asked for.
+                        _rebase_backup_chain(server, say)
                 else:
                     say("Could not relaunch. Start the server manually:\n  "
                         f"{cfg.mux_start_cmd}")

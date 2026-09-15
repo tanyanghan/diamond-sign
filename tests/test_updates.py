@@ -586,6 +586,73 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_chain_rebased_after_a_recovered_relaunch():
+    print("chain re-base after an unconfirmed relaunch:")
+    import core.updates as upd
+
+    order = []
+    rel = mv.parse_bedrock_links(BEDROCK_LINKS)
+    attempts = {"n": 0}
+
+    def relaunch(say):
+        # First call fails to CONFIRM (the server may well be up); the
+        # finally-block retry succeeds. This is exactly what happened when
+        # the log watcher was bound to the swapped-away directory.
+        attempts["n"] += 1
+        order.append(f"relaunch{attempts['n']}")
+        return attempts["n"] > 1
+
+    backend = types.SimpleNamespace(
+        probe_stopped=lambda timeout=10: True, is_online=lambda: False,
+        broadcast=lambda m: None, stop_server=lambda say: None,
+        wait_until_stopped=lambda timeout=120: True,
+        force_stop=lambda say: True, relaunch=relaunch)
+
+    server = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            edition="bedrock", name="XPS-Bedrock", restore_warning_seconds=0,
+            minecraft_dir=Path("/srv/b"), backup_dir=Path("/srv/bk"),
+            mux_start_cmd="x", incremental_enabled=True),
+        backend=backend,
+        load_installed_version=lambda: {"source": "bedrock",
+                                        "mc_version": "1.26.44.1",
+                                        "build": None},
+        load_manifest=lambda: ("abcd", "base.zip", {}),
+        read_chain_marker=lambda: "abcd",
+        save_installed_version=lambda *a, **k: None,
+        save_manifest=lambda *a, **k: order.append("invalidate"),
+        chain_marker_path=Path("/nonexistent/.diamondsign_chain"),
+        run_backup=lambda status_cb=None, offline=False: None,
+        reattach_log_watch=lambda: None,
+        _prepare_relaunch_cwd=lambda staged: None,
+        _discard_old_world=lambda p: None,
+        log=types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None,
+                                  exception=lambda *a: None))
+
+    saved = (upd.preflight, upd.ensure_downloaded, upd._install_bedrock,
+             upd.reconcile_online, upd._rebase_backup_chain)
+    try:
+        upd.preflight = lambda s, r: None
+        upd.ensure_downloaded = lambda r, log=None: Path("/tmp/b.zip")
+        upd._install_bedrock = lambda s, a, say: Path("/srv/old")
+        upd.reconcile_online = lambda s, reason=None: set()
+        upd._rebase_backup_chain = lambda s, say: order.append("rebase")
+        upd.update_server(server, rel, say=lambda m: None)
+    finally:
+        (upd.preflight, upd.ensure_downloaded, upd._install_bedrock,
+         upd.reconcile_online, upd._rebase_backup_chain) = saved
+
+    check("invalidate" in order, "the old chain is retired by the install")
+    check(order.count("relaunch1") and order.count("relaunch2"),
+          f"the first relaunch went unconfirmed and was retried ({order})")
+    check("rebase" in order,
+          "the chain is re-based once the retry succeeds -- otherwise the "
+          "server returns on the new version with NO backup chain, waiting "
+          "on a manual /backup nothing asked for")
+    check(order.index("invalidate") < order.index("rebase"),
+          "and in the right order")
+
+
 def test_update_progress_is_logged():
     print("update progress reaches the bot log:")
     import core.updates as upd
@@ -1038,6 +1105,7 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_chain_rebased_after_a_recovered_relaunch,
                test_update_progress_is_logged,
                test_missing_baseline_is_logged,
                test_watcher_rebound_before_relaunch,
