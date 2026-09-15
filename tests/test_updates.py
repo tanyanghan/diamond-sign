@@ -584,6 +584,42 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_notification_goes_to_admin_dm_only():
+    print("update notification routing:")
+    import bot as botmod
+    import types
+
+    calls = {"announce": [], "admin": []}
+    fake_bot = types.SimpleNamespace(
+        announce=lambda srv, m: calls["announce"].append(m) or 1,
+        alert_admins=lambda m: calls["admin"].append(m))
+    rel = mv.parse_bedrock_links(BEDROCK_LINKS)
+    server = types.SimpleNamespace(
+        config=types.SimpleNamespace(name="Square-Friends", edition="bedrock"),
+        load_installed_version=lambda: {"source": "bedrock",
+                                        "mc_version": "1.26.44.1",
+                                        "build": None,
+                                        "filename": "old.zip"})
+
+    real_fetch = botmod._fetch_shared_artifact
+    real_prune = botmod.updates.mc_versions.prune_cache
+    try:
+        botmod._fetch_shared_artifact = lambda s, r: True
+        botmod.updates.mc_versions.prune_cache = lambda e, keep: []
+        botmod._announce_update(server, fake_bot, rel)
+    finally:
+        botmod._fetch_shared_artifact = real_fetch
+        botmod.updates.mc_versions.prune_cache = real_prune
+
+    check(calls["announce"] == [],
+          "does NOT post to the server's group chats (/update_server is "
+          "admin-and-DM-only, so players could not act on it anyway)")
+    check(len(calls["admin"]) == 1, "sends exactly one admin alert")
+    check("Square-Friends" in calls["admin"][0],
+          "the alert names the server, since an admin DM is not scoped to one")
+    check("/update_server" in calls["admin"][0], "tells the admin what to run")
+
+
 def test_version_command_both_flavours():
     print("`version` command, both Java flavours:")
     from core.logparse import parse_version_command
@@ -824,6 +860,7 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_notification_goes_to_admin_dm_only,
                test_version_command_both_flavours,
                test_live_version_query,
                test_per_source_user_agent,

@@ -448,7 +448,7 @@ def _fetch_shared_artifact(server, release) -> bool:
 
 
 def _announce_update(server, bot, release) -> None:
-    """Download the new build, then tell the chats it is ready to install."""
+    """Download the new build, then tell the ADMIN it is ready to install."""
     installed = server.load_installed_version()
     _fetch_shared_artifact(server, release)
 
@@ -461,9 +461,15 @@ def _announce_update(server, bot, release) -> None:
     msg = ("\U0001f4e6 " + updates.describe_update(server, release)
            + "\nDownloaded and ready \u2014 send /update_server to review, then "
              "/update_server confirm to install.")
-    sent = bot.announce(server, msg)
-    logger.info("[%s] Update available: %s %s \u2014 announced to %d chat(s)",
-                server.config.name, release.source, release.describe(), sent)
+    # Admin DM only, never the server's chats. /update_server is registered
+    # private_only + admin_only, so a group announcement would tell players
+    # about an action none of them can take -- they cannot even see the
+    # command. Same reasoning as the scheduled backup's progress messages.
+    # describe_update() leads with the server name, so the admin still knows
+    # which server it refers to without the message being chat-scoped.
+    bot.alert_admins(msg)
+    logger.info("[%s] Update available: %s %s \u2014 alerted the admin(s)",
+                server.config.name, release.source, release.describe())
 
 
 def _start_scheduled_backup(server, bot) -> None:

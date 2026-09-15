@@ -778,7 +778,9 @@ The mechanics differ by edition:
 ## Server version updates — `/update_server`
 
 The bot checks every 6 hours whether a newer server build has been released,
-downloads it, and posts a message to the chats bound to that server. Nothing is
+downloads it, and **DMs the admin**. It deliberately does not post to the
+server's group chats: `/update_server` is admin-and-DM-only, so an announcement
+there would tell players about something none of them can act on. Nothing is
 installed until you run `/update_server confirm`.
 
 Where releases come from (the minecraft.net download pages are JS-gated and
