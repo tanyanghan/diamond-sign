@@ -124,8 +124,15 @@ identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
                                          // the world's level-name (slugified).
           "edition": {                   // edition-specific settings, nested here:
             "type": "java",              //   "java" (default) or "bedrock"
-            "rcon": { "password": "…", "host": "localhost", "port": 25575 }
+            "rcon": { "password": "…", "host": "localhost", "port": 25575 },
                                          //   Java only — RCON command transport
+            "server_jar": "server.jar",  //   Java only — the jar /update
+                                         //   overwrites, relative to minecraft_dir.
+                                         //   Keep it fixed and mux.start_cmd never
+                                         //   changes when the version does.
+            "flavor": "paper"            //   Java only — "paper" | "vanilla",
+                                         //   which upstream to follow. Omit to
+                                         //   auto-detect from the running server.
             // Bedrock uses these two instead of rcon:
             //   "type": "bedrock",
             //   "bedrock_script_events": false,// deaths/chat via the behavior pack
@@ -136,6 +143,13 @@ identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
                                          // transport, and Java's optional /restore restart
           "chat_relay": false,           // shared: relay in-game chat to the chats
                                          // (on Bedrock also needs bedrock_script_events)
+          "updates": {
+            "enabled": true,             // watch for new server releases
+            "pin_mc_version": false      // true = only newer BUILDS of the
+                                         // Minecraft version you already run,
+                                         // never a version jump (which migrates
+                                         // the world irreversibly)
+          },
           "backup": {
             "dir": "~/backup/survival",
             "schedule": "daily",         // daily | weekly (Mon) | monthly (1st)
