@@ -417,6 +417,71 @@ def test_chain_is_rebased_not_preserved():
           "and tells the operator how to re-establish the chain")
 
 
+def test_refuses_while_players_online():
+    print("empty-server gate:")
+    import core.updates as upd
+    real = upd.reconcile_online
+    try:
+        upd.reconcile_online = lambda srv, reason=None: {"Kamion", "erny1618"}
+        try:
+            upd.require_empty_server(object())
+            check(False, "should refuse while players are online")
+        except upd.UpdateError as e:
+            msg = str(e)
+            check("2 player(s) online" in msg, "reports how many are online")
+            check("Kamion" in msg and "erny1618" in msg, "names them")
+            check("disconnects everyone" in msg, "explains why it refuses")
+
+        # A failed query is not proof the server is empty.
+        upd.reconcile_online = lambda srv, reason=None: None
+        try:
+            upd.require_empty_server(object())
+            check(False, "an unconfirmed query should refuse, not proceed")
+        except upd.UpdateError as e:
+            check("could not confirm" in str(e),
+                  "unknown online state refuses rather than assuming empty")
+
+        upd.reconcile_online = lambda srv, reason=None: set()
+        upd.require_empty_server(object())
+        check(True, "proceeds when the server is empty")
+    finally:
+        upd.reconcile_online = real
+
+
+def test_pre_update_backup_is_conditional():
+    print("pre-update backup:")
+    import core.updates as upd
+
+    def server(chain, marker, incr=True):
+        return types.SimpleNamespace(
+            load_manifest=lambda: (chain, "srv_full.zip", {}),
+            read_chain_marker=lambda: marker,
+            config=types.SimpleNamespace(incremental_enabled=incr))
+
+    said = []
+    check(upd.has_rollback_point(server("abcd", "abcd"), said.append),
+          "valid chain + incrementals -> reuse it, skip the full backup")
+    check(any("using it as the rollback point" in m for m in said),
+          "says why it is skipping")
+
+    said = []
+    check(not upd.has_rollback_point(server("abcd", "wxyz"), said.append),
+          "marker mismatch -> take a full backup")
+    check(any("invalid" in m for m in said), "says the chain is invalid")
+
+    said = []
+    check(not upd.has_rollback_point(server("", ""), said.append),
+          "no chain at all -> take a full backup")
+
+    said = []
+    check(not upd.has_rollback_point(server("abcd", "abcd", incr=False),
+                                     said.append),
+          "valid chain but incrementals DISABLED -> still take a full backup "
+          "(the chain is only as fresh as the last scheduled full)")
+    check(any("may be days old" in m for m in said),
+          "explains the staleness risk")
+
+
 def test_java_preflight_refuses_missing_jar():
     print("Java preflight:")
     with tempfile.TemporaryDirectory() as td:
@@ -467,6 +532,8 @@ def main():
                test_extract_preserves_exec_bit, test_extract_rejects_bad_zips,
                test_custom_pack_diff, test_bedrock_swap_end_to_end,
                test_chain_is_rebased_not_preserved,
+               test_refuses_while_players_online,
+               test_pre_update_backup_is_conditional,
                test_java_preflight_refuses_missing_jar,
                test_update_comparison):
         fn()

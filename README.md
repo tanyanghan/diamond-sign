@@ -784,9 +784,17 @@ rollback.
 **Both kinds of update are reported, labelled differently.** A new Paper *build*
 of the Minecraft version you already run is routine. A new *Minecraft version*
 migrates the world format and **cannot be undone** — the upgraded world will
-not load on the old server — so it is called out explicitly. Either way
-`/update confirm` takes a **full backup first**, which is the only route back
-from a migration.
+not load on the old server — so it is called out explicitly. `/update` refuses while anyone is playing — it disconnects everyone and, on a
+version bump, migrates their world on the way back up. Wait until the server is
+empty. (A query it cannot answer counts as "someone might be on".)
+
+**A rollback point is always in place before anything is touched.** If the
+backup chain is valid and incrementals are running, that chain already is one —
+the cycle captures the world every few minutes while players are online and once
+more as the last one leaves — so `/update` reuses it rather than spending
+minutes on a duplicate full backup. It takes a fresh full backup when there is no
+chain, the marker does not match, or incrementals are disabled (in which case the
+chain is only as fresh as the last *scheduled* full, which can be days old).
 
 ```
 /update            # installed vs available, and whether it's a major jump

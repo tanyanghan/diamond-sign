@@ -132,6 +132,70 @@ def ensure_downloaded(release, log=None) -> Path:
         raise UpdateError(f"download failed: {e}") from e
 
 
+# --- who is playing --------------------------------------------------------
+def require_empty_server(server) -> None:
+    """Refuse to update while anyone is playing.
+
+    An update disconnects everyone, and on a Minecraft version bump migrates
+    the world on the way back up — not something to do out from under
+    someone mid-session.
+
+    It also happens to be what makes skipping the pre-update backup sound: an
+    empty server means the incremental cycle already ran its final pass as the
+    last player left, so the chain is a current rollback point rather than one
+    that stops several minutes ago.
+
+    A query that fails counts as "someone might be on". Being unable to ask is
+    not evidence that nobody is playing.
+    """
+    online = reconcile_online(server, reason="before update")
+    if online is None:
+        raise UpdateError(
+            "could not confirm whether anyone is online. Try again shortly, "
+            "or stop the server first and re-run /update.")
+    if online:
+        names = ", ".join(sorted(online))
+        raise UpdateError(
+            f"{len(online)} player(s) online ({names}). An update disconnects "
+            f"everyone \u2014 wait until the server is empty and run /update "
+            f"again.")
+
+
+# --- rollback point --------------------------------------------------------
+def has_rollback_point(server, say) -> bool:
+    """Whether the existing backup chain can serve as the update's rollback.
+
+    A valid chain -- a full backup plus a manifest that still matches the
+    on-disk marker, the same test bot.py makes at startup -- already IS a
+    restorable copy of the world. With the incremental cycle running it is
+    also current: it captures the world every few minutes while players are
+    online, and once more as the last one leaves. Taking another full backup
+    on top of that mostly duplicates it, and on a multi-GB world that is
+    minutes of extra downtime for no extra safety.
+
+    Incrementals being disabled is the exception. The chain is then only as
+    fresh as the last SCHEDULED full, which on a weekly schedule can be days
+    old — not something anyone wants to roll back to — so a fresh full
+    backup runs instead.
+    """
+    chain_id, base_full, _ = server.load_manifest()
+    if not chain_id:
+        say("No backup chain established \u2014 taking a full backup first.")
+        return False
+    if server.read_chain_marker() != chain_id:
+        say("Backup chain is invalid \u2014 taking a full backup first.")
+        return False
+    if not server.config.incremental_enabled:
+        say(f"Backup chain {chain_id} is valid but incrementals are disabled "
+            "for this server, so it may be days old \u2014 taking a fresh "
+            "full backup first.")
+        return False
+    say(f"Backup chain {chain_id} is valid (base: {base_full}) and "
+        "incrementals are current \u2014 using it as the rollback point "
+        "instead of taking another full backup.")
+    return True
+
+
 # --- Bedrock helpers -------------------------------------------------------
 def _extract_bds(artifact: Path, staging: Path, log) -> None:
     """Unpack a BDS zip into ``staging``, preserving Unix modes.
@@ -276,15 +340,20 @@ def update_server(server, release, *, say) -> None:
         already_down = backend.probe_stopped(timeout=10) is True
         if already_down:
             say("Server is already stopped — updating directly.")
+        else:
+            require_empty_server(server)
 
-        # 1. Always back up first. A Minecraft version upgrade migrates the
-        #    world irreversibly, so this is the only route back.
-        say("Taking a full backup before updating...")
-        try:
-            server.run_backup(status_cb=say, offline=already_down)
-        except Exception as e:
-            say(f"Pre-update backup failed, aborting update: {e}")
-            return
+        # 1. Make sure a rollback point exists before anything is touched. A
+        #    Minecraft version upgrade migrates the world irreversibly, so a
+        #    backup is the only route back -- but it does not have to be a
+        #    NEW one. See has_rollback_point().
+        if not has_rollback_point(server, say):
+            say("Taking a full backup before updating...")
+            try:
+                server.run_backup(status_cb=say, offline=already_down)
+            except Exception as e:
+                say(f"Pre-update backup failed, aborting update: {e}")
+                return
 
         # 2. Warn players, immediately before the stop.
         if warn > 0 and not already_down and backend.is_online():
