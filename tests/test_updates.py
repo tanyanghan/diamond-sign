@@ -584,6 +584,58 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_update_progress_is_logged():
+    print("update progress reaches the bot log:")
+    import core.updates as upd
+
+    logged, chatted = [], []
+    srv = types.SimpleNamespace(
+        log=types.SimpleNamespace(info=lambda fmt, m: logged.append(m),
+                                  exception=lambda *a: None),
+        config=types.SimpleNamespace(edition="bedrock", name="XPS-Bedrock",
+                                     restore_warning_seconds=0),
+        backend=types.SimpleNamespace(probe_stopped=lambda timeout=10: True))
+
+    real = upd.preflight
+    try:
+        upd.preflight = lambda s, r: (_ for _ in ()).throw(
+            upd.UpdateError("staged swap unavailable"))
+        upd.update_server(srv, types.SimpleNamespace(
+            source="bedrock", mc_version="1", build=None, filename="f.zip"),
+            say=chatted.append)
+    finally:
+        upd.preflight = real
+
+    check(logged == chatted and logged,
+          "every chat message is also written to the bot log (an update used "
+          "to leave no trace there at all)")
+    check("staged swap unavailable" in logged[0],
+          "the reason is in the log, not only in the chat")
+
+
+def test_missing_baseline_is_logged():
+    print("missing version baseline is visible:")
+    import core.updates as upd
+    lines = []
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / "console.log"
+        log.write_text("nothing resembling a version banner" + chr(10),
+                       encoding="utf-8")
+        srv = types.SimpleNamespace(
+            config=types.SimpleNamespace(edition="bedrock", log_path=log,
+                                         name="Square-Friends",
+                                         updates_enabled=True),
+            record_observed_version=lambda p: None)
+        real = upd.logger.info
+        try:
+            upd.logger.info = lambda fmt, *a: lines.append(fmt % a)
+            check(upd.recover_server_version(srv) is None, "finds nothing")
+        finally:
+            upd.logger.info = real
+    check(any("installed version is unknown" in l for l in lines),
+          "says so, rather than silently never checking for updates again")
+
+
 def test_watcher_rebound_before_relaunch():
     print("log watcher rebinding order:")
     import core.updates as upd
@@ -984,6 +1036,8 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_update_progress_is_logged,
+               test_missing_baseline_is_logged,
                test_watcher_rebound_before_relaunch,
                test_relaunch_does_not_retry_into_a_live_server,
                test_backup_plan_matches_reality,

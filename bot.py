@@ -468,8 +468,9 @@ def _announce_update(server, bot, release) -> None:
     # describe_update() leads with the server name, so the admin still knows
     # which server it refers to without the message being chat-scoped.
     bot.alert_admins(msg)
-    logger.info("[%s] Update available: %s %s \u2014 alerted the admin(s)",
-                server.config.name, release.source, release.describe())
+    logger.info("[%s] Update available: %s %s (installed: %s) \u2014 alerted the admin(s)",
+                server.config.name, release.source, release.describe(),
+                installed.get("mc_version") or "unknown")
 
 
 def _start_scheduled_backup(server, bot) -> None:

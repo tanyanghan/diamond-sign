@@ -213,9 +213,32 @@ def recover_server_version(server) -> dict | None:
     """
     if server.config.edition == EDITION_BEDROCK:
         best = _recover_bedrock_version(server)
-        if best:
-            server.record_observed_version(best)
-        return best
+    else:
+        best = None
+        try:
+            with open(server.config.log_path, encoding="utf-8",
+                      errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= _VERSION_SCAN_LINES:
+                        break
+                    parsed = parse_version_line(line)
+                    if parsed is None:
+                        continue
+                    best = parsed
+                    if parsed.get("build") is not None:
+                        break
+        except OSError:
+            best = None
+    if best:
+        server.record_observed_version(best)
+    elif server.config.updates_enabled:
+        # Worth saying out loud: with no baseline the poll stays silent, and
+        # the reason is otherwise invisible.
+        logger.info("[%s] No version banner found in %s — the installed "
+                    "version is unknown, so update checks stay quiet until "
+                    "/update_server is run once", server.config.name,
+                    server.config.log_path.name)
+    return best
     best = None
     try:
         with open(server.config.log_path, encoding="utf-8",
@@ -482,11 +505,20 @@ def update_server(server, release, *, say) -> None:
     """Install ``release``. Assumes the caller holds ``server.backup_lock``.
 
     Mirrors Server.restore_world's shape and failure posture: nothing is
-    touched until the artifact is downloaded and verified, a full backup runs
-    first (the only way back from a world migration), and a failure after the
-    stop leaves the server deliberately down rather than running on a
-    half-updated install.
+    touched until the artifact is downloaded and verified, a rollback point is
+    guaranteed to exist first (the only way back from a world migration), and a
+    failure after the stop leaves the server deliberately down rather
+    than running on a half-updated install.
     """
+    # Mirror run_backup: every progress line goes to the bot log as well as
+    # the chat. Without this an update left no trace in the log at all --
+    # exactly what was needed to diagnose a relaunch that silently retried.
+    chat = say
+
+    def say(msg):
+        server.log.info("Update: %s", msg)
+        chat(msg)
+
     backend = server.backend
     cfg = server.config
     warn = cfg.restore_warning_seconds
