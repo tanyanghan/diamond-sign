@@ -458,7 +458,10 @@ def _install_bedrock(server, artifact: Path, say) -> Path:
     kept = sorted(n for n in preserve if "/" in n)
     if kept:
         say(f"Keeping your packs: {', '.join(kept)}")
-    return restore_core.swap_in_staging(staging, mc_dir, preserve, say)
+    # Same swap the restore uses, but say so in the update's own terms:
+    # "Swapped in the restored world" is confusing during an update.
+    return restore_core.swap_in_staging(staging, mc_dir, preserve, say,
+                                        what="updated server")
 
 
 def _install_java(server, artifact: Path, say) -> Path:
