@@ -584,6 +584,96 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_watcher_rebound_before_relaunch():
+    print("log watcher rebinding order:")
+    import core.updates as upd
+
+    order = []
+    rel = mv.parse_bedrock_links(BEDROCK_LINKS)
+
+    backend = types.SimpleNamespace(
+        probe_stopped=lambda timeout=10: True,      # already stopped
+        is_online=lambda: False,
+        broadcast=lambda m: None,
+        stop_server=lambda say: None,
+        wait_until_stopped=lambda timeout=120: True,
+        force_stop=lambda say: True,
+        relaunch=lambda say: (order.append("relaunch"), True)[1])
+
+    server = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            edition="bedrock", name="XPS-Bedrock", restore_warning_seconds=0,
+            minecraft_dir=Path("/srv/bedrock"), backup_dir=Path("/srv/backup"),
+            mux_start_cmd="cd /srv/bedrock && ./bedrock_server",
+            incremental_enabled=True),
+        backend=backend,
+        load_installed_version=lambda: {"source": "bedrock",
+                                        "mc_version": "1.26.44.1",
+                                        "build": None},
+        load_manifest=lambda: ("abcd", "base.zip", {}),
+        read_chain_marker=lambda: "abcd",
+        save_installed_version=lambda *a, **k: None,
+        save_manifest=lambda *a, **k: None,
+        chain_marker_path=Path("/nonexistent/.diamondsign_chain"),
+        run_backup=lambda status_cb=None, offline=False: None,
+        reattach_log_watch=lambda: order.append("reattach"),
+        _prepare_relaunch_cwd=lambda staged: None,
+        _discard_old_world=lambda p: None,
+        log=types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None,
+                                  exception=lambda *a: None))
+
+    real_pre, real_dl, real_inst = (upd.preflight, upd.ensure_downloaded,
+                                    upd._install_bedrock)
+    real_rec, real_rem = upd.reconcile_online, upd._rebase_backup_chain
+    try:
+        upd.preflight = lambda s, r: None
+        upd.ensure_downloaded = lambda r, log=None: Path("/tmp/bds.zip")
+        upd._install_bedrock = lambda s, a, say: (order.append("swap"),
+                                                  Path("/srv/old"))[1]
+        upd.reconcile_online = lambda s, reason=None: set()
+        upd._rebase_backup_chain = lambda s, say: None
+        upd.update_server(server, rel, say=lambda m: None)
+    finally:
+        (upd.preflight, upd.ensure_downloaded, upd._install_bedrock) = (
+            real_pre, real_dl, real_inst)
+        upd.reconcile_online, upd._rebase_backup_chain = real_rec, real_rem
+
+    check("swap" in order and "reattach" in order and "relaunch" in order,
+          f"all three steps ran ({order})")
+    check(order.index("reattach") < order.index("relaunch"),
+          "the watcher is rebound BEFORE relaunch -- bound to the old, "
+          "renamed-aside directory it would never see 'Server started.'")
+    check(order.index("swap") < order.index("reattach"),
+          "and after the swap, so it binds to the new directory")
+
+
+def test_relaunch_does_not_retry_into_a_live_server():
+    print("Bedrock relaunch retry guard:")
+    from backends.bedrock import BedrockBackend
+
+    sent, online = [], {"v": False}
+
+    class Waiter:
+        def wait(self, timeout=None):
+            # Simulate the missed confirmation: the server really did start,
+            # but the watcher never saw the line.
+            online["v"] = True
+            return False
+
+    be = BedrockBackend.__new__(BedrockBackend)
+    be.config = types.SimpleNamespace(mux_start_cmd="cd /srv && ./bedrock_server")
+    be._watcher = types.SimpleNamespace(expect_line=lambda p: Waiter(),
+                                        cancel=lambda w: None)
+    be.send_command = lambda c: sent.append(c)
+    be.is_online = lambda: online["v"]
+
+    check(be.relaunch(lambda m: None) is True,
+          "reports success once it confirms the server is actually up")
+    check(len(sent) == 1,
+          f"start command sent exactly ONCE ({len(sent)}x) -- a retry would "
+          "type a shell line into a live game console ('Unknown command: cd')")
+
+
 def test_backup_plan_matches_reality():
     print("confirm prompt describes what will actually happen:")
     import core.updates as upd
@@ -894,6 +984,8 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_watcher_rebound_before_relaunch,
+               test_relaunch_does_not_retry_into_a_live_server,
                test_backup_plan_matches_reality,
                test_notification_goes_to_admin_dm_only,
                test_version_command_both_flavours,

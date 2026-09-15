@@ -549,6 +549,15 @@ def update_server(server, release, *, say) -> None:
         else:
             kept = _install_java(server, artifact, say)
         installed_ok = True
+        if cfg.edition == EDITION_BEDROCK:
+            # The swap replaced the server directory, so the log watcher is
+            # still bound to the OLD inode. Rebind before relaunching, not
+            # after: Bedrock's relaunch waits for "Server started." to appear
+            # in console.log, and a watcher pointing at the old directory
+            # never sees it. The server comes up fine, the wait times out,
+            # and the retry injects the start command into a console that is
+            # now a running server ("Unknown command: cd").
+            server.reattach_log_watch()
         server.save_installed_version(release.source, release.mc_version,
                                       release.build, filename=release.filename)
         _invalidate_chain(server)

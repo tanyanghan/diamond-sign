@@ -949,6 +949,16 @@ class Server:
                     preserve_names=self.backup_exclude_names,
                     log_fn=say, preflight_done=True)
             restored = True
+            # Both paths replaced the server directory contents (the staged
+            # path replaced the directory itself), so the log watcher is
+            # still bound to the old inode. Rebind BEFORE relaunching:
+            # Bedrock waits for "Server started." in console.log and Java
+            # for "RCON running on" in latest.log, and a watcher pointing at
+            # the replaced directory sees neither -- the server comes up and
+            # the bot retries anyway, typing its start command into a live
+            # console. It is rebound again after the relaunch, when Java has
+            # rotated a fresh latest.log into place.
+            self.reattach_log_watch()
 
             # 6. Relaunch and confirm ready.
             say("Restarting the server...")

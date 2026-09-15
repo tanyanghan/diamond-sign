@@ -508,6 +508,15 @@ class BedrockBackend(ServerBackend):
             log("No MUX_START_CMD configured; cannot relaunch the server")
             return False
         for attempt in range(1, 4):
+            if attempt > 1 and self.is_online():
+                # A retry means the previous wait timed out -- which does not
+                # prove the server failed to start, only that the
+                # confirmation was missed (e.g. the log watcher was bound to
+                # a directory a restore or update had just replaced). Sending
+                # start_cmd again would type a shell line into a live game
+                # console. Confirm it is really down first.
+                log("Server is already running; relaunch not needed")
+                return True
             waiter = self._watcher.expect_line("Server started")
             self.send_command(cmd)
             if waiter.wait(timeout=120):
