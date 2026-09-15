@@ -35,10 +35,10 @@ RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
 # Paper-style "[Async Chat Thread - #0/INFO]:"). The <> brackets distinguish it
 # from join/leave/death lines (which start with a bare \w name).
 # --- server version, read off the startup banner ----------------------------
-# Bootstrap only. /update is the AUTHORITATIVE record of what is installed --
+# Bootstrap only. /update_server is the AUTHORITATIVE record of what is installed --
 # it knows exactly what it just wrote -- so these exist purely so a server
 # that predates the feature still has something to compare against before
-# /update has ever run once. Both lines were taken verbatim from this repo's
+# /update_server has ever run once. Both lines were taken verbatim from this repo's
 # own captured logs (logs/log_*.txt), not guessed:
 #
 #   [16:37:28] [Server thread/INFO]: This server is running Paper version

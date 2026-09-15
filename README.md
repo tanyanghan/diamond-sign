@@ -34,7 +34,7 @@ run **multiple bots** at once.
 | Whole-world restore | ✓ — needs `mux` set (below) | ✓ |
 | Per-player restore | ✓ | ✓ |
 | `/allowlist` | ✓ | ✓ |
-| Version monitoring + `/update` | ✓ — Paper or vanilla | ✓ — Bedrock Dedicated Server |
+| Version monitoring + `/update_server` | ✓ — Paper or vanilla | ✓ — Bedrock Dedicated Server |
 | World seed (`/seed`) | ✓ — `seed` over RCON | ✓ — read from `level.dat` (BDS has no `seed` command) |
 | Death notifications | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
 | In-game chat relay | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
@@ -126,7 +126,7 @@ identity (one Telegram bot and/or one Slack app) fronting a list of **servers**.
             "type": "java",              //   "java" (default) or "bedrock"
             "rcon": { "password": "…", "host": "localhost", "port": 25575 },
                                          //   Java only — RCON command transport
-            "server_jar": "server.jar",  //   Java only — the jar /update
+            "server_jar": "server.jar",  //   Java only — the jar /update_server
                                          //   overwrites, relative to minecraft_dir.
                                          //   Keep it fixed and mux.start_cmd never
                                          //   changes when the version does.
@@ -194,7 +194,7 @@ below when commands change):
 status - Show server status and who's online
 list - List known players
 seed - Show the world seed
-update - Check for and install a new server version
+update_server - Check for and install a new server version
 stats - Player statistics
 playtime - Playtime leaderboard
 achievements - Player achievements
@@ -246,7 +246,7 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
       { "command": "/online", "description": "Show online players", "should_escape": false },
       { "command": "/list", "description": "List known players", "should_escape": false },
       { "command": "/seed", "description": "Show the world seed", "should_escape": false },
-      { "command": "/update", "description": "Check for and install a new server version", "should_escape": false },
+      { "command": "/update_server", "description": "Check for and install a new server version", "should_escape": false },
       { "command": "/stats", "description": "Player statistics", "should_escape": false },
       { "command": "/playtime", "description": "Playtime leaderboard", "should_escape": false },
       { "command": "/achievements", "description": "Player achievements", "should_escape": false },
@@ -456,7 +456,7 @@ its pause state.
 |---------|-------------|
 | `/status` | Show whether the server is online, and who's playing. In an admin DM it lists every server the bot fronts; in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
-| `/update [confirm]` | *(Admin)* Show the installed vs available server version; `confirm` backs up, stops, updates and restarts |
+| `/update_server [confirm]` | *(Admin)* Show the installed vs available server version; `confirm` backs up, stops, updates and restarts |
 | `/seed` | Show the world seed — Java runs the server's `seed` command (needs the server up); Bedrock reads `RandomSeed` from the world's `level.dat` (works either way) |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
@@ -775,11 +775,11 @@ The mechanics differ by edition:
 
 ---
 
-## Server version updates — `/update`
+## Server version updates — `/update_server`
 
 The bot checks every 6 hours whether a newer server build has been released,
 downloads it, and posts a message to the chats bound to that server. Nothing is
-installed until you run `/update confirm`.
+installed until you run `/update_server confirm`.
 
 Where releases come from (the minecraft.net download pages are JS-gated and
 cannot be scraped, so each edition uses its real API):
@@ -798,21 +798,21 @@ rollback.
 **Both kinds of update are reported, labelled differently.** A new Paper *build*
 of the Minecraft version you already run is routine. A new *Minecraft version*
 migrates the world format and **cannot be undone** — the upgraded world will
-not load on the old server — so it is called out explicitly. `/update` refuses while anyone is playing — it disconnects everyone and, on a
+not load on the old server — so it is called out explicitly. `/update_server` refuses while anyone is playing — it disconnects everyone and, on a
 version bump, migrates their world on the way back up. Wait until the server is
 empty. (A query it cannot answer counts as "someone might be on".)
 
 **A rollback point is always in place before anything is touched.** If the
 backup chain is valid and incrementals are running, that chain already is one —
 the cycle captures the world every few minutes while players are online and once
-more as the last one leaves — so `/update` reuses it rather than spending
+more as the last one leaves — so `/update_server` reuses it rather than spending
 minutes on a duplicate full backup. It takes a fresh full backup when there is no
 chain, the marker does not match, or incrementals are disabled (in which case the
 chain is only as fresh as the last *scheduled* full, which can be days old).
 
 ```
-/update            # installed vs available, and whether it's a major jump
-/update confirm    # back up, warn players, stop, swap, restart
+/update_server            # installed vs available, and whether it's a major jump
+/update_server confirm    # back up, warn players, stop, swap, restart
 ```
 
 ### Configuration
@@ -820,7 +820,7 @@ chain is only as fresh as the last *scheduled* full, which can be days old).
 ```jsonc
 "edition": {
   "type": "java",
-  "server_jar": "server.jar",   // the jar /update overwrites (Java only)
+  "server_jar": "server.jar",   // the jar /update_server overwrites (Java only)
   "flavor": "paper"             // "paper" | "vanilla"; omit to auto-detect
 },
 "updates": {
@@ -830,13 +830,13 @@ chain is only as fresh as the last *scheduled* full, which can be days old).
 }
 ```
 
-**Java: standardise on one jar filename.** `/update` overwrites exactly
+**Java: standardise on one jar filename.** `/update_server` overwrites exactly
 `edition.server_jar`, so your `mux.start_cmd` (and any shell alias or systemd
 unit) never has to change when the version does. If your jar is still named
 after its version — `paper-1.21.11-127.jar` — rename it to `server.jar`,
 update `start_cmd` and your alias to match, and you never touch them again. The
 bot will **not** rename it for you: it cannot see your aliases, so a silent
-rename would break your own launch script. `/update` refuses with a message
+rename would break your own launch script. `/update_server` refuses with a message
 naming both the file it expected and the jar it found.
 
 **Bedrock: your config and packs are preserved.** The BDS zip ships
@@ -852,7 +852,7 @@ removing a vanilla pack does not strand yours.
 chain: its base full backup holds the previous binary and a pre-migration world,
 and after a Bedrock swap every file has a fresh mtime, so the next incremental
 would diff against a stale manifest and re-capture the whole directory. So
-`/update` drops the chain marker, and once the server is confirmed back up it
+`/update_server` drops the chain marker, and once the server is confirmed back up it
 runs a **full backup** — giving future incrementals a base that matches the
 updated server. Two full backups therefore bracket an update: the one before it
 is your rollback point, the one after it is the new chain's foundation. If the
@@ -863,7 +863,7 @@ Bedrock updates require a layout the staged swap supports (see
 [Whole-world restore](#whole-world-restore-from-chat--restore) for the same
 constraints). Unlike `/restore` there is no in-place fallback — the only
 other way to apply a BDS release is to unzip over the install, which is exactly
-the config-destroying thing this avoids — so `/update` refuses and tells you
+the config-destroying thing this avoids — so `/update_server` refuses and tells you
 why.
 
 ---
@@ -977,7 +977,7 @@ servers in one process never collide. All of it is git-ignored:
   counts (per-server, not portable)
 - `data/<name>/bedrock_player_state.json` — *(Bedrock)* per-player data hashes, so
   incremental sidecars only carry players that changed
-- `data/<name>/installed_version.json` — which server build is installed. Written authoritatively by `/update`; otherwise bootstrapped from the startup
+- `data/<name>/installed_version.json` — which server build is installed. Written authoritatively by `/update_server`; otherwise bootstrapped from the startup
   banner so a server that predates the feature still has something to compare against
 - `<minecraft_dir>/.diamondsign_chain` — chain-validity marker, in the server dir
 - `~/.diamond-sign/minecraft_servers/{java,bedrock}/` — downloaded server

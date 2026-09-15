@@ -730,7 +730,7 @@ def test_no_baseline_stays_quiet():
               "no baseline -> the background poll stays quiet instead of "
               "claiming an update (it cannot know if the server is behind)")
         check(upd.available_update(server, require_baseline=False) is rel,
-              "...but /update still shows it, since installing it is what "
+              "...but /update_server still shows it, since installing it is what "
               "records a baseline in the first place")
         server.load_installed_version = lambda: {
             "source": "bedrock", "mc_version": "1.26.45.1", "build": None}

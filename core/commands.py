@@ -155,7 +155,7 @@ _RESTORE_PLAYER_PAGE_SIZE = 10  # versions shown per page in /restore_player lis
 # /restore (whole-world) pending-state, keyed like the player restore by
 # "{bot}:{server}:{platform}:{user}". Same list -> select -> confirm gate so an
 # accidental /restore can't wipe and rebuild the world in one command.
-# /update pending-state, same list->confirm discipline as the restores: an
+# /update_server pending-state, same list->confirm discipline as the restores: an
 # update stops the server and replaces its binary, and a Minecraft version bump
 # migrates the world irreversibly, so it must never happen on one mistyped
 # message.
@@ -650,7 +650,8 @@ def register_commands(router, auth: dict) -> None:
     router.register("backup", cmd_backup, private_only=True, admin_only=True,
                     needs_online=True)
 
-    # --- /update (server version) ---
+    # --- /update_server (server version) ---
+    # Named update_server, not update: Slack reserves /update.
     def cmd_update(ctx):
         server = ctx.server
         confirm = bool(ctx.args) and ctx.args[0].lower() == "confirm"
@@ -687,8 +688,8 @@ def register_commands(router, auth: dict) -> None:
                     ctx.chat_id,
                     updates.describe_update(server, release)
                     + "\n\nA full backup runs first, then the server is "
-                      "stopped, updated and restarted.\nSend `/update "
-                      "confirm` to proceed.")
+                      "stopped, updated and restarted.\nSend "
+                      "`/update_server confirm` to proceed.")
 
             threading.Thread(target=look, daemon=True).start()
             return
@@ -696,7 +697,7 @@ def register_commands(router, auth: dict) -> None:
         with _pending_update_lock:
             entry = _pending_update.pop(pkey, None)
         if entry is None or time.time() - entry["ts"] > _PENDING_UPDATE_TTL:
-            ctx.reply("Nothing to confirm \u2014 run /update first to see what "
+            ctx.reply("Nothing to confirm \u2014 run /update_server first to see what "
                       "is available.")
             return
 
@@ -714,7 +715,7 @@ def register_commands(router, auth: dict) -> None:
                 server.backup_lock.release()
 
         threading.Thread(target=run, daemon=True).start()
-    router.register("update", cmd_update, private_only=True, admin_only=True,
+    router.register("update_server", cmd_update, private_only=True, admin_only=True,
                     cap=lambda c: c.server.backend.can_restart,
                     cap_message="Updating needs a restart transport \u2014 set "
                                 "mux.session + mux.start_cmd for this server.")

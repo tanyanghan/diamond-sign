@@ -104,11 +104,11 @@ def available_update(server, *, require_baseline: bool = True):
         # Nothing to compare against: the background poll would otherwise
         # report "an update is available" on every cycle forever, whether or
         # not the server is actually behind. Stay quiet and say why rather
-        # than crying wolf. /update passes require_baseline=False, since a
+        # than crying wolf. /update_server passes require_baseline=False, since a
         # human asking directly should still be shown what is on offer.
         logger.warning(
             "[%s] A %s release is available (%s) but the installed version is "
-            "unknown, so it cannot be compared. Run /update to install it "
+            "unknown, so it cannot be compared. Run /update_server to install it "
             "explicitly, which also records what is installed.",
             cfg.name, release.source, release.describe())
         return None
@@ -203,7 +203,7 @@ def recover_server_version(server) -> dict | None:
     bot attaches — and the bot restarts far more often than the Minecraft
     server does. On a server that was already running, the startup banner
     scrolled past long ago and nothing would ever record a version, leaving
-    /update with no idea what is installed (and, for Java, no idea whether it
+    /update_server with no idea what is installed (and, for Java, no idea whether it
     is Paper or vanilla).
 
     Both banners are collected rather than the first match taken. Paper prints
@@ -296,12 +296,12 @@ def require_empty_server(server) -> None:
     if online is None:
         raise UpdateError(
             "could not confirm whether anyone is online. Try again shortly, "
-            "or stop the server first and re-run /update.")
+            "or stop the server first and re-run /update_server.")
     if online:
         names = ", ".join(sorted(online))
         raise UpdateError(
             f"{len(online)} player(s) online ({names}). An update disconnects "
-            f"everyone \u2014 wait until the server is empty and run /update "
+            f"everyone \u2014 wait until the server is empty and run /update_server "
             f"again.")
 
 
@@ -454,7 +454,7 @@ def preflight(server, release) -> None:
         found = sorted(p.name for p in cfg.minecraft_dir.glob("*.jar"))
         hint = (f" Found: {', '.join(found)}." if found else "")
         raise UpdateError(
-            f"no '{cfg.server_jar}' in {cfg.minecraft_dir}.{hint} /update "
+            f"no '{cfg.server_jar}' in {cfg.minecraft_dir}.{hint} /update_server "
             f"overwrites exactly that file, so rename your jar to "
             f"'{cfg.server_jar}' (updating mux.start_cmd and any shell alias "
             f"to match), or set edition.server_jar to the name you use.")
@@ -573,7 +573,7 @@ def update_server(server, release, *, say) -> None:
                         f"{cfg.mux_start_cmd}")
             else:
                 say("⚠️ The server was left STOPPED: the update did not "
-                    "complete. Fix the problem and run /update again, or "
+                    "complete. Fix the problem and run /update_server again, or "
                     "/start to bring it up on the old version.")
         if kept is not None and not relaunched:
             say(f"Previous version kept at {kept.name} — restore it by hand "

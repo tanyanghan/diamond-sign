@@ -93,11 +93,11 @@ class ServerConfig:
     # /restore stops the server.
     restore_warning_seconds: int = 15
 
-    # --- server-version updates (/update) ---
+    # --- server-version updates (/update_server) ---
     # Whether this server takes part in release monitoring at all.
     updates_enabled: bool = True
     # Java only: the jar the start command actually launches, relative to
-    # minecraft_dir. /update overwrites exactly this path, so a version bump
+    # minecraft_dir. /update_server overwrites exactly this path, so a version bump
     # never has to rewrite mux_start_cmd (or the operator's shell aliases).
     # The jar filename appears NOWHERE else in the code — it lives only
     # inside the opaque start_cmd string — so the updater has no other way

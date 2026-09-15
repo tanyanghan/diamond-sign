@@ -145,7 +145,7 @@ class LogWatcher(FileSystemEventHandler):
         Both editions print one: Java's "This server is running Paper
         version ..." / "Starting minecraft server version ...", and BDS's
         "Version: 1.26.45.1". Cheap and silent — record_observed_version()
-        ignores anything it already knows, and never overwrites what /update
+        ignores anything it already knows, and never overwrites what /update_server
         wrote.
         """
         try:

@@ -150,7 +150,7 @@ class Server:
     def load_installed_version(self) -> dict:
         """What server build is installed: ``{source, mc_version, build, ...}``.
 
-        ``{}`` when unknown. /update writes this authoritatively (it knows
+        ``{}`` when unknown. /update_server writes this authoritatively (it knows
         exactly what it installed); the startup-log banner only ever fills it
         in for a server that predates the feature.
         """
@@ -164,7 +164,7 @@ class Server:
 
     def save_installed_version(self, source: str, mc_version: str,
                                build=None, **extra) -> None:
-        """Record what is installed. Called by /update after a successful
+        """Record what is installed. Called by /update_server after a successful
         swap, so the record is authoritative rather than inferred."""
         record = {"source": source, "mc_version": mc_version, "build": build,
                   "recorded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -179,16 +179,16 @@ class Server:
     def record_observed_version(self, parsed: dict) -> None:
         """Bootstrap a version record from a startup-log banner.
 
-        Only fills a gap: never overwrites a record /update wrote, and never
+        Only fills a gap: never overwrites a record /update_server wrote, and never
         rewrites an identical observation (the banner reappears on every
         restart). A server installed by hand before this feature existed still
-        gets something for /update to compare against.
+        gets something for /update_server to compare against.
         """
         if not parsed:
             return
         current = self.load_installed_version()
         if current and not current.get("observed"):
-            return      # /update's authoritative record wins
+            return      # /update_server's authoritative record wins
         if (current.get("mc_version") == parsed.get("mc_version")
                 and current.get("build") == parsed.get("build")):
             return      # unchanged since the last restart

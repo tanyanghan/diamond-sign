@@ -375,7 +375,7 @@ def _start_update_check(server, bot) -> None:
     Same shape as _start_scheduled_backup: one daemon thread per server with a
     sleep loop. It only ever reads metadata, downloads to a cache outside the
     server directory, and posts a message — it never touches the running
-    server. Applying an update is always an explicit /update confirm.
+    server. Applying an update is always an explicit /update_server confirm.
     """
     if not server.config.updates_enabled:
         logger.info("[%s] Version monitoring disabled", server.config.name)
@@ -416,7 +416,7 @@ def _fetch_shared_artifact(server, release) -> bool:
         fetch that has just demonstrably failed.
 
     Returns whether the artifact is on disk. A failure is not fatal — the
-    operator is still told a release exists, and /update fetches it then.
+    operator is still told a release exists, and /update_server fetches it then.
     """
     name = release.filename
     if not _update_download_lock.acquire(blocking=False):
@@ -459,8 +459,8 @@ def _announce_update(server, bot, release) -> None:
         logger.warning("[%s] Cache prune failed", server.config.name)
 
     msg = ("\U0001f4e6 " + updates.describe_update(server, release)
-           + "\nDownloaded and ready \u2014 send /update to review, then "
-             "/update confirm to install.")
+           + "\nDownloaded and ready \u2014 send /update_server to review, then "
+             "/update_server confirm to install.")
     sent = bot.announce(server, msg)
     logger.info("[%s] Update available: %s %s \u2014 announced to %d chat(s)",
                 server.config.name, release.source, release.describe(), sent)
