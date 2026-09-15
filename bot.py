@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import logging
 import sys
 import threading
@@ -368,6 +369,16 @@ _UPDATE_FAILURE_MEMO = 30 * 60
 # per-server knob (updates.enabled) is not, and nothing here needs tuning.
 _UPDATE_CHECK_INTERVAL = 6 * 60 * 60
 
+# The first check runs almost immediately, staggered a couple of seconds per
+# server so four of them don't hit the upstreams in the same instant. It used
+# to be a flat 60s, which meant a minute of silence after every restart before
+# a pending update was mentioned -- far too cautious for what this actually
+# does: a few KB of JSON per source, on a daemon thread that cannot delay
+# startup, with downloads already serialised behind their own lock.
+_UPDATE_FIRST_CHECK_DELAY = 3
+_UPDATE_CHECK_STAGGER = 2
+_update_check_slot = itertools.count()
+
 
 def _start_update_check(server, bot) -> None:
     """Poll for a newer server build, download it, and announce it.
@@ -382,9 +393,8 @@ def _start_update_check(server, bot) -> None:
         return
 
     def _loop():
-        # Stagger the first check a little so every server doesn't hit the
-        # upstreams the instant the bot starts.
-        time.sleep(60)
+        time.sleep(_UPDATE_FIRST_CHECK_DELAY
+                   + _UPDATE_CHECK_STAGGER * next(_update_check_slot))
         while True:
             try:
                 release = updates.available_update(server)

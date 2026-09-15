@@ -586,6 +586,31 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_first_check_is_prompt_and_staggered():
+    print("first version check timing:")
+    import bot as botmod
+
+    check(botmod._UPDATE_FIRST_CHECK_DELAY <= 5,
+          f"first check within a few seconds of start "
+          f"({botmod._UPDATE_FIRST_CHECK_DELAY}s) -- it used to be a flat 60s, "
+          "so a pending update went unmentioned for a minute after a restart")
+    check(botmod._UPDATE_CHECK_STAGGER > 0,
+          "servers are still staggered, not fired simultaneously")
+
+    # Each thread takes the next slot, so N servers spread out rather than
+    # all waiting the same amount.
+    slots = [next(botmod._update_check_slot) for _ in range(4)]
+    check(slots == sorted(set(slots)) and len(set(slots)) == 4,
+          f"each server gets a distinct, increasing slot ({slots})")
+
+    delays = [botmod._UPDATE_FIRST_CHECK_DELAY
+              + botmod._UPDATE_CHECK_STAGGER * i for i in range(4)]
+    check(max(delays) < 15,
+          f"even the last of four servers checks within {max(delays)}s")
+    check(botmod._UPDATE_CHECK_INTERVAL == 6 * 60 * 60,
+          "the steady-state interval is unchanged")
+
+
 def test_restore_downgrade_is_noticed():
     print("a restore that downgrades the binary:")
     from core.server import Server
@@ -1160,6 +1185,7 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_first_check_is_prompt_and_staggered,
                test_restore_downgrade_is_noticed,
                test_chain_rebased_after_a_recovered_relaunch,
                test_update_progress_is_logged,
