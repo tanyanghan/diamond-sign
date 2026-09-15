@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import logging
 import sys
 import threading
@@ -20,6 +21,7 @@ from core.presence import reconcile_online, recover_online_identities
 from core.notifications import make_notify_callback
 from core.logwatch import LogWatcher
 from core.server import Server
+from core import updates
 from core.commands import register_commands, make_unclaimed_handler
 
 # ---------------------------------------------------------------------------
@@ -349,6 +351,138 @@ def _validate_chain(server) -> None:
 _scheduled_backup_lock = threading.Lock()
 
 
+# Serialize release downloads across the process. Several servers of the same
+# edition see the same new release at once; without this they would each pull
+# the same 60-120 MB artifact simultaneously. The first one through writes it
+# to the shared cache and the rest find it already there.
+_update_download_lock = threading.Lock()
+
+# Artifacts that just failed to download, by filename. Without this every
+# server of that edition repeats the same doomed fetch in turn: three Bedrock
+# servers each retried the same URL three times, turning one failure into
+# nine and a ten-minute stall. Guarded by _update_download_lock.
+_update_download_failed: dict = {}
+_UPDATE_FAILURE_MEMO = 30 * 60
+
+# How often to ask the upstreams what the newest build is. Deliberately a
+# constant rather than config: it is inherently process-wide while the
+# per-server knob (updates.enabled) is not, and nothing here needs tuning.
+_UPDATE_CHECK_INTERVAL = 6 * 60 * 60
+
+# The first check runs almost immediately, staggered a couple of seconds per
+# server so four of them don't hit the upstreams in the same instant. It used
+# to be a flat 60s, which meant a minute of silence after every restart before
+# a pending update was mentioned -- far too cautious for what this actually
+# does: a few KB of JSON per source, on a daemon thread that cannot delay
+# startup, with downloads already serialised behind their own lock.
+_UPDATE_FIRST_CHECK_DELAY = 3
+_UPDATE_CHECK_STAGGER = 2
+_update_check_slot = itertools.count()
+
+
+def _start_update_check(server, bot) -> None:
+    """Poll for a newer server build, download it, and announce it.
+
+    Same shape as _start_scheduled_backup: one daemon thread per server with a
+    sleep loop. It only ever reads metadata, downloads to a cache outside the
+    server directory, and posts a message — it never touches the running
+    server. Applying an update is always an explicit /update_server confirm.
+    """
+    if not server.config.updates_enabled:
+        logger.info("[%s] Version monitoring disabled", server.config.name)
+        return
+
+    def _loop():
+        time.sleep(_UPDATE_FIRST_CHECK_DELAY
+                   + _UPDATE_CHECK_STAGGER * next(_update_check_slot))
+        while True:
+            try:
+                release = updates.available_update(server)
+                if release is not None:
+                    _announce_update(server, bot, release)
+            except Exception:
+                # A flaky upstream must never take the bot down, and must not
+                # kill the loop either: log and try again next cycle.
+                logger.exception("[%s] Version check failed",
+                                 server.config.name)
+            logger.info("[%s] Next version check in %d seconds",
+                        server.config.name, _UPDATE_CHECK_INTERVAL)
+            time.sleep(_UPDATE_CHECK_INTERVAL)
+
+    threading.Thread(target=_loop, daemon=True,
+                     name=f"update-check-{server.config.key}").start()
+
+
+def _fetch_shared_artifact(server, release) -> bool:
+    """Download a release once, however many servers want it.
+
+    Servers of the same edition share one cache, so the work is done by
+    whichever gets here first and everyone else reuses the file. Two things
+    make that actually hold:
+
+      * the cache is checked while holding the lock, so a server that queued
+        behind a download finds the finished file instead of starting its own;
+      * a failure is remembered briefly, so the rest do not each repeat a
+        fetch that has just demonstrably failed.
+
+    Returns whether the artifact is on disk. A failure is not fatal — the
+    operator is still told a release exists, and /update_server fetches it then.
+    """
+    name = release.filename
+    if not _update_download_lock.acquire(blocking=False):
+        logger.info("[%s] Waiting for another server's download of %s",
+                    server.config.name, name)
+        _update_download_lock.acquire()
+    try:
+        dest = updates.mc_versions.cache_dir(release.edition) / name
+        if dest.exists():
+            logger.info("[%s] %s already in the cache", server.config.name,
+                        name)
+            return True
+        failed_at = _update_download_failed.get(name)
+        if failed_at and time.time() - failed_at < _UPDATE_FAILURE_MEMO:
+            logger.info("[%s] Skipping %s: another server's download failed "
+                        "recently", server.config.name, name)
+            return False
+        try:
+            updates.ensure_downloaded(release, log=None)
+            _update_download_failed.pop(name, None)
+            return True
+        except Exception as e:
+            _update_download_failed[name] = time.time()
+            logger.warning("[%s] Could not pre-download %s: %s",
+                           server.config.name, name, e)
+            return False
+    finally:
+        _update_download_lock.release()
+
+
+def _announce_update(server, bot, release) -> None:
+    """Download the new build, then tell the ADMIN it is ready to install."""
+    installed = server.load_installed_version()
+    _fetch_shared_artifact(server, release)
+
+    try:
+        keep = {release.filename, installed.get("filename")}
+        updates.mc_versions.prune_cache(release.edition, keep)
+    except Exception:
+        logger.warning("[%s] Cache prune failed", server.config.name)
+
+    msg = ("\U0001f4e6 " + updates.describe_update(server, release)
+           + "\nDownloaded and ready \u2014 send /update_server to review, then "
+             "/update_server confirm to install.")
+    # Admin DM only, never the server's chats. /update_server is registered
+    # private_only + admin_only, so a group announcement would tell players
+    # about an action none of them can take -- they cannot even see the
+    # command. Same reasoning as the scheduled backup's progress messages.
+    # describe_update() leads with the server name, so the admin still knows
+    # which server it refers to without the message being chat-scoped.
+    bot.alert_admins(msg)
+    logger.info("[%s] Update available: %s %s (installed: %s) \u2014 alerted the admin(s)",
+                server.config.name, release.source, release.describe(),
+                installed.get("mc_version") or "unknown")
+
+
 def _start_scheduled_backup(server, bot) -> None:
     """Start the per-server scheduled full-backup thread. Status is reported to
     the owning bot's admins."""
@@ -463,7 +597,12 @@ def _bring_up_server(server, bot) -> bool:
                     server.config.name, log_path)
 
         _validate_chain(server)
+        # Learn the installed version from the log the server already
+        # wrote: the tailer starts at EOF, so a server that was up
+        # before the bot would otherwise never have one recorded.
+        updates.recover_server_version(server)
         _start_scheduled_backup(server, bot)
+        _start_update_check(server, bot)
         # Capturing who's already online can wait up to ~2 min for RCON when the
         # server is still booting (or down). Do it off the startup path so a
         # slow/down server doesn't delay this bot's chat adapters and leave it

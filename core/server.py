@@ -83,6 +83,7 @@ class Server:
         # on Bedrock). Matched by basename anywhere in the tree.
         self.backup_exclude_names = frozenset(backup_exclude_names(config))
         self.manifest_path = self._data_path("backup_manifest.json")
+        self.version_path = self._data_path("installed_version.json")
         self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
         # Bedrock per-player restore reads player data from a sidecar embedded in
         # each backup zip (the live LevelDB is locked while the server runs).
@@ -145,6 +146,89 @@ class Server:
             except Exception:
                 self.log.exception("Failed to load backup_manifest.json")
         return "", "", {}
+
+    def load_installed_version(self) -> dict:
+        """What server build is installed: ``{source, mc_version, build, ...}``.
+
+        ``{}`` when unknown. /update_server writes this authoritatively (it knows
+        exactly what it installed); the startup-log banner only ever fills it
+        in for a server that predates the feature.
+        """
+        if self.version_path.exists():
+            try:
+                with open(self.version_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                self.log.exception("Failed to load installed_version.json")
+        return {}
+
+    def save_installed_version(self, source: str, mc_version: str,
+                               build=None, **extra) -> None:
+        """Record what is installed. Called by /update_server after a successful
+        swap, so the record is authoritative rather than inferred."""
+        record = {"source": source, "mc_version": mc_version, "build": build,
+                  "recorded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  "observed": False}
+        record.update(extra)
+        try:
+            with open(self.version_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+        except OSError:
+            self.log.exception("Failed to write installed_version.json")
+
+    def forget_installed_version(self) -> None:
+        """Drop the installed-version record.
+
+        Used after a world restore: the restore replaces the server directory
+        from a backup, binary included, so whatever was recorded no longer
+        describes what is on disk. Clearing it leaves the state honestly
+        unknown until the restored server's own startup banner re-establishes
+        it, rather than confidently wrong.
+        """
+        try:
+            self.version_path.unlink(missing_ok=True)
+        except OSError:
+            self.log.warning("Could not clear installed_version.json")
+
+    def record_observed_version(self, parsed: dict) -> None:
+        """Record a version read from a startup-log banner.
+
+        The banner is what the server that is ACTUALLY RUNNING printed about
+        itself, so it wins over anything previously recorded — including
+        what /update_server wrote. That record is only authoritative until
+        something else changes the binary underneath it, and a world restore
+        does exactly that: a Bedrock backup contains the whole server
+        directory, ``bedrock_server`` included, so restoring an older one
+        downgrades the server. Refusing to correct the record there left the
+        bot certain it was running a version it had just replaced.
+
+        An identical observation is still ignored, since the banner reappears
+        on every restart and rewriting the file each time would be noise.
+        """
+        if not parsed:
+            return
+        current = self.load_installed_version()
+        if (current.get("mc_version") == parsed.get("mc_version")
+                and current.get("build") == parsed.get("build")):
+            return      # unchanged since the last restart
+        if current.get("mc_version"):
+            self.log.info("Installed version changed: %s -> %s (the running "
+                          "server says so)", current.get("mc_version"),
+                          parsed.get("mc_version"))
+        record = {"source": parsed.get("source", ""),
+                  "mc_version": parsed.get("mc_version", ""),
+                  "build": parsed.get("build"),
+                  "software": parsed.get("software", ""),
+                  "recorded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  "observed": True}
+        try:
+            with open(self.version_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            self.log.info("Detected server version: %s %s%s",
+                          record["software"], record["mc_version"],
+                          f" build {record['build']}" if record["build"] else "")
+        except OSError:
+            self.log.exception("Failed to write installed_version.json")
 
     def save_manifest(self, files: dict, chain_id: str, base_full: str) -> None:
         """Write the manifest with the current chain state and file mtimes."""
@@ -888,6 +972,21 @@ class Server:
                     preserve_names=self.backup_exclude_names,
                     log_fn=say, preflight_done=True)
             restored = True
+            # Both paths replaced the server directory contents (the staged
+            # path replaced the directory itself), so the log watcher is
+            # still bound to the old inode. Rebind BEFORE relaunching:
+            # Bedrock waits for "Server started." in console.log and Java
+            # for "RCON running on" in latest.log, and a watcher pointing at
+            # the replaced directory sees neither -- the server comes up and
+            # the bot retries anyway, typing its start command into a live
+            # console. It is rebound again after the relaunch, when Java has
+            # rotated a fresh latest.log into place.
+            self.reattach_log_watch()
+            # The restore replaced the server directory from a backup,
+            # binary included, so any recorded version now describes the
+            # build that WAS installed. Forget it; the restored server's
+            # own startup banner re-establishes it within seconds.
+            self.forget_installed_version()
 
             # 6. Relaunch and confirm ready.
             say("Restarting the server...")

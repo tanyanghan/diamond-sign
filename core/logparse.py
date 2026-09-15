@@ -34,6 +34,115 @@ RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
 # Player chat, e.g. "[12:34:56] [Server thread/INFO]: <Steve> hello" (or a
 # Paper-style "[Async Chat Thread - #0/INFO]:"). The <> brackets distinguish it
 # from join/leave/death lines (which start with a bare \w name).
+# --- server version, read off the startup banner ----------------------------
+# Bootstrap only. /update_server is the AUTHORITATIVE record of what is installed --
+# it knows exactly what it just wrote -- so these exist purely so a server
+# that predates the feature still has something to compare against before
+# /update_server has ever run once. Both lines were taken verbatim from this repo's
+# own captured logs (logs/log_*.txt), not guessed:
+#
+#   [16:37:28] [Server thread/INFO]: This server is running Paper version
+#       1.21.11-117-main@79c77f5 (2026-02-20T...) (Implementing API version ...)
+#   [10:12:45] [Server thread/INFO]: Starting minecraft server version 1.21.6
+#
+# Order matters: Paper prints BOTH lines, its own after the vanilla one, so the
+# Paper match must win. The vanilla line alone cannot identify the flavour —
+# Fabric and Paper both print it.
+RE_PAPER_VERSION = re.compile(
+    r'This server is running (\w+) version ([\d.]+)-(\d+)-\S+')
+RE_VANILLA_VERSION = re.compile(
+    r'Starting minecraft server version (\S+)')
+
+
+# The `version` console command, which BOTH Java flavours answer -- and in
+# completely different shapes, which is what makes it a reliable way to tell
+# them apart:
+#
+#   Paper    This server is running Paper version 26.2-121-main@a2a42c5 (...)
+#            You are 2 version(s) behind
+#            Previous version: 26.2-117-27af5dd (MC: 26.2)      <- NOT ours
+#
+#   Vanilla  Server version info:
+#            id = 26.2
+#            name = 26.2
+#            stable = yes
+#
+# The vanilla block is only read when its header is present, so a stray
+# "id = ..." elsewhere in a log can never be taken for a version.
+_VANILLA_VERSION_HEADER = "Server version info:"
+RE_VANILLA_VERSION_ID = re.compile(r'\bid\s*=\s*(\S+)\s*$')
+RE_VANILLA_VERSION_STABLE = re.compile(r'\bstable\s*=\s*(\S+)\s*$')
+
+
+def parse_version_command(text: str) -> dict | None:
+    """Parse the output of the `version` command, either Java flavour.
+
+    Paper's banner wins when present: it carries the build number, which the
+    vanilla block has no equivalent of. Only if no banner appears is the
+    structured vanilla block read, so a Paper server is never mislabelled.
+    """
+    best = None
+    for line in text.splitlines():
+        parsed = parse_version_line(line)
+        if parsed:
+            best = parsed
+            if parsed.get("build") is not None:
+                return best
+    if best:
+        return best
+    if _VANILLA_VERSION_HEADER not in text:
+        return None
+    version = stable = None
+    for line in text.splitlines():
+        m = RE_VANILLA_VERSION_ID.search(line)
+        if m and version is None:
+            version = m.group(1)
+        m = RE_VANILLA_VERSION_STABLE.search(line)
+        if m and stable is None:
+            stable = m.group(1).lower() == "yes"
+    if not version:
+        return None
+    return {"source": "vanilla", "software": "Vanilla",
+            "mc_version": version, "build": None, "stable": stable}
+
+
+# BDS prints its version in the first few lines of every run:
+#   [2026-09-15 12:37:33:754 INFO] Version: 1.26.45.1
+# Anchored on the whole line so a chat message mentioning a version cannot be
+# mistaken for the banner. BDS has no `version` console command to ask instead
+# (it answers "Unknown command"), so the log is the only source.
+RE_BEDROCK_VERSION = re.compile(
+    r'^\[[^\]]*INFO\]\s*Version:\s*([\d.]+)\s*$')
+
+
+def parse_bedrock_version_line(line: str) -> dict | None:
+    """Extract the BDS version from one console line, or None."""
+    m = RE_BEDROCK_VERSION.match(line.strip())
+    if not m:
+        return None
+    return {"source": "bedrock", "software": "Bedrock Dedicated Server",
+            "mc_version": m.group(1), "build": None}
+
+
+def parse_version_line(line: str) -> dict | None:
+    """Extract a server version from one Java startup line, or None.
+
+    Returns ``{"source", "mc_version", "build", "software"}``. ``build`` is
+    the Paper build number, or None for vanilla-style lines.
+    """
+    m = RE_PAPER_VERSION.search(line)
+    if m:
+        software, mc_version, build = m.group(1), m.group(2), m.group(3)
+        return {"source": "paper" if software.lower() == "paper" else "vanilla",
+                "software": software, "mc_version": mc_version,
+                "build": int(build)}
+    m = RE_VANILLA_VERSION.search(line)
+    if m:
+        return {"source": "vanilla", "software": "Vanilla",
+                "mc_version": m.group(1), "build": None}
+    return None
+
+
 RE_CHAT = re.compile(r'^\[[\d:]+\] \[[^\]]*/INFO\]: <([^>]+)> (.+)$')
 DEATH_PHRASES = (
     "was slain by", "was shot by", "was killed",

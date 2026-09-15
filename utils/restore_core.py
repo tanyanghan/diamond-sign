@@ -488,7 +488,7 @@ def can_stage_swap(target_dir: Path, backup_dir: Path) -> tuple[bool, str]:
 
 
 def swap_in_staging(staging: Path, target_dir: Path, preserve_names,
-                    log) -> Path:
+                    log, what: str = "restored world") -> Path:
     """Replace ``target_dir`` with ``staging`` via two renames.
 
     Returns the path the old directory was renamed aside to (the caller
@@ -539,7 +539,7 @@ def swap_in_staging(staging: Path, target_dir: Path, preserve_names,
                 f"the world is at {old}", world_intact=False) from e
         raise SwapError(f"swap failed, original world restored: {e}",
                         world_intact=True) from e
-    log(f"Swapped in the restored world (previous world kept at {old.name})")
+    log(f"Swapped in the {what} (previous kept at {old.name})")
     return old
 
 

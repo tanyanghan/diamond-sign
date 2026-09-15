@@ -10,11 +10,14 @@
           "name": "survival",
           "edition": {
             "type": "java",
-            "rcon": { "password": "your_rcon_password", "host": "localhost", "port": 25575 }
+            "rcon": { "password": "your_rcon_password", "host": "localhost", "port": 25575 },
+            "server_jar": "server.jar",
+            "flavor": "paper"
           },
           "minecraft_dir": "/srv/survival",
           "mux": { "session": "0:survival", "start_cmd": "cd /srv/survival && java -jar server.jar nogui" },
           "chat_relay": false,
+          "updates": { "enabled": true, "pin_mc_version": false },
           "backup": {
             "dir": "~/backup/survival",
             "schedule": "daily",
@@ -51,6 +54,7 @@
           "minecraft_dir": "/srv/bedrock",
           "mux": { "session": "", "start_cmd": "" },
           "chat_relay": true,
+          "updates": { "enabled": true },
           "backup": {
             "dir": "~/backup/bedrock",
             "pre_restore_backup": false,
