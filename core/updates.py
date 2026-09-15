@@ -230,6 +230,14 @@ def recover_server_version(server) -> dict | None:
         except OSError:
             best = None
     if best:
+        # Always report it, not just when record_observed_version() writes:
+        # a baseline that is merely WRONG (an older banner still inside the
+        # scan window, say) is otherwise indistinguishable from a right one,
+        # and it is what every later "update available" is compared against.
+        logger.info("[%s] Installed version from %s: %s %s%s",
+                    server.config.name, server.config.log_path.name,
+                    best.get("software", "?"), best.get("mc_version", "?"),
+                    f" build {best['build']}" if best.get("build") else "")
         server.record_observed_version(best)
     elif server.config.updates_enabled:
         # Worth saying out loud: with no baseline the poll stays silent, and

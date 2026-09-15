@@ -541,7 +541,8 @@ def test_version_detection_from_logs():
             "26.2-121-main@a2a42c5 (2026-08-29T11:32:25Z)",
             ""]), encoding="utf-8")
         srv = types.SimpleNamespace(
-            config=types.SimpleNamespace(edition="java", log_path=jlog),
+            config=types.SimpleNamespace(edition="java", log_path=jlog,
+                                         name="XPS-Java", updates_enabled=True),
             record_observed_version=lambda p: None)
         got = upd.recover_server_version(srv)
         check(got and got["source"] == "paper" and got["build"] == 121,
@@ -557,7 +558,8 @@ def test_version_detection_from_logs():
             "[2026-09-15 12:39:09:506 INFO] There are 0/10 players online:",
             ""]), encoding="utf-8")
         srv2 = types.SimpleNamespace(
-            config=types.SimpleNamespace(edition="bedrock", log_path=blog),
+            config=types.SimpleNamespace(edition="bedrock", log_path=blog,
+                                         name="XPS-Bedrock", updates_enabled=True),
             record_observed_version=lambda p: None)
         got2 = upd.recover_server_version(srv2)
         check(got2 and got2["mc_version"] == "1.26.45.1",
