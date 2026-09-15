@@ -858,10 +858,18 @@ def register_commands(router, auth: dict) -> None:
                                               server_name)
 
         if not confirm:
-            # Verify every zip this point needs BEFORE offering the confirm
+            # Check every zip this point needs BEFORE offering the confirm
             # step — a corrupt backup must surface while choosing, not after
-            # the world is wiped. (restore_world re-validates at confirm.)
-            problems = restore_core.validate_chain_files(
+            # the world is wiped.
+            #
+            # Structural check only (open each zip, read its central
+            # directory): it catches truncation, which is the failure mode
+            # actually seen in the wild, in milliseconds. The full CRC pass
+            # decompresses everything and took ~50s on an 84-zip chain, which
+            # is a long time to leave /restore <N> unanswered. Nothing is lost
+            # by deferring it: the restore extracts before touching the world
+            # and zipfile raises BadZipFile: Bad CRC-32 on any bad entry.
+            problems = restore_core.validate_chain_structure(
                 chains[point["chain_idx"]], point["point_idx"])
             if problems:
                 server.log.warning("Restore: point %d unusable: %s",

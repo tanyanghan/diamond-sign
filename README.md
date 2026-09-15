@@ -623,14 +623,29 @@ bot killed mid-backup (OOM, reboot) leaves harmless debris that is cleaned on
 the next backup, never a truncated `.zip` silently poisoning the chain. The
 chain manifest only advances after that verification, so a backup that never
 finished is automatically re-captured in full by the next incremental.
-`/restore` re-verifies every zip the chosen point needs **twice before
-anything is touched** — at selection (a corrupt point is refused with the
-filename) and again at confirm, together with a disk-space estimate — so a
-bad backup or a full disk aborts the restore while the server is still up and
-the world untouched. If a restore still fails after the world was replaced,
-the server is deliberately **left stopped** (the world on disk is incomplete;
-`/start` overrides) and incremental backups are suspended until the next full
-backup. Chain discovery only accepts zips whose filename matches this server's
+`/restore` checks the chain before touching anything: a fast structural check
+at selection (each zip is opened and its central directory read, which is what
+a truncated write destroys) refuses a corrupt point by filename while you are
+still choosing, and a disk-space estimate runs at confirm. Full CRC
+verification happens during extraction — `zipfile` raises on any bad entry
+— so every byte is still checked before the world is replaced, without
+decompressing the whole chain up front just to do it again.
+
+**Staged swap.** Where the layout allows it, the restored world is extracted
+into a sibling directory **while the server is still running**, and only then
+is the server stopped, the new directory renamed into place, and the server
+started. Downtime becomes two renames rather than the length of the
+extraction, and the live world is untouched until that swap — so a corrupt
+zip or a full disk aborts with players still online and nothing to repair. The
+previous world is kept alongside until the restart is confirmed, then removed.
+
+The bot falls back to replacing the world in place (stop, wipe, extract) when
+a swap would not be safe — the backup dir living inside the server
+directory, a symlinked or mounted server directory, a different filesystem, or
+too little free space. The reason is logged. If an in-place restore fails
+after the world was replaced, the server is deliberately **left stopped** (the
+world on disk is incomplete; `/start` overrides) and incremental backups are
+suspended until the next full backup. Chain discovery only accepts zips whose filename matches this server's
 name exactly — to quarantine a bad backup, rename it (e.g. a `corrupt_`
 prefix) and it drops out of every chain.
 

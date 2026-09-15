@@ -271,6 +271,33 @@ class PreflightError(RuntimeError):
     up, unlike a mid-restore failure after the wipe."""
 
 
+def validate_chain_structure(chain: dict, point_idx: int) -> list[str]:
+    """Cheap structural check of every zip a restore would need.
+
+    Opening a zip reads its central directory, which is what a truncated
+    write destroys — the failure mode actually seen in the wild (a backup
+    killed mid-write). Unlike ``validate_chain_files`` this does NOT
+    decompress anything, so it is milliseconds rather than ~50s on a long
+    chain, and is what the /restore listing uses to reject a bad point while
+    the admin is still choosing. Full CRC verification still happens later:
+    ``zipfile`` raises ``BadZipFile: Bad CRC-32`` while extracting, and the
+    staged restore extracts before anything is touched.
+    """
+    to_check = [chain["full"]["path"]]
+    if point_idx >= 0:
+        to_check += [i["path"] for i in chain["incrementals"][:point_idx + 1]]
+    problems = []
+    for path in to_check:
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                zf.namelist()
+        except zipfile.BadZipFile as e:
+            problems.append(f"{path.name}: not a valid zip ({e})")
+        except OSError as e:
+            problems.append(f"{path.name}: unreadable ({e})")
+    return problems
+
+
 def check_disk_space(chain: dict, point_idx: int, target_dir: Path,
                      backup_dir: Path, establish_chain: bool, log) -> None:
     """Abort (raise PreflightError) if the restore can't fit on disk.
@@ -409,6 +436,113 @@ def _restored_world_sidecar(target_dir: Path, backup_dir: Path):
                                                    tmp_dir=backup_dir)
 
 
+class SwapError(RuntimeError):
+    """A staged swap failed. ``world_intact`` says whether the live server
+    directory was left coherent (rollback succeeded, or the swap never got
+    far enough to matter) — the caller uses it to decide between relaunching
+    and leaving the server deliberately stopped."""
+
+    def __init__(self, message: str, *, world_intact: bool):
+        super().__init__(message)
+        self.world_intact = world_intact
+
+
+def can_stage_swap(target_dir: Path, backup_dir: Path) -> tuple[bool, str]:
+    """Whether ``target_dir`` can be replaced by renaming a staging sibling in.
+
+    Returns ``(True, "")`` or ``(False, reason)``. Conservative by design: the
+    fallback (today's in-place wipe+extract) only costs extra downtime, while
+    a swap attempted on an unsuitable layout can orphan backups or silently
+    change directory permissions. Every "no" is reported so a slow restore is
+    explainable from the log.
+    """
+    try:
+        target_dir = Path(target_dir)
+        if target_dir.is_symlink():
+            # os.rename would move the SYMLINK, leaving the real directory
+            # orphaned elsewhere and a plain dir in its place.
+            return False, "server directory is a symlink"
+        if not target_dir.is_dir():
+            return False, "server directory does not exist"
+        if os.path.ismount(target_dir):
+            return False, "server directory is a mount point"
+        parent = target_dir.parent
+        if not os.access(parent, os.W_OK | os.X_OK):
+            return False, f"no write access to {parent}"
+        # The staging dir is created in the parent, and rename() cannot cross
+        # filesystems, so the parent must be on the same device.
+        if os.stat(parent).st_dev != os.stat(target_dir).st_dev:
+            return False, "server directory is on a different filesystem "                          "from its parent"
+        if backup_dir is not None:
+            try:
+                Path(backup_dir).resolve().relative_to(target_dir.resolve())
+            except ValueError:
+                pass  # not nested — the normal case
+            else:
+                # Renaming the server dir aside would carry every backup zip
+                # away with it, and the swapped-in tree would have none.
+                return False, "backup dir lives inside the server directory"
+    except OSError as e:
+        return False, f"could not inspect the server directory ({e})"
+    return True, ""
+
+
+def swap_in_staging(staging: Path, target_dir: Path, preserve_names,
+                    log) -> Path:
+    """Replace ``target_dir`` with ``staging`` via two renames.
+
+    Returns the path the old directory was renamed aside to (the caller
+    deletes it once the server is confirmed back up, so a world that will not
+    boot can still be rolled back by hand).
+
+    Raises ``SwapError`` on failure, with ``world_intact`` telling the caller
+    whether the original directory is back in place.
+    """
+    staging, target_dir = Path(staging), Path(target_dir)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    old = target_dir.parent / f"{target_dir.name}.pre-restore-{ts}"
+
+    # The in-place path preserves target_dir's own inode, so its mode, setgid
+    # bit and timestamps survive a restore. A freshly created staging dir has
+    # only the default umask, so copy that metadata across or the swap would
+    # silently change the server directory's permissions.
+    try:
+        shutil.copystat(target_dir, staging)
+    except OSError as e:
+        log(f"Could not copy directory permissions to staging ({e}) — continuing")
+
+    moved: list = []
+    try:
+        os.rename(target_dir, old)                                     # A
+    except OSError as e:
+        raise SwapError(f"could not move the old world aside: {e}",
+                        world_intact=True) from e
+    try:
+        # Bot infrastructure that is not world data and is never in a backup
+        # zip (the Bedrock console.log the bot tails). The in-place path keeps
+        # it by not deleting it; a swap has to carry it across explicitly.
+        for name in preserve_names:
+            src = old / name
+            if src.exists():
+                os.replace(src, staging / name)
+                moved.append(name)
+        os.rename(staging, target_dir)                                 # C
+    except OSError as e:
+        # Undo in reverse: preserved files back, then the directory back.
+        try:
+            for name in moved:
+                os.replace(staging / name, old / name)
+            os.rename(old, target_dir)
+        except OSError as rollback_err:
+            raise SwapError(
+                f"swap failed ({e}) AND rollback failed ({rollback_err}) — "
+                f"the world is at {old}", world_intact=False) from e
+        raise SwapError(f"swap failed, original world restored: {e}",
+                        world_intact=True) from e
+    log(f"Swapped in the restored world (previous world kept at {old.name})")
+    return old
+
+
 def _wipe_target(target_dir: Path, preserve_names, backup_dir: Path,
                  log) -> None:
     """Clear ``target_dir`` before extracting a full snapshot, keeping bot
@@ -439,7 +573,8 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
                   backup_dir: Path, exclude_names, copy_cmd: str = "",
                   manifest_path: Path = None, marker_dir: Path = None,
                   establish_chain: bool = True, preserve_names=frozenset(),
-                  wipe: bool = True, log_fn=None, dry_run: bool = False) -> dict:
+                  wipe: bool = True, log_fn=None, dry_run: bool = False,
+                  preflight_done: bool = False) -> dict:
     """Restore ``chain`` up to ``point_idx`` into ``target_dir`` (in-place).
 
     ``point_idx`` == -1 restores the full backup only; >= 0 applies incrementals
@@ -461,10 +596,17 @@ def restore_chain(chain: dict, point_idx: int, target_dir: Path, *,
     full_zip = chain["full"]["path"]
     incrementals = [] if point_idx == -1 else chain["incrementals"][:point_idx + 1]
 
-    if not dry_run:
+    if not dry_run and not preflight_done:
         # Never touch the world on a chain that can't complete. Both checks
         # run BEFORE the wipe: a truncated zip or full disk discovered
         # mid-apply once left a server on a days-old partial world.
+        #
+        # ``preflight_done`` lets a caller that just ran these same two checks
+        # on the same files skip the repeat — it is not a cheap one: the CRC
+        # pass decompresses every zip, ~50s for an 8.4 GB / 84-zip chain, and
+        # it was running twice per restore, the second time with the server
+        # already stopped. restore.py has no pre-flight of its own, so the
+        # default keeps verifying.
         problems = validate_chain_files(chain, point_idx)
         if problems:
             raise PreflightError(
