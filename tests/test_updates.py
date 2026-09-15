@@ -484,7 +484,7 @@ def test_pre_update_backup_is_conditional():
     said = []
     check(upd.has_rollback_point(server("abcd", "abcd"), said.append),
           "valid chain + incrementals -> reuse it, skip the full backup")
-    check(any("using it as the rollback point" in m for m in said),
+    check(any("as the rollback point" in m for m in said),
           "says why it is skipping")
 
     said = []
@@ -582,6 +582,40 @@ def test_up_to_date_bedrock_is_quiet():
               "(this was the false alarm seen in production)")
     finally:
         mv.latest_bedrock = real
+
+
+def test_backup_plan_matches_reality():
+    print("confirm prompt describes what will actually happen:")
+    import core.updates as upd
+
+    def srv(chain, marker, incr=True):
+        return types.SimpleNamespace(
+            load_manifest=lambda: (chain, "XPS-Java_full.zip", {}),
+            read_chain_marker=lambda: marker,
+            config=types.SimpleNamespace(incremental_enabled=incr))
+
+    plan = upd.backup_plan(srv("9513aca4", "9513aca4"))
+    check("no pre-update backup needed" in plan,
+          "a reusable chain is reported as such, not as 'a full backup runs "
+          "first' (which stopped being true when it became conditional)")
+    check("9513aca4" in plan, "names the chain it will rely on")
+
+    for chain, marker, incr, why in (("", "", True, "no backup chain"),
+                                     ("a", "b", True, "invalid"),
+                                     ("a", "a", False, "incrementals are disabled")):
+        plan = upd.backup_plan(srv(chain, marker, incr))
+        check(plan.startswith("A full backup runs first"),
+              f"full backup promised when {why}")
+        check(why.split()[0] in plan or why in plan,
+              "and the reason is given")
+
+    # The pure check and the narrated one must never disagree.
+    said = []
+    for chain, marker in (("a", "a"), ("a", "b")):
+        s = srv(chain, marker)
+        pure, _ = upd.rollback_point_status(s)
+        check(upd.has_rollback_point(s, said.append) is pure,
+              "the narrated check agrees with the pure one")
 
 
 def test_notification_goes_to_admin_dm_only():
@@ -860,6 +894,7 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_backup_plan_matches_reality,
                test_notification_goes_to_admin_dm_only,
                test_version_command_both_flavours,
                test_live_version_query,

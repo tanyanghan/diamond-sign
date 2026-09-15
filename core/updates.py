@@ -136,7 +136,7 @@ def describe_update(server, release) -> str:
     if is_major(release, installed):
         line += ("\n⚠️ This changes the Minecraft version. It migrates "
                  "the world format and CANNOT be undone -- the upgraded world "
-                 "will not load on the old version. A full backup runs first.")
+                 "will not load on the old version, so the rollback point below is your only way back.")
     return line
 
 
@@ -306,38 +306,55 @@ def require_empty_server(server) -> None:
 
 
 # --- rollback point --------------------------------------------------------
-def has_rollback_point(server, say) -> bool:
-    """Whether the existing backup chain can serve as the update's rollback.
+def rollback_point_status(server) -> tuple[bool, str]:
+    """(can the existing chain serve as the rollback point, why).
 
     A valid chain -- a full backup plus a manifest that still matches the
     on-disk marker, the same test bot.py makes at startup -- already IS a
     restorable copy of the world. With the incremental cycle running it is
     also current: it captures the world every few minutes while players are
-    online, and once more as the last one leaves. Taking another full backup
-    on top of that mostly duplicates it, and on a multi-GB world that is
-    minutes of extra downtime for no extra safety.
+    online, and once more as the last one leaves (and an update only runs on
+    an empty server, so that final pass has always just happened). Taking
+    another full backup on top of that mostly duplicates it, and on a
+    multi-GB world that is minutes of extra downtime for no extra safety.
 
     Incrementals being disabled is the exception. The chain is then only as
     fresh as the last SCHEDULED full, which on a weekly schedule can be days
-    old — not something anyone wants to roll back to — so a fresh full
-    backup runs instead.
+    old — not something anyone wants to roll back to.
+
+    Pure, so the /update_server review can say which way it will go before
+    the operator commits to anything.
     """
     chain_id, base_full, _ = server.load_manifest()
     if not chain_id:
-        say("No backup chain established \u2014 taking a full backup first.")
-        return False
+        return False, "no backup chain is established"
     if server.read_chain_marker() != chain_id:
-        say("Backup chain is invalid \u2014 taking a full backup first.")
-        return False
+        return False, "the backup chain is invalid"
     if not server.config.incremental_enabled:
-        say(f"Backup chain {chain_id} is valid but incrementals are disabled "
-            "for this server, so it may be days old \u2014 taking a fresh "
-            "full backup first.")
-        return False
-    say(f"Backup chain {chain_id} is valid (base: {base_full}) and "
-        "incrementals are current \u2014 using it as the rollback point "
-        "instead of taking another full backup.")
-    return True
+        return False, (f"chain {chain_id} is valid but incrementals are "
+                       "disabled, so it may be days old")
+    return True, (f"backup chain {chain_id} is valid (base: {base_full}) and "
+                  "incrementals are current")
+
+
+def backup_plan(server) -> str:
+    """One line describing what the update will do about backups."""
+    reusable, why = rollback_point_status(server)
+    if reusable:
+        return (f"Rollback point: the existing {why} \u2014 no pre-update "
+                "backup needed.")
+    return f"A full backup runs first ({why})."
+
+
+def has_rollback_point(server, say) -> bool:
+    """rollback_point_status(), reported to the operator as it runs."""
+    reusable, why = rollback_point_status(server)
+    if reusable:
+        say(f"Using the existing {why} as the rollback point \u2014 skipping "
+            "a duplicate pre-update backup.")
+    else:
+        say(f"Taking a full backup first: {why}.")
+    return reusable
 
 
 # --- Bedrock helpers -------------------------------------------------------

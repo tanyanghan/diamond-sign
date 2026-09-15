@@ -687,9 +687,11 @@ def register_commands(router, auth: dict) -> None:
                 ctx.adapter.send(
                     ctx.chat_id,
                     updates.describe_update(server, release)
-                    + "\n\nA full backup runs first, then the server is "
-                      "stopped, updated and restarted.\nSend "
-                      "`/update_server confirm` to proceed.")
+                    + "\n\n" + updates.backup_plan(server)
+                    + "\nThe server is then stopped, updated and "
+                      "restarted, and a fresh full backup runs afterwards to "
+                      "re-base the backup chain."
+                    + "\nSend `/update_server confirm` to proceed.")
 
             threading.Thread(target=look, daemon=True).start()
             return
