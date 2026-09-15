@@ -31,6 +31,7 @@ from pathlib import Path
 from core.presence import reconcile_online
 from utils import mc_versions, restore_core
 from core.logparse import (parse_bedrock_version_line,
+                           parse_version_command,
                            parse_version_line)
 from utils.config import EDITION_BEDROCK, EDITION_JAVA
 from utils.download import DownloadError, download_file
@@ -251,12 +252,13 @@ def refresh_installed_version(server) -> dict | None:
     The existing banner regex picks the right line out of that and, notably,
     does NOT match the "Previous version:" line underneath it.
 
-    Vanilla has no such command and answers "Unknown command", which simply
-    yields no match — the caller keeps whatever it already had. Paper also
-    resolves the version asynchronously, so the RCON reply may carry only
-    "Checking version, please wait..."; that is fine, because issuing the
-    command makes the banner appear in the log, where the LogWatcher parses
-    it independently.
+    Vanilla answers the same command in a completely different shape
+    ("Server version info:" then "id = 26.2"), which parse_version_command
+    handles -- and which is itself a reliable way to tell the two flavours
+    apart. Paper resolves its version asynchronously, so the RCON reply may
+    carry only "Checking version, please wait..."; that is fine, because
+    issuing the command makes the banner appear in the log, where the
+    LogWatcher parses it independently.
     """
     cfg = server.config
     if cfg.edition == EDITION_BEDROCK:
@@ -268,13 +270,7 @@ def refresh_installed_version(server) -> dict | None:
     except Exception:
         logger.debug("[%s] Live version query failed", cfg.name)
         return None
-    best = None
-    for line in (out or "").splitlines():
-        parsed = parse_version_line(line)
-        if parsed:
-            best = parsed
-            if parsed.get("build") is not None:
-                break
+    best = parse_version_command(out or "")
     if best:
         server.record_observed_version(best)
     return best

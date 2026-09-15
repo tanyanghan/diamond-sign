@@ -54,6 +54,58 @@ RE_VANILLA_VERSION = re.compile(
     r'Starting minecraft server version (\S+)')
 
 
+# The `version` console command, which BOTH Java flavours answer -- and in
+# completely different shapes, which is what makes it a reliable way to tell
+# them apart:
+#
+#   Paper    This server is running Paper version 26.2-121-main@a2a42c5 (...)
+#            You are 2 version(s) behind
+#            Previous version: 26.2-117-27af5dd (MC: 26.2)      <- NOT ours
+#
+#   Vanilla  Server version info:
+#            id = 26.2
+#            name = 26.2
+#            stable = yes
+#
+# The vanilla block is only read when its header is present, so a stray
+# "id = ..." elsewhere in a log can never be taken for a version.
+_VANILLA_VERSION_HEADER = "Server version info:"
+RE_VANILLA_VERSION_ID = re.compile(r'\bid\s*=\s*(\S+)\s*$')
+RE_VANILLA_VERSION_STABLE = re.compile(r'\bstable\s*=\s*(\S+)\s*$')
+
+
+def parse_version_command(text: str) -> dict | None:
+    """Parse the output of the `version` command, either Java flavour.
+
+    Paper's banner wins when present: it carries the build number, which the
+    vanilla block has no equivalent of. Only if no banner appears is the
+    structured vanilla block read, so a Paper server is never mislabelled.
+    """
+    best = None
+    for line in text.splitlines():
+        parsed = parse_version_line(line)
+        if parsed:
+            best = parsed
+            if parsed.get("build") is not None:
+                return best
+    if best:
+        return best
+    if _VANILLA_VERSION_HEADER not in text:
+        return None
+    version = stable = None
+    for line in text.splitlines():
+        m = RE_VANILLA_VERSION_ID.search(line)
+        if m and version is None:
+            version = m.group(1)
+        m = RE_VANILLA_VERSION_STABLE.search(line)
+        if m and stable is None:
+            stable = m.group(1).lower() == "yes"
+    if not version:
+        return None
+    return {"source": "vanilla", "software": "Vanilla",
+            "mc_version": version, "build": None, "stable": stable}
+
+
 # BDS prints its version in the first few lines of every run:
 #   [2026-09-15 12:37:33:754 INFO] Version: 1.26.45.1
 # Anchored on the whole line so a chat message mentioning a version cannot be

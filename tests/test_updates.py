@@ -584,6 +584,67 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_version_command_both_flavours():
+    print("`version` command, both Java flavours:")
+    from core.logparse import parse_version_command
+    import core.updates as upd
+    lf = chr(10)
+
+    # Real vanilla output: a structured block, nothing like Paper's banner.
+    vanilla = lf.join([
+        "[17:28:36] [Server thread/INFO]: Server version info:",
+        "[17:28:36] [Server thread/INFO]: id = 26.2",
+        "[17:28:36] [Server thread/INFO]: name = 26.2",
+        "[17:28:36] [Server thread/INFO]: data = 4903",
+        "[17:28:36] [Server thread/INFO]: protocol = 776 (0x308)",
+        "[17:28:36] [Server thread/INFO]: pack_resource = 88.0",
+        "[17:28:36] [Server thread/INFO]: pack_data = 107.1",
+        "[17:28:36] [Server thread/INFO]: stable = yes"])
+    got = parse_version_command(vanilla)
+    check(got and got["source"] == "vanilla" and got["mc_version"] == "26.2",
+          "vanilla's structured block parsed")
+    check(got.get("stable") is True, "stable flag read")
+    check(got["build"] is None, "vanilla has no build number")
+
+    # Real Paper output, whose trailing line names the PREVIOUS build.
+    paper = lf.join([
+        "Checking version, please wait...",
+        "This server is running Paper version 26.2-121-main@a2a42c5 "
+        "(2026-08-29T11:32:25Z) (Implementing API version 26.2.build.121-stable)",
+        "You are 2 version(s) behind",
+        "Download the new version at: https://papermc.io/downloads/paper",
+        "Previous version: 26.2-117-27af5dd (MC: 26.2)"])
+    got = parse_version_command(paper)
+    check(got and got["source"] == "paper" and got["build"] == 121,
+          "Paper's banner parsed")
+    check(got["build"] != 117,
+          "the 'Previous version:' line is NOT picked up (it would report "
+          "the build the server used to run, making it look stale forever)")
+
+    # The two are distinguishable, which is how the flavour is decided.
+    check(parse_version_command(vanilla)["source"] !=
+          parse_version_command(paper)["source"],
+          "the two shapes identify the flavour")
+
+    # Guard rails.
+    check(parse_version_command("Unknown command: version.") is None,
+          "an unexpected reply yields nothing rather than a bad parse")
+    check(parse_version_command("chat: my id = 9.9.9") is None,
+          "a stray 'id = ...' without the header is ignored")
+
+    # End to end through the live query.
+    for text, want in ((vanilla, "vanilla"), (paper, "paper")):
+        srv = types.SimpleNamespace(
+            config=types.SimpleNamespace(edition="java", name="t"),
+            backend=types.SimpleNamespace(
+                is_online=lambda: True,
+                capture_command=lambda c, timeout=5, _t=text: _t),
+            record_observed_version=lambda p: None)
+        res = upd.refresh_installed_version(srv)
+        check(res and res["source"] == want,
+              f"live query identifies {want}")
+
+
 def test_live_version_query():
     print("live `version` query (Paper):")
     import core.updates as upd
@@ -763,6 +824,7 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_version_command_both_flavours,
                test_live_version_query,
                test_per_source_user_agent,
                test_no_baseline_stays_quiet,
