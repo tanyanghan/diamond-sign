@@ -115,7 +115,16 @@ def test_bedrock():
     check(rel is not None and rel.mc_version == "1.26.45.1",
           f"version parsed out of the filename ({rel.mc_version})")
     check("bin-linux/" in rel.url, "picked Linux, not Windows")
+    check("bin-win" not in rel.url, "Windows build rejected")
     check("preview" not in rel.url, "picked stable, not the Preview channel")
+    # Three near-misses sit alongside it in the same response; the match is on
+    # exact downloadType, so none of them can be picked up by accident.
+    only_preview = {"result": {"links": [
+        l for l in BEDROCK_LINKS["result"]["links"]
+        if l["downloadType"] != "serverBedrockLinux"]}}
+    check(mv.parse_bedrock_links(only_preview) is None,
+          "with no serverBedrockLinux present it returns None rather than "
+          "falling back to Windows or Preview")
     check(rel.sha256 is None and rel.sha1 is None,
           "no checksum published -> none claimed")
     check(rel.edition == "bedrock", "reported as a bedrock artifact")
@@ -316,6 +325,20 @@ def test_extract_rejects_bad_zips():
             check(False, "a zip with no binary should be refused")
         except up.UpdateError as e:
             check("bedrock_server" in str(e), "refuses a zip with no binary")
+
+        # Defence in depth: the WINDOWS build ships bedrock_server.exe, so even
+        # if the wrong download were ever selected it is refused here -- before
+        # the server is stopped, not after.
+        with _zf.ZipFile(root / "win.zip", "w") as zz:
+            zz.writestr("bedrock_server.exe", "MZ")
+            zz.writestr("server.properties", "x")
+        try:
+            up._extract_bds(root / "win.zip", root / "s3", lambda m: None)
+            check(False, "a Windows zip should be refused")
+        except up.UpdateError as e:
+            check("bedrock_server" in str(e),
+                  "a Windows build (bedrock_server.exe) is refused before "
+                  "anything is stopped")
 
 
 def test_custom_pack_diff():
