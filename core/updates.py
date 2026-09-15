@@ -30,7 +30,8 @@ from pathlib import Path
 
 from core.presence import reconcile_online
 from utils import mc_versions, restore_core
-from utils.config import EDITION_BEDROCK
+from core.logparse import parse_version_line
+from utils.config import EDITION_BEDROCK, EDITION_JAVA
 from utils.download import DownloadError, download_file
 from utils.restore_core import _apply_zip_mode
 
@@ -61,7 +62,7 @@ class UpdateError(RuntimeError):
 
 
 # --- what's available ------------------------------------------------------
-def available_update(server):
+def available_update(server, *, require_baseline: bool = True):
     """Newest release for ``server``, or None if it is already current.
 
     Metadata only: no download, no locks. Safe to call from a poll thread.
@@ -73,9 +74,17 @@ def available_update(server):
     if cfg.edition == EDITION_BEDROCK:
         release = mc_versions.latest_bedrock()
     else:
-        # Configured flavour wins; otherwise believe what the startup banner
-        # said, and fall back to vanilla until something says otherwise.
-        flavor = cfg.java_flavor or installed.get("source") or "vanilla"
+        # Configured flavour wins, else whatever the startup banner said.
+        # There is deliberately NO default: guessing vanilla for a Paper
+        # server means polling the wrong upstream and pulling a jar that would
+        # replace Paper with vanilla if it were ever installed.
+        flavor = cfg.java_flavor or installed.get("source")
+        if not flavor:
+            logger.warning(
+                "[%s] Cannot tell whether this server runs Paper or vanilla "
+                "(no version banner seen yet). Set edition.flavor to check "
+                "for updates.", cfg.name)
+            return None
         if flavor == mc_versions.SOURCE_PAPER:
             pin = (installed.get("mc_version")
                    if cfg.updates_pin_mc_version else None)
@@ -83,6 +92,18 @@ def available_update(server):
         else:
             release = mc_versions.latest_vanilla()
     if release is None or release.same_build_as(installed):
+        return None
+    if require_baseline and not installed.get("mc_version"):
+        # Nothing to compare against: the background poll would otherwise
+        # report "an update is available" on every cycle forever, whether or
+        # not the server is actually behind. Stay quiet and say why rather
+        # than crying wolf. /update passes require_baseline=False, since a
+        # human asking directly should still be shown what is on offer.
+        logger.warning(
+            "[%s] A %s release is available (%s) but the installed version is "
+            "unknown, so it cannot be compared. Run /update to install it "
+            "explicitly, which also records what is installed.",
+            cfg.name, release.source, release.describe())
         return None
     return release
 
@@ -127,9 +148,54 @@ def ensure_downloaded(release, log=None) -> Path:
     try:
         return download_file(release.url, dest, sha256=release.sha256,
                              sha1=release.sha1, expected_size=release.size,
-                             log_fn=say)
+                             user_agent=release.user_agent, log_fn=say)
     except DownloadError as e:
         raise UpdateError(f"download failed: {e}") from e
+
+
+# --- what is installed -----------------------------------------------------
+# How far into the log to look for a startup banner. Java recreates
+# latest.log on every server start, so the banner is within the first handful
+# of lines; this bound just stops a long-running server's log being read in
+# full.
+_VERSION_SCAN_LINES = 400
+
+
+def recover_server_version(server) -> dict | None:
+    """Read the installed version out of the CURRENT log, once, at startup.
+
+    The live tailer seeks to EOF, so it only ever sees lines written after the
+    bot attaches — and the bot restarts far more often than the Minecraft
+    server does. On a server that was already running, the startup banner
+    scrolled past long ago and nothing would ever record a version, leaving
+    /update with no idea what is installed (and, for Java, no idea whether it
+    is Paper or vanilla).
+
+    Both banners are collected rather than the first match taken. Paper prints
+    vanilla's "Starting minecraft server version X" too, and prints it FIRST,
+    so first-match-wins would label every Paper server vanilla. A line
+    carrying a build number is as specific as it gets, so that wins.
+    """
+    if server.config.edition != EDITION_JAVA:
+        return None       # Bedrock's version comes from the download URL
+    best = None
+    try:
+        with open(server.config.log_path, encoding="utf-8",
+                  errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= _VERSION_SCAN_LINES:
+                    break
+                parsed = parse_version_line(line)
+                if parsed is None:
+                    continue
+                best = parsed
+                if parsed.get("build") is not None:
+                    break
+    except OSError:
+        return None
+    if best:
+        server.record_observed_version(best)
+    return best
 
 
 # --- who is playing --------------------------------------------------------

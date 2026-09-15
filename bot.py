@@ -356,6 +356,13 @@ _scheduled_backup_lock = threading.Lock()
 # to the shared cache and the rest find it already there.
 _update_download_lock = threading.Lock()
 
+# Artifacts that just failed to download, by filename. Without this every
+# server of that edition repeats the same doomed fetch in turn: three Bedrock
+# servers each retried the same URL three times, turning one failure into
+# nine and a ten-minute stall. Guarded by _update_download_lock.
+_update_download_failed: dict = {}
+_UPDATE_FAILURE_MEMO = 30 * 60
+
 # How often to ask the upstreams what the newest build is. Deliberately a
 # constant rather than config: it is inherently process-wide while the
 # per-server knob (updates.enabled) is not, and nothing here needs tuning.
@@ -396,22 +403,54 @@ def _start_update_check(server, bot) -> None:
                      name=f"update-check-{server.config.key}").start()
 
 
+def _fetch_shared_artifact(server, release) -> bool:
+    """Download a release once, however many servers want it.
+
+    Servers of the same edition share one cache, so the work is done by
+    whichever gets here first and everyone else reuses the file. Two things
+    make that actually hold:
+
+      * the cache is checked while holding the lock, so a server that queued
+        behind a download finds the finished file instead of starting its own;
+      * a failure is remembered briefly, so the rest do not each repeat a
+        fetch that has just demonstrably failed.
+
+    Returns whether the artifact is on disk. A failure is not fatal — the
+    operator is still told a release exists, and /update fetches it then.
+    """
+    name = release.filename
+    if not _update_download_lock.acquire(blocking=False):
+        logger.info("[%s] Waiting for another server's download of %s",
+                    server.config.name, name)
+        _update_download_lock.acquire()
+    try:
+        dest = updates.mc_versions.cache_dir(release.edition) / name
+        if dest.exists():
+            logger.info("[%s] %s already in the cache", server.config.name,
+                        name)
+            return True
+        failed_at = _update_download_failed.get(name)
+        if failed_at and time.time() - failed_at < _UPDATE_FAILURE_MEMO:
+            logger.info("[%s] Skipping %s: another server's download failed "
+                        "recently", server.config.name, name)
+            return False
+        try:
+            updates.ensure_downloaded(release, log=None)
+            _update_download_failed.pop(name, None)
+            return True
+        except Exception as e:
+            _update_download_failed[name] = time.time()
+            logger.warning("[%s] Could not pre-download %s: %s",
+                           server.config.name, name, e)
+            return False
+    finally:
+        _update_download_lock.release()
+
+
 def _announce_update(server, bot, release) -> None:
     """Download the new build, then tell the chats it is ready to install."""
     installed = server.load_installed_version()
-    if not _update_download_lock.acquire(blocking=False):
-        logger.info("[%s] Waiting for another server's download",
-                    server.config.name)
-        _update_download_lock.acquire()
-    try:
-        updates.ensure_downloaded(release, log=None)
-    except Exception as e:
-        # Still worth telling the operator a release exists, even if fetching
-        # it failed -- /update will retry the download.
-        logger.warning("[%s] Could not pre-download %s: %s",
-                       server.config.name, release.filename, e)
-    finally:
-        _update_download_lock.release()
+    _fetch_shared_artifact(server, release)
 
     try:
         keep = {release.filename, installed.get("filename")}
@@ -541,6 +580,10 @@ def _bring_up_server(server, bot) -> bool:
                     server.config.name, log_path)
 
         _validate_chain(server)
+        # Learn the installed version from the log the server already
+        # wrote: the tailer starts at EOF, so a server that was up
+        # before the bot would otherwise never have one recorded.
+        updates.recover_server_version(server)
         _start_scheduled_backup(server, bot)
         _start_update_check(server, bot)
         # Capturing who's already online can wait up to ~2 min for RCON when the

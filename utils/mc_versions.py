@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .download import DownloadError, fetch_json
+from .download import BROWSER_USER_AGENT, DownloadError, USER_AGENT, fetch_json
 
 logger = logging.getLogger("diamondsign")
 
@@ -58,6 +58,9 @@ class ReleaseInfo:
     sha256: str | None = None
     sha1: str | None = None
     size: int | None = None
+    # Which User-Agent this artifact's host expects. Paper demands a
+    # descriptive one; minecraft.net's CDN stalls anything non-browser.
+    user_agent: str = USER_AGENT
 
     @property
     def edition(self) -> str:
@@ -186,7 +189,8 @@ def parse_bedrock_links(doc: dict) -> ReleaseInfo | None:
         if not m:
             return None
         return ReleaseInfo(source=SOURCE_BEDROCK, mc_version=m.group(1),
-                           build=None, url=url, filename=Path(url).name)
+                           build=None, url=url, filename=Path(url).name,
+                           user_agent=BROWSER_USER_AGENT)
     return None
 
 

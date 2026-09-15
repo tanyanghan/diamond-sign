@@ -31,6 +31,17 @@ logger = logging.getLogger("diamondsign")
 USER_AGENT = ("diamond-sign/1.0 "
               "(+https://github.com/tanyanghan/diamond-sign)")
 
+# The two upstreams want OPPOSITE things, which is why the User-Agent is
+# per-request rather than a single constant.
+#
+# Paper rejects generic agents outright. minecraft.net's CDN does the reverse:
+# it accepts the connection from a non-browser agent and then simply never
+# sends the body, so the download dies on a read timeout rather than a clean
+# error. Measured against the live URL: the descriptive agent above times out
+# after 25s, this one returns 206 in 0.1s.
+BROWSER_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
 _CHUNK = 256 * 1024
 
 

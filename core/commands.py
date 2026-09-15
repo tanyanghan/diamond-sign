@@ -663,7 +663,11 @@ def register_commands(router, auth: dict) -> None:
 
             def look():
                 try:
-                    release = updates.available_update(server)
+                    # A human asked directly, so show what is on offer
+                    # even with no recorded baseline to compare to;
+                    # installing it is what records one.
+                    release = updates.available_update(
+                        server, require_baseline=False)
                 except Exception as e:
                     server.log.exception("Update check failed")
                     ctx.adapter.send(ctx.chat_id, f"Update check failed: {e}")

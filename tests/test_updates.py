@@ -505,6 +505,97 @@ def test_pre_update_backup_is_conditional():
           "explains the staleness risk")
 
 
+def test_per_source_user_agent():
+    print("per-source User-Agent:")
+    from utils.download import BROWSER_USER_AGENT, USER_AGENT
+    paper = mv.parse_paper_build(PAPER_BUILD, "26.2")
+    bedrock = mv.parse_bedrock_links(BEDROCK_LINKS)
+    vanilla = mv.parse_vanilla_version(MOJANG_VERSION, "26.2")
+    check(paper.user_agent == USER_AGENT,
+          "Paper gets the descriptive agent (it rejects generic ones)")
+    check(vanilla.user_agent == USER_AGENT, "Mojang gets the descriptive agent")
+    check(bedrock.user_agent == BROWSER_USER_AGENT,
+          "Bedrock gets a browser agent (minecraft.net's CDN accepts the "
+          "connection then never sends the body to anything else, so the "
+          "download dies on a read timeout)")
+    check(BROWSER_USER_AGENT != USER_AGENT, "the two are genuinely different")
+
+    # The UA actually reaches the request.
+    seen = {}
+    real = urllib.request.urlopen
+
+    def spy(req, timeout=None):
+        seen["ua"] = req.get_header("User-agent")
+        return _FakeResponse(b"data")
+
+    urllib.request.urlopen = spy
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            download_file("https://x/f.zip", Path(td) / "f.zip",
+                          user_agent=BROWSER_USER_AGENT, retries=1)
+    finally:
+        urllib.request.urlopen = real
+    check(seen.get("ua") == BROWSER_USER_AGENT,
+          "download_file sends the agent it was given")
+
+
+def test_no_baseline_stays_quiet():
+    print("unknown installed version:")
+    import core.updates as upd
+    rel = mv.parse_bedrock_links(BEDROCK_LINKS)
+    server = types.SimpleNamespace(
+        config=types.SimpleNamespace(updates_enabled=True, edition="bedrock",
+                                     name="Square-Friends"),
+        load_installed_version=lambda: {})
+    real = mv.latest_bedrock
+    try:
+        mv.latest_bedrock = lambda: rel
+        check(upd.available_update(server) is None,
+              "no baseline -> the background poll stays quiet instead of "
+              "claiming an update (it cannot know if the server is behind)")
+        check(upd.available_update(server, require_baseline=False) is rel,
+              "...but /update still shows it, since installing it is what "
+              "records a baseline in the first place")
+        server.load_installed_version = lambda: {
+            "source": "bedrock", "mc_version": "1.26.45.1", "build": None}
+        check(upd.available_update(server) is None,
+              "already on the latest version -> no update")
+        server.load_installed_version = lambda: {
+            "source": "bedrock", "mc_version": "1.26.44.1", "build": None}
+        check(upd.available_update(server) is rel,
+              "genuinely behind -> update reported")
+    finally:
+        mv.latest_bedrock = real
+
+
+def test_java_flavor_is_not_guessed():
+    print("Java flavour:")
+    import core.updates as upd
+    server = types.SimpleNamespace(
+        config=types.SimpleNamespace(updates_enabled=True, edition="java",
+                                     java_flavor="", name="XPS-Java",
+                                     updates_pin_mc_version=False),
+        load_installed_version=lambda: {})
+    called = []
+    real_v, real_p = mv.latest_vanilla, mv.latest_paper
+    try:
+        mv.latest_vanilla = lambda: called.append("vanilla")
+        mv.latest_paper = lambda pin=None: called.append("paper")
+        check(upd.available_update(server) is None,
+              "unknown flavour -> no check at all")
+        check(called == [],
+              "does NOT default to vanilla (that would poll the wrong "
+              "upstream and offer a jar that replaces Paper)")
+
+        server.load_installed_version = lambda: {
+            "source": "paper", "mc_version": "26.2", "build": 121}
+        upd.available_update(server)
+        check(called == ["paper"],
+              "a recorded Paper banner routes the check to Paper")
+    finally:
+        mv.latest_vanilla, mv.latest_paper = real_v, real_p
+
+
 def test_java_preflight_refuses_missing_jar():
     print("Java preflight:")
     with tempfile.TemporaryDirectory() as td:
@@ -555,6 +646,9 @@ def main():
                test_extract_preserves_exec_bit, test_extract_rejects_bad_zips,
                test_custom_pack_diff, test_bedrock_swap_end_to_end,
                test_chain_is_rebased_not_preserved,
+               test_per_source_user_agent,
+               test_no_baseline_stays_quiet,
+               test_java_flavor_is_not_guessed,
                test_refuses_while_players_online,
                test_pre_update_backup_is_conditional,
                test_java_preflight_refuses_missing_jar,
