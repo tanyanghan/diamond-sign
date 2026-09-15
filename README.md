@@ -821,10 +821,21 @@ naming both the file it expected and the jar it found.
 `server.properties`, `permissions.json` and `allowlist.json`, so unpacking it
 over an install would overwrite them. Instead the release is unpacked to a
 staging directory, and your `worlds/`, those three config files, `console.log`,
-the backup-chain marker, and **any pack the release does not ship** (this bot's
-`diamondsign_events`, plus anything of your own) are moved across before the
-directory is swapped in atomically. Packs are diffed rather than hardcoded, so a
-release adding or removing a vanilla pack does not strand yours.
+and **any pack the release does not ship** (this bot's `diamondsign_events`,
+plus anything of your own) are moved across before the directory is swapped in
+atomically. Packs are diffed rather than hardcoded, so a release adding or
+removing a vanilla pack does not strand yours.
+
+**The backup chain is re-based, not carried over.** An update retires the old
+chain: its base full backup holds the previous binary and a pre-migration world,
+and after a Bedrock swap every file has a fresh mtime, so the next incremental
+would diff against a stale manifest and re-capture the whole directory. So
+`/update` drops the chain marker, and once the server is confirmed back up it
+runs a **full backup** — giving future incrementals a base that matches the
+updated server. Two full backups therefore bracket an update: the one before it
+is your rollback point, the one after it is the new chain's foundation. If the
+post-update backup fails the update still stands, but incrementals stay
+suspended until you run `/backup`.
 
 Bedrock updates require a layout the staged swap supports (see
 [Whole-world restore](#whole-world-restore-from-chat--restore) for the same

@@ -30,7 +30,6 @@ from pathlib import Path
 
 from core.presence import reconcile_online
 from utils import mc_versions, restore_core
-from utils.backup_utils import CHAIN_MARKER_NAME
 from utils.config import EDITION_BEDROCK
 from utils.download import DownloadError, download_file
 from utils.restore_core import _apply_zip_mode
@@ -40,11 +39,19 @@ logger = logging.getLogger("diamondsign")
 # Bot infrastructure and operator config that a Bedrock release must never
 # clobber. worlds/ is the world itself; the three json/properties files are
 # shipped in the zip as DEFAULTS and would otherwise silently replace the
-# operator's; console.log is the stream the bot tails; the chain marker must
-# survive or the next startup invalidates the backup chain.
+# operator's; console.log is the stream the bot tails.
+#
+# The chain marker is deliberately NOT here. An update makes the old chain
+# meaningless: its base full holds the previous binary and a pre-migration
+# world, and after a Bedrock swap every file in the directory has a fresh
+# mtime, so the next incremental would diff against the stale manifest and
+# re-capture the entire server directory (the pathology behind the 1.6 GB
+# merged incremental this project already fought once). Letting the marker
+# go leaves the chain correctly marked invalid, and the post-update full
+# backup below rebases everything on the updated server.
 _BEDROCK_PRESERVE = {
     "worlds", "server.properties", "permissions.json", "allowlist.json",
-    "console.log", CHAIN_MARKER_NAME,
+    "console.log",
 }
 _PACK_DIRS = ("behavior_packs", "resource_packs")
 
@@ -314,6 +321,7 @@ def update_server(server, release, *, say) -> None:
         installed_ok = True
         server.save_installed_version(release.source, release.mc_version,
                                       release.build, filename=release.filename)
+        _invalidate_chain(server)
 
         # 5. Relaunch.
         say("Restarting the server...")
@@ -325,6 +333,7 @@ def update_server(server, release, *, say) -> None:
             _cleanup(server, release, kept, say)
             say(f"Update complete — now running {release.source} "
                 f"{release.describe()}.")
+            _rebase_backup_chain(server, say)
         else:
             say("Update applied but relaunch was not confirmed. Start the "
                 f"server manually:\n  {cfg.mux_start_cmd}")
@@ -356,6 +365,54 @@ def update_server(server, release, *, say) -> None:
         if kept is not None and not relaunched:
             say(f"Previous version kept at {kept.name} — restore it by hand "
                 "if the new one will not start.")
+
+
+def _invalidate_chain(server) -> None:
+    """Retire the backup chain that described the PREVIOUS version.
+
+    An update makes the old chain meaningless: its base full holds the old
+    binary and a pre-migration world. On Bedrock the marker is already gone
+    (the swap simply does not carry it across); on Java only the jar changed,
+    so the marker is still sitting there and would otherwise keep a stale
+    chain looking valid. Clearing both here means the state is honest in the
+    window before the post-update backup — and stays honest if that backup
+    never happens.
+    """
+    try:
+        server.save_manifest({}, chain_id="", base_full="")
+        marker = server.chain_marker_path
+        if marker.exists():
+            marker.unlink()
+    except OSError:
+        server.log.warning("Could not invalidate the backup chain after the "
+                           "update; run /backup to re-establish it")
+
+
+def _rebase_backup_chain(server, say) -> None:
+    """Start a fresh backup chain on the updated server.
+
+    Deliberately AFTER the relaunch: the new server migrates the world when it
+    first opens it, so a backup taken while it was still stopped would pair
+    the new binary with a pre-migration world. run_backup() generates a new
+    chain id, rebuilds the manifest from the files as they now are, and writes
+    the marker — so every later incremental is based on the updated server
+    instead of on a full backup holding the previous version.
+
+    This matters most on Bedrock, where the swap gives every file in the
+    directory a fresh mtime: without re-basing, the next incremental would
+    diff against the old manifest and re-capture the whole server directory.
+
+    A failure here does not undo the update. It leaves incrementals suspended,
+    which is the correct fail-safe, until the operator runs /backup.
+    """
+    say("Taking a post-update backup to re-base the backup chain...")
+    try:
+        server.run_backup(status_cb=say)
+        say("Backup chain re-based on the updated server.")
+    except Exception as e:
+        server.log.exception("Post-update backup failed")
+        say(f"Post-update backup failed: {e}\nThe update itself succeeded, "
+            "but incremental backups stay suspended until you run /backup.")
 
 
 def _cleanup(server, release, kept, say) -> None:

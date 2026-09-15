@@ -359,8 +359,10 @@ def test_bedrock_swap_end_to_end():
               "permissions survived")
         check((mc / "worlds" / "Bedrock level" / "level.dat").read_text() == "MYWORLD",
               "world survived untouched")
-        check((mc / ".diamondsign_chain").read_text() == "abcd1234",
-              "backup-chain marker survived (else incrementals get suspended)")
+        check(not (mc / ".diamondsign_chain").exists(),
+              "backup-chain marker deliberately NOT carried across (the old "
+              "chain describes the previous version; the post-update backup "
+              "re-bases it)")
         check((mc / "console.log").read_text() == "history",
               "console.log survived")
         check((mc / "behavior_packs" / "diamondsign_events").is_dir(),
@@ -371,6 +373,48 @@ def test_bedrock_swap_end_to_end():
               "new release's files are present")
         check((mc / "bedrock_server").read_text() == "#!binary\n",
               "new binary installed")
+
+
+def test_chain_is_rebased_not_preserved():
+    print("backup chain after an update:")
+    check(".diamondsign_chain" not in up._BEDROCK_PRESERVE,
+          "chain marker is not in the Bedrock preserve set")
+
+    calls = []
+    with tempfile.TemporaryDirectory() as td:
+        mc = Path(td) / "srv"; mc.mkdir()
+        marker = mc / ".diamondsign_chain"
+        marker.write_text("oldchain")
+        server = types.SimpleNamespace(
+            chain_marker_path=marker,
+            log=types.SimpleNamespace(warning=lambda *a: None,
+                                      exception=lambda *a: None),
+            save_manifest=lambda files, chain_id="", base_full="":
+                calls.append(("manifest", chain_id)),
+            run_backup=lambda status_cb=None: calls.append(("backup", None)))
+
+        up._invalidate_chain(server)
+        check(not marker.exists(),
+              "Java's surviving marker is removed too (only the jar changed, "
+              "so the swap would otherwise leave a stale chain looking valid)")
+        check(("manifest", "") in calls, "manifest cleared to an empty chain")
+
+        up._rebase_backup_chain(server, lambda m: None)
+        check(("backup", None) in calls,
+              "a full backup runs after the update, re-basing the chain on "
+              "the updated server")
+
+    # A failed post-update backup must not look like a failed update.
+    said = []
+    boom = types.SimpleNamespace(
+        log=types.SimpleNamespace(exception=lambda *a: None),
+        run_backup=lambda status_cb=None: (_ for _ in ()).throw(
+            RuntimeError("disk full")))
+    up._rebase_backup_chain(boom, said.append)
+    check(any("update itself succeeded" in m for m in said),
+          "a failed post-update backup reports the update as still successful")
+    check(any("/backup" in m for m in said),
+          "and tells the operator how to re-establish the chain")
 
 
 def test_java_preflight_refuses_missing_jar():
@@ -422,6 +466,7 @@ def main():
                test_download_verification, test_fetch_json, test_prune,
                test_extract_preserves_exec_bit, test_extract_rejects_bad_zips,
                test_custom_pack_diff, test_bedrock_swap_end_to_end,
+               test_chain_is_rebased_not_preserved,
                test_java_preflight_refuses_missing_jar,
                test_update_comparison):
         fn()
