@@ -364,8 +364,7 @@ def rollback_point_status(server) -> tuple[bool, str]:
     if not server.config.incremental_enabled:
         return False, (f"chain {chain_id} is valid but incrementals are "
                        "disabled, so it may be days old")
-    return True, (f"backup chain {chain_id} is valid (base: {base_full}) and "
-                  "incrementals are current")
+    return True, f"backup chain {chain_id} (base: {base_full})"
 
 
 def backup_plan(server) -> str:
@@ -551,7 +550,10 @@ def update_server(server, release, *, say) -> None:
         if not has_rollback_point(server, say):
             say("Taking a full backup before updating...")
             try:
-                server.run_backup(status_cb=say, offline=already_down)
+                # chat, not say: run_backup logs every status line itself
+                # ("Backup: ..."), so passing the logging wrapper would put
+                # each one in the log twice.
+                server.run_backup(status_cb=chat, offline=already_down)
             except Exception as e:
                 say(f"Pre-update backup failed, aborting update: {e}")
                 return
@@ -612,7 +614,7 @@ def update_server(server, release, *, say) -> None:
             _cleanup(server, release, kept, say)
             say(f"Update complete — now running {release.source} "
                 f"{release.describe()}.")
-            _rebase_backup_chain(server, say)
+            _rebase_backup_chain(server, say, chat)
         else:
             say("Update applied but relaunch was not confirmed. Start the "
                 f"server manually:\n  {cfg.mux_start_cmd}")
@@ -641,7 +643,7 @@ def update_server(server, release, *, say) -> None:
                         # Without this the server comes back up on the new
                         # version with no backup chain at all, waiting on a
                         # manual /backup that nothing asked for.
-                        _rebase_backup_chain(server, say)
+                        _rebase_backup_chain(server, say, chat)
                 else:
                     say("Could not relaunch. Start the server manually:\n  "
                         f"{cfg.mux_start_cmd}")
@@ -675,7 +677,7 @@ def _invalidate_chain(server) -> None:
                            "update; run /backup to re-establish it")
 
 
-def _rebase_backup_chain(server, say) -> None:
+def _rebase_backup_chain(server, say, chat=None) -> None:
     """Start a fresh backup chain on the updated server.
 
     Deliberately AFTER the relaunch: the new server migrates the world when it
@@ -694,7 +696,8 @@ def _rebase_backup_chain(server, say) -> None:
     """
     say("Taking a post-update backup to re-base the backup chain...")
     try:
-        server.run_backup(status_cb=say)
+        # chat, not say: run_backup already logs each status line.
+        server.run_backup(status_cb=chat if chat is not None else say)
         say("Backup chain re-based on the updated server.")
     except Exception as e:
         server.log.exception("Post-update backup failed")

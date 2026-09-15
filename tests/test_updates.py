@@ -586,6 +586,55 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_backup_status_is_not_logged_twice():
+    print("post-update backup logging:")
+    import core.updates as upd
+
+    logged, chatted, status_cbs = [], [], []
+    srv = types.SimpleNamespace(
+        log=types.SimpleNamespace(info=lambda fmt, m: logged.append(m),
+                                  exception=lambda *a: None),
+        run_backup=lambda status_cb=None: status_cbs.append(status_cb))
+
+    # say() logs and forwards; chat() only forwards. run_backup logs every
+    # status line itself, so it must be handed the chat-only one.
+    def chat(m):
+        chatted.append(m)
+
+    def say(m):
+        logged.append(m)
+        chat(m)
+
+    upd._rebase_backup_chain(srv, say, chat)
+    check(status_cbs and status_cbs[0] is chat,
+          "run_backup is given the chat-only callback, not the logging "
+          "wrapper (which produced a 'Backup: X' AND an 'Update: X' line "
+          "for every single step)")
+    check(any("post-update backup" in m for m in logged),
+          "the update's own message is still logged")
+
+
+def test_rollback_phrasing_reads_as_a_sentence():
+    print("rollback-point phrasing:")
+    import core.updates as upd
+    srv = types.SimpleNamespace(
+        load_manifest=lambda: ("08d63f2b", "mc-bedrock_20260817.zip", {}),
+        read_chain_marker=lambda: "08d63f2b",
+        config=types.SimpleNamespace(incremental_enabled=True))
+
+    said = []
+    upd.has_rollback_point(srv, said.append)
+    check("chain 08d63f2b is valid" not in said[0],
+          "not 'the existing backup chain X IS VALID ... as the rollback "
+          "point' -- the detail is a noun phrase both callers can slot in")
+    check("the existing backup chain 08d63f2b" in said[0]
+          and "as the rollback point" in said[0],
+          f"reads properly: {said[0][:70]}...")
+    plan = upd.backup_plan(srv)
+    check("Rollback point: the existing backup chain 08d63f2b" in plan,
+          "and the confirm prompt reads properly too")
+
+
 def test_first_check_is_prompt_and_staggered():
     print("first version check timing:")
     import bot as botmod
@@ -716,7 +765,7 @@ def test_chain_rebased_after_a_recovered_relaunch():
         upd.ensure_downloaded = lambda r, log=None: Path("/tmp/b.zip")
         upd._install_bedrock = lambda s, a, say: Path("/srv/old")
         upd.reconcile_online = lambda s, reason=None: set()
-        upd._rebase_backup_chain = lambda s, say: order.append("rebase")
+        upd._rebase_backup_chain = lambda s, say, chat=None: order.append("rebase")
         upd.update_server(server, rel, say=lambda m: None)
     finally:
         (upd.preflight, upd.ensure_downloaded, upd._install_bedrock,
@@ -832,7 +881,7 @@ def test_watcher_rebound_before_relaunch():
         upd._install_bedrock = lambda s, a, say: (order.append("swap"),
                                                   Path("/srv/old"))[1]
         upd.reconcile_online = lambda s, reason=None: set()
-        upd._rebase_backup_chain = lambda s, say: None
+        upd._rebase_backup_chain = lambda s, say, chat=None: None
         upd.update_server(server, rel, say=lambda m: None)
     finally:
         (upd.preflight, upd.ensure_downloaded, upd._install_bedrock) = (
@@ -1185,6 +1234,8 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_backup_status_is_not_logged_twice,
+               test_rollback_phrasing_reads_as_a_sentence,
                test_first_check_is_prompt_and_staggered,
                test_restore_downgrade_is_noticed,
                test_chain_rebased_after_a_recovered_relaunch,
