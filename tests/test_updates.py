@@ -586,6 +586,61 @@ def test_up_to_date_bedrock_is_quiet():
         mv.latest_bedrock = real
 
 
+def test_restore_downgrade_is_noticed():
+    print("a restore that downgrades the binary:")
+    from core.server import Server
+    from core.logparse import parse_bedrock_version_line
+    import core.updates as upd
+
+    # A Bedrock backup contains the WHOLE server directory, bedrock_server
+    # included, so restoring an older one downgrades the server. Real numbers
+    # from the run: /update_server installed 1.26.45.1, then a restore to an
+    # August backup brought back 1.26.40.8.
+    banner = "[2026-09-15 19:49:54:793 INFO] Version: 1.26.40.8"
+
+    with tempfile.TemporaryDirectory() as td:
+        vp = Path(td) / "installed_version.json"
+        log = Path(td) / "console.log"
+        log.write_text(banner + chr(10), encoding="utf-8")
+        srv = types.SimpleNamespace(
+            version_path=vp,
+            config=types.SimpleNamespace(edition="bedrock", log_path=log,
+                                         name="XPS-Bedrock",
+                                         updates_enabled=True),
+            log=types.SimpleNamespace(info=lambda *a: None,
+                                      warning=lambda *a: None,
+                                      exception=lambda *a: None))
+        for m in ("load_installed_version", "save_installed_version",
+                  "record_observed_version", "forget_installed_version"):
+            setattr(srv, m, types.MethodType(getattr(Server, m), srv))
+
+        srv.save_installed_version("bedrock", "1.26.45.1", None)
+        check(srv.load_installed_version()["observed"] is False,
+              "/update_server's record starts out authoritative")
+
+        srv.record_observed_version(parse_bedrock_version_line(banner))
+        check(srv.load_installed_version()["mc_version"] == "1.26.40.8",
+              "the running server's banner CORRECTS the authoritative record "
+              "-- it was only authoritative until something else changed the "
+              "binary, and a restore does exactly that")
+
+        # Same answer via the startup backfill, for a bot restarted later.
+        srv.save_installed_version("bedrock", "1.26.45.1", None)
+        upd.recover_server_version(srv)
+        check(srv.load_installed_version()["mc_version"] == "1.26.40.8",
+              "the startup backfill corrects it too")
+
+        # And the downgrade is then reported as an available update.
+        rel = mv.parse_bedrock_links(BEDROCK_LINKS)      # 1.26.45.1
+        check(not rel.same_build_as(srv.load_installed_version()),
+              "so the newer release is seen as available again")
+
+        # forget_installed_version leaves it honestly unknown.
+        srv.forget_installed_version()
+        check(srv.load_installed_version() == {},
+              "a restore can drop the record outright")
+
+
 def test_chain_rebased_after_a_recovered_relaunch():
     print("chain re-base after an unconfirmed relaunch:")
     import core.updates as upd
@@ -1105,6 +1160,7 @@ def main():
                test_chain_is_rebased_not_preserved,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
+               test_restore_downgrade_is_noticed,
                test_chain_rebased_after_a_recovered_relaunch,
                test_update_progress_is_logged,
                test_missing_baseline_is_logged,

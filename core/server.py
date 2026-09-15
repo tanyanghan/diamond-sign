@@ -176,22 +176,45 @@ class Server:
         except OSError:
             self.log.exception("Failed to write installed_version.json")
 
-    def record_observed_version(self, parsed: dict) -> None:
-        """Bootstrap a version record from a startup-log banner.
+    def forget_installed_version(self) -> None:
+        """Drop the installed-version record.
 
-        Only fills a gap: never overwrites a record /update_server wrote, and never
-        rewrites an identical observation (the banner reappears on every
-        restart). A server installed by hand before this feature existed still
-        gets something for /update_server to compare against.
+        Used after a world restore: the restore replaces the server directory
+        from a backup, binary included, so whatever was recorded no longer
+        describes what is on disk. Clearing it leaves the state honestly
+        unknown until the restored server's own startup banner re-establishes
+        it, rather than confidently wrong.
+        """
+        try:
+            self.version_path.unlink(missing_ok=True)
+        except OSError:
+            self.log.warning("Could not clear installed_version.json")
+
+    def record_observed_version(self, parsed: dict) -> None:
+        """Record a version read from a startup-log banner.
+
+        The banner is what the server that is ACTUALLY RUNNING printed about
+        itself, so it wins over anything previously recorded — including
+        what /update_server wrote. That record is only authoritative until
+        something else changes the binary underneath it, and a world restore
+        does exactly that: a Bedrock backup contains the whole server
+        directory, ``bedrock_server`` included, so restoring an older one
+        downgrades the server. Refusing to correct the record there left the
+        bot certain it was running a version it had just replaced.
+
+        An identical observation is still ignored, since the banner reappears
+        on every restart and rewriting the file each time would be noise.
         """
         if not parsed:
             return
         current = self.load_installed_version()
-        if current and not current.get("observed"):
-            return      # /update_server's authoritative record wins
         if (current.get("mc_version") == parsed.get("mc_version")
                 and current.get("build") == parsed.get("build")):
             return      # unchanged since the last restart
+        if current.get("mc_version"):
+            self.log.info("Installed version changed: %s -> %s (the running "
+                          "server says so)", current.get("mc_version"),
+                          parsed.get("mc_version"))
         record = {"source": parsed.get("source", ""),
                   "mc_version": parsed.get("mc_version", ""),
                   "build": parsed.get("build"),
@@ -959,6 +982,11 @@ class Server:
             # console. It is rebound again after the relaunch, when Java has
             # rotated a fresh latest.log into place.
             self.reattach_log_watch()
+            # The restore replaced the server directory from a backup,
+            # binary included, so any recorded version now describes the
+            # build that WAS installed. Forget it; the restored server's
+            # own startup banner re-establishes it within seconds.
+            self.forget_installed_version()
 
             # 6. Relaunch and confirm ready.
             say("Restarting the server...")
