@@ -20,6 +20,7 @@ from core.presence import reconcile_online, recover_online_identities
 from core.notifications import make_notify_callback
 from core.logwatch import LogWatcher
 from core.server import Server
+from core import updates
 from core.commands import register_commands, make_unclaimed_handler
 
 # ---------------------------------------------------------------------------
@@ -349,6 +350,83 @@ def _validate_chain(server) -> None:
 _scheduled_backup_lock = threading.Lock()
 
 
+# Serialize release downloads across the process. Several servers of the same
+# edition see the same new release at once; without this they would each pull
+# the same 60-120 MB artifact simultaneously. The first one through writes it
+# to the shared cache and the rest find it already there.
+_update_download_lock = threading.Lock()
+
+# How often to ask the upstreams what the newest build is. Deliberately a
+# constant rather than config: it is inherently process-wide while the
+# per-server knob (updates.enabled) is not, and nothing here needs tuning.
+_UPDATE_CHECK_INTERVAL = 6 * 60 * 60
+
+
+def _start_update_check(server, bot) -> None:
+    """Poll for a newer server build, download it, and announce it.
+
+    Same shape as _start_scheduled_backup: one daemon thread per server with a
+    sleep loop. It only ever reads metadata, downloads to a cache outside the
+    server directory, and posts a message — it never touches the running
+    server. Applying an update is always an explicit /update confirm.
+    """
+    if not server.config.updates_enabled:
+        logger.info("[%s] Version monitoring disabled", server.config.name)
+        return
+
+    def _loop():
+        # Stagger the first check a little so every server doesn't hit the
+        # upstreams the instant the bot starts.
+        time.sleep(60)
+        while True:
+            try:
+                release = updates.available_update(server)
+                if release is not None:
+                    _announce_update(server, bot, release)
+            except Exception:
+                # A flaky upstream must never take the bot down, and must not
+                # kill the loop either: log and try again next cycle.
+                logger.exception("[%s] Version check failed",
+                                 server.config.name)
+            logger.info("[%s] Next version check in %d seconds",
+                        server.config.name, _UPDATE_CHECK_INTERVAL)
+            time.sleep(_UPDATE_CHECK_INTERVAL)
+
+    threading.Thread(target=_loop, daemon=True,
+                     name=f"update-check-{server.config.key}").start()
+
+
+def _announce_update(server, bot, release) -> None:
+    """Download the new build, then tell the chats it is ready to install."""
+    installed = server.load_installed_version()
+    if not _update_download_lock.acquire(blocking=False):
+        logger.info("[%s] Waiting for another server's download",
+                    server.config.name)
+        _update_download_lock.acquire()
+    try:
+        updates.ensure_downloaded(release, log=None)
+    except Exception as e:
+        # Still worth telling the operator a release exists, even if fetching
+        # it failed -- /update will retry the download.
+        logger.warning("[%s] Could not pre-download %s: %s",
+                       server.config.name, release.filename, e)
+    finally:
+        _update_download_lock.release()
+
+    try:
+        keep = {release.filename, installed.get("filename")}
+        updates.mc_versions.prune_cache(release.edition, keep)
+    except Exception:
+        logger.warning("[%s] Cache prune failed", server.config.name)
+
+    msg = ("\U0001f4e6 " + updates.describe_update(server, release)
+           + "\nDownloaded and ready \u2014 send /update to review, then "
+             "/update confirm to install.")
+    sent = bot.announce(server, msg)
+    logger.info("[%s] Update available: %s %s \u2014 announced to %d chat(s)",
+                server.config.name, release.source, release.describe(), sent)
+
+
 def _start_scheduled_backup(server, bot) -> None:
     """Start the per-server scheduled full-backup thread. Status is reported to
     the owning bot's admins."""
@@ -464,6 +542,7 @@ def _bring_up_server(server, bot) -> bool:
 
         _validate_chain(server)
         _start_scheduled_backup(server, bot)
+        _start_update_check(server, bot)
         # Capturing who's already online can wait up to ~2 min for RCON when the
         # server is still booting (or down). Do it off the startup path so a
         # slow/down server doesn't delay this bot's chat adapters and leave it

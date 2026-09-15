@@ -93,6 +93,25 @@ class ServerConfig:
     # /restore stops the server.
     restore_warning_seconds: int = 15
 
+    # --- server-version updates (/update) ---
+    # Whether this server takes part in release monitoring at all.
+    updates_enabled: bool = True
+    # Java only: the jar the start command actually launches, relative to
+    # minecraft_dir. /update overwrites exactly this path, so a version bump
+    # never has to rewrite mux_start_cmd (or the operator's shell aliases).
+    # The jar filename appears NOWHERE else in the code — it lives only
+    # inside the opaque start_cmd string — so the updater has no other way
+    # to know what to replace.
+    server_jar: str = "server.jar"
+    # Java only: which upstream to follow, "paper" or "vanilla". Empty means
+    # auto — detected from the version line in the startup log, defaulting
+    # to vanilla until a Paper banner is seen.
+    java_flavor: str = ""
+    # Stay on the current Minecraft version and only take new builds of it
+    # (Paper). Off means a new Minecraft version is also offered — which
+    # migrates the world format irreversibly, so it is always labelled as such.
+    updates_pin_mc_version: bool = False
+
     @property
     def log_path(self) -> Path:
         if self.edition == EDITION_BEDROCK:
@@ -162,6 +181,7 @@ def _server_from_dict(d: dict) -> ServerConfig:
         name = _slug(get_level_name(mc_dir))
 
     rcon = ed.get("rcon") or {}          # Java-only (under "edition")
+    updates = d.get("updates") or {}     # shared (server top level)
     mux = d.get("mux") or {}             # shared (server top level)
     backup = d.get("backup") or {}
     incr = backup.get("incremental") or {}
@@ -204,6 +224,10 @@ def _server_from_dict(d: dict) -> ServerConfig:
         backup_copy_cmd=(backup.get("copy_cmd") or "").strip(),
         pre_restore_backup=bool(backup.get("pre_restore_backup", False)),
         restore_warning_seconds=int(backup.get("restore_warning_seconds") or 15),
+        updates_enabled=bool(updates.get("enabled", True)),
+        server_jar=(ed.get("server_jar") or "server.jar").strip(),
+        java_flavor=(ed.get("flavor") or "").strip().lower(),
+        updates_pin_mc_version=bool(updates.get("pin_mc_version", False)),
     )
 
 

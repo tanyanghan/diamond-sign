@@ -16,6 +16,7 @@ from pathlib import Path
 
 from backends import CAP_PLAYER_RESTORE, CAP_STATS, EVENT_DEATH, EVENT_ACHIEVEMENT
 from utils import restore_core
+from core import updates
 from core.auth import AUTH_PATH, auth_lock, save_auth, auth_ns, is_admin
 from core.state import (
     refresh_player_names, register_player, uuid_by_name,
@@ -154,6 +155,15 @@ _RESTORE_PLAYER_PAGE_SIZE = 10  # versions shown per page in /restore_player lis
 # /restore (whole-world) pending-state, keyed like the player restore by
 # "{bot}:{server}:{platform}:{user}". Same list -> select -> confirm gate so an
 # accidental /restore can't wipe and rebuild the world in one command.
+# /update pending-state, same list->confirm discipline as the restores: an
+# update stops the server and replaces its binary, and a Minecraft version bump
+# migrates the world irreversibly, so it must never happen on one mistyped
+# message.
+_pending_update: dict = {}
+_pending_update_lock = threading.Lock()
+_PENDING_UPDATE_TTL = 300
+
+
 _pending_world_restore: dict = {}
 _pending_world_lock = threading.Lock()
 _PENDING_WORLD_RESTORE_TTL = 300
@@ -639,6 +649,71 @@ def register_commands(router, auth: dict) -> None:
         threading.Thread(target=run, daemon=True).start()
     router.register("backup", cmd_backup, private_only=True, admin_only=True,
                     needs_online=True)
+
+    # --- /update (server version) ---
+    def cmd_update(ctx):
+        server = ctx.server
+        confirm = bool(ctx.args) and ctx.args[0].lower() == "confirm"
+        _cmd_log(ctx, "Update", f" (args={ctx.args})")
+        pkey = (f"{ctx.bot.config.name}:{server.config.key}:"
+                f"{ctx.platform}:{ctx.user_id}")
+
+        if not confirm:
+            ctx.reply("Checking for a newer server version...")
+
+            def look():
+                try:
+                    release = updates.available_update(server)
+                except Exception as e:
+                    server.log.exception("Update check failed")
+                    ctx.adapter.send(ctx.chat_id, f"Update check failed: {e}")
+                    return
+                if release is None:
+                    installed = server.load_installed_version()
+                    current = installed.get("mc_version") or "unknown"
+                    ctx.adapter.send(
+                        ctx.chat_id,
+                        f"{server.config.name} is up to date (running "
+                        f"{current}).")
+                    return
+                with _pending_update_lock:
+                    _pending_update[pkey] = {"release": release,
+                                             "ts": time.time()}
+                ctx.adapter.send(
+                    ctx.chat_id,
+                    updates.describe_update(server, release)
+                    + "\n\nA full backup runs first, then the server is "
+                      "stopped, updated and restarted.\nSend `/update "
+                      "confirm` to proceed.")
+
+            threading.Thread(target=look, daemon=True).start()
+            return
+
+        with _pending_update_lock:
+            entry = _pending_update.pop(pkey, None)
+        if entry is None or time.time() - entry["ts"] > _PENDING_UPDATE_TTL:
+            ctx.reply("Nothing to confirm \u2014 run /update first to see what "
+                      "is available.")
+            return
+
+        release = entry["release"]
+        if not server.backup_lock.acquire(blocking=False):
+            ctx.reply("A backup, restore or update is already in progress.")
+            return
+        ctx.reply(f"Updating to {release.describe()}...")
+        say = lambda m: ctx.adapter.send(ctx.chat_id, m)
+
+        def run():
+            try:
+                updates.update_server(server, release, say=say)
+            finally:
+                server.backup_lock.release()
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("update", cmd_update, private_only=True, admin_only=True,
+                    cap=lambda c: c.server.backend.can_restart,
+                    cap_message="Updating needs a restart transport \u2014 set "
+                                "mux.session + mux.start_cmd for this server.")
 
     # --- /allowlist (server whitelist/allowlist passthrough) ---
     _ALLOWLIST_SUBS = {"on", "off", "add", "remove", "list", "reload"}

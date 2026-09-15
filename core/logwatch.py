@@ -12,7 +12,8 @@ import time
 
 from watchdog.events import FileSystemEventHandler
 
-from core.logparse import parse_line
+from core.logparse import parse_line, parse_version_line
+from utils.config import EDITION_JAVA
 from utils.logtail import split_complete_lines
 
 
@@ -137,6 +138,24 @@ class LogWatcher(FileSystemEventHandler):
             for waiter in triggered:
                 self._waiters.remove(waiter)
 
+    def _maybe_version(self, line: str) -> None:
+        """Bootstrap the installed-version record from the startup banner.
+
+        Java only: Bedrock's version comes from the download URL that
+        /update records, so there is no need to guess at BDS console
+        wording. Cheap and silent — record_observed_version() ignores
+        anything it already knows, and never overwrites what /update wrote.
+        """
+        if self._server.config.edition != EDITION_JAVA:
+            return
+        try:
+            parsed = parse_version_line(line)
+            if parsed:
+                self._server.record_observed_version(parsed)
+        except Exception:
+            logger.exception("[%s] Version detection failed",
+                             self._server.config.name)
+
     def _maybe_server_start(self, line: str) -> None:
         """If a line signals the server (re)started, fire the on_server_start
         callback in a background thread (debounced). Runs off-thread so the
@@ -185,6 +204,8 @@ class LogWatcher(FileSystemEventHandler):
                     self._check_waiters(line)
                     # Server (re)start -> resync online status (debounced).
                     self._maybe_server_start(line)
+                    # Bootstrap the installed-version record (Java banner).
+                    self._maybe_version(line)
                     # Check player event notifications
                     event_type, payload = parse_line(line, self._server)
                     if event_type and payload:

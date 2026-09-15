@@ -34,6 +34,7 @@ run **multiple bots** at once.
 | Whole-world restore | ✓ — needs `mux` set (below) | ✓ |
 | Per-player restore | ✓ | ✓ |
 | `/allowlist` | ✓ | ✓ |
+| Version monitoring + `/update` | ✓ — Paper or vanilla | ✓ — Bedrock Dedicated Server |
 | World seed (`/seed`) | ✓ — `seed` over RCON | ✓ — read from `level.dat` (BDS has no `seed` command) |
 | Death notifications | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
 | In-game chat relay | ✓ | ✓ — needs the [behavior pack](#bedrock-chat--death-events) |
@@ -179,6 +180,7 @@ below when commands change):
 status - Show server status and who's online
 list - List known players
 seed - Show the world seed
+update - Check for and install a new server version
 stats - Player statistics
 playtime - Playtime leaderboard
 achievements - Player achievements
@@ -230,6 +232,7 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
       { "command": "/online", "description": "Show online players", "should_escape": false },
       { "command": "/list", "description": "List known players", "should_escape": false },
       { "command": "/seed", "description": "Show the world seed", "should_escape": false },
+      { "command": "/update", "description": "Check for and install a new server version", "should_escape": false },
       { "command": "/stats", "description": "Player statistics", "should_escape": false },
       { "command": "/playtime", "description": "Playtime leaderboard", "should_escape": false },
       { "command": "/achievements", "description": "Player achievements", "should_escape": false },
@@ -439,6 +442,7 @@ its pause state.
 |---------|-------------|
 | `/status` | Show whether the server is online, and who's playing. In an admin DM it lists every server the bot fronts; in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
+| `/update [confirm]` | *(Admin)* Show the installed vs available server version; `confirm` backs up, stops, updates and restarts |
 | `/seed` | Show the world seed — Java runs the server's `seed` command (needs the server up); Bedrock reads `RandomSeed` from the world's `level.dat` (works either way) |
 | `/stats [player]` | Full stats for one or all players |
 | `/playtime` | Playtime leaderboard |
@@ -757,6 +761,80 @@ The mechanics differ by edition:
 
 ---
 
+## Server version updates — `/update`
+
+The bot checks every 6 hours whether a newer server build has been released,
+downloads it, and posts a message to the chats bound to that server. Nothing is
+installed until you run `/update confirm`.
+
+Where releases come from (the minecraft.net download pages are JS-gated and
+cannot be scraped, so each edition uses its real API):
+
+| Edition | Source | Verified with |
+|---|---|---|
+| Java — Paper | `fill.papermc.io/v3` | SHA-256 |
+| Java — vanilla | Mojang's version manifest | SHA-1 |
+| Bedrock | the Minecraft services download-links endpoint | CRC on unpack (no checksum is published) |
+
+Downloads land in **`~/.diamond-sign/minecraft_servers/{java,bedrock}/`**, shared
+by every server of that edition and pruned to the newest build plus whatever is
+currently installed — so the running version is always on hand for a manual
+rollback.
+
+**Both kinds of update are reported, labelled differently.** A new Paper *build*
+of the Minecraft version you already run is routine. A new *Minecraft version*
+migrates the world format and **cannot be undone** — the upgraded world will
+not load on the old server — so it is called out explicitly. Either way
+`/update confirm` takes a **full backup first**, which is the only route back
+from a migration.
+
+```
+/update            # installed vs available, and whether it's a major jump
+/update confirm    # back up, warn players, stop, swap, restart
+```
+
+### Configuration
+
+```jsonc
+"edition": {
+  "type": "java",
+  "server_jar": "server.jar",   // the jar /update overwrites (Java only)
+  "flavor": "paper"             // "paper" | "vanilla"; omit to auto-detect
+},
+"updates": {
+  "enabled": true,              // opt this server out of monitoring
+  "pin_mc_version": false       // true = only take new builds of the Minecraft
+                                //        version you already run, never a jump
+}
+```
+
+**Java: standardise on one jar filename.** `/update` overwrites exactly
+`edition.server_jar`, so your `mux.start_cmd` (and any shell alias or systemd
+unit) never has to change when the version does. If your jar is still named
+after its version — `paper-1.21.11-127.jar` — rename it to `server.jar`,
+update `start_cmd` and your alias to match, and you never touch them again. The
+bot will **not** rename it for you: it cannot see your aliases, so a silent
+rename would break your own launch script. `/update` refuses with a message
+naming both the file it expected and the jar it found.
+
+**Bedrock: your config and packs are preserved.** The BDS zip ships
+`server.properties`, `permissions.json` and `allowlist.json`, so unpacking it
+over an install would overwrite them. Instead the release is unpacked to a
+staging directory, and your `worlds/`, those three config files, `console.log`,
+the backup-chain marker, and **any pack the release does not ship** (this bot's
+`diamondsign_events`, plus anything of your own) are moved across before the
+directory is swapped in atomically. Packs are diffed rather than hardcoded, so a
+release adding or removing a vanilla pack does not strand yours.
+
+Bedrock updates require a layout the staged swap supports (see
+[Whole-world restore](#whole-world-restore-from-chat--restore) for the same
+constraints). Unlike `/restore` there is no in-place fallback — the only
+other way to apply a BDS release is to unzip over the install, which is exactly
+the config-destroying thing this avoids — so `/update` refuses and tells you
+why.
+
+---
+
 ## Bedrock specifics
 
 Beyond [connecting a Bedrock server](#bedrock), a few features work differently
@@ -866,7 +944,13 @@ servers in one process never collide. All of it is git-ignored:
   counts (per-server, not portable)
 - `data/<name>/bedrock_player_state.json` — *(Bedrock)* per-player data hashes, so
   incremental sidecars only carry players that changed
+- `data/<name>/installed_version.json` — which server build is installed. Written authoritatively by `/update`; otherwise bootstrapped from the startup
+  banner so a server that predates the feature still has something to compare against
 - `<minecraft_dir>/.diamondsign_chain` — chain-validity marker, in the server dir
+- `~/.diamond-sign/minecraft_servers/{java,bedrock}/` — downloaded server
+  artifacts, shared by every server of that edition. Pruned to the newest download
+  plus whatever is currently installed, so the running version stays available for a
+  manual rollback
 
 Process-wide state (repo root, git-ignored):
 

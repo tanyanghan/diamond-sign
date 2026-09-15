@@ -83,6 +83,7 @@ class Server:
         # on Bedrock). Matched by basename anywhere in the tree.
         self.backup_exclude_names = frozenset(backup_exclude_names(config))
         self.manifest_path = self._data_path("backup_manifest.json")
+        self.version_path = self._data_path("installed_version.json")
         self.chain_marker_path = self.config.minecraft_dir / CHAIN_MARKER_NAME
         # Bedrock per-player restore reads player data from a sidecar embedded in
         # each backup zip (the live LevelDB is locked while the server runs).
@@ -145,6 +146,66 @@ class Server:
             except Exception:
                 self.log.exception("Failed to load backup_manifest.json")
         return "", "", {}
+
+    def load_installed_version(self) -> dict:
+        """What server build is installed: ``{source, mc_version, build, ...}``.
+
+        ``{}`` when unknown. /update writes this authoritatively (it knows
+        exactly what it installed); the startup-log banner only ever fills it
+        in for a server that predates the feature.
+        """
+        if self.version_path.exists():
+            try:
+                with open(self.version_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                self.log.exception("Failed to load installed_version.json")
+        return {}
+
+    def save_installed_version(self, source: str, mc_version: str,
+                               build=None, **extra) -> None:
+        """Record what is installed. Called by /update after a successful
+        swap, so the record is authoritative rather than inferred."""
+        record = {"source": source, "mc_version": mc_version, "build": build,
+                  "recorded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  "observed": False}
+        record.update(extra)
+        try:
+            with open(self.version_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+        except OSError:
+            self.log.exception("Failed to write installed_version.json")
+
+    def record_observed_version(self, parsed: dict) -> None:
+        """Bootstrap a version record from a startup-log banner.
+
+        Only fills a gap: never overwrites a record /update wrote, and never
+        rewrites an identical observation (the banner reappears on every
+        restart). A server installed by hand before this feature existed still
+        gets something for /update to compare against.
+        """
+        if not parsed:
+            return
+        current = self.load_installed_version()
+        if current and not current.get("observed"):
+            return      # /update's authoritative record wins
+        if (current.get("mc_version") == parsed.get("mc_version")
+                and current.get("build") == parsed.get("build")):
+            return      # unchanged since the last restart
+        record = {"source": parsed.get("source", ""),
+                  "mc_version": parsed.get("mc_version", ""),
+                  "build": parsed.get("build"),
+                  "software": parsed.get("software", ""),
+                  "recorded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  "observed": True}
+        try:
+            with open(self.version_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            self.log.info("Detected server version: %s %s%s",
+                          record["software"], record["mc_version"],
+                          f" build {record['build']}" if record["build"] else "")
+        except OSError:
+            self.log.exception("Failed to write installed_version.json")
 
     def save_manifest(self, files: dict, chain_id: str, base_full: str) -> None:
         """Write the manifest with the current chain state and file mtimes."""

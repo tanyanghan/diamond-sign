@@ -34,6 +34,45 @@ RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
 # Player chat, e.g. "[12:34:56] [Server thread/INFO]: <Steve> hello" (or a
 # Paper-style "[Async Chat Thread - #0/INFO]:"). The <> brackets distinguish it
 # from join/leave/death lines (which start with a bare \w name).
+# --- server version, read off the startup banner ----------------------------
+# Bootstrap only. /update is the AUTHORITATIVE record of what is installed --
+# it knows exactly what it just wrote -- so these exist purely so a server
+# that predates the feature still has something to compare against before
+# /update has ever run once. Both lines were taken verbatim from this repo's
+# own captured logs (logs/log_*.txt), not guessed:
+#
+#   [16:37:28] [Server thread/INFO]: This server is running Paper version
+#       1.21.11-117-main@79c77f5 (2026-02-20T...) (Implementing API version ...)
+#   [10:12:45] [Server thread/INFO]: Starting minecraft server version 1.21.6
+#
+# Order matters: Paper prints BOTH lines, its own after the vanilla one, so the
+# Paper match must win. The vanilla line alone cannot identify the flavour —
+# Fabric and Paper both print it.
+RE_PAPER_VERSION = re.compile(
+    r'This server is running (\w+) version ([\d.]+)-(\d+)-\S+')
+RE_VANILLA_VERSION = re.compile(
+    r'Starting minecraft server version (\S+)')
+
+
+def parse_version_line(line: str) -> dict | None:
+    """Extract a server version from one Java startup line, or None.
+
+    Returns ``{"source", "mc_version", "build", "software"}``. ``build`` is
+    the Paper build number, or None for vanilla-style lines.
+    """
+    m = RE_PAPER_VERSION.search(line)
+    if m:
+        software, mc_version, build = m.group(1), m.group(2), m.group(3)
+        return {"source": "paper" if software.lower() == "paper" else "vanilla",
+                "software": software, "mc_version": mc_version,
+                "build": int(build)}
+    m = RE_VANILLA_VERSION.search(line)
+    if m:
+        return {"source": "vanilla", "software": "Vanilla",
+                "mc_version": m.group(1), "build": None}
+    return None
+
+
 RE_CHAT = re.compile(r'^\[[\d:]+\] \[[^\]]*/INFO\]: <([^>]+)> (.+)$')
 DEATH_PHRASES = (
     "was slain by", "was shot by", "was killed",
