@@ -300,14 +300,34 @@ def test_prune():
 import os
 import stat
 import types
+import json as _json
 import zipfile as _zf
 
 import core.updates as up
 from utils.restore_core import swap_in_staging
 
 
-def _make_bds_zip(path: Path, *, with_worlds=False, exec_bit=True, extra=()):
-    """A miniature BDS release zip, shaped like the real one."""
+# Pack UUIDs are stable across releases; the directory NAME is not. These
+# stand in for the real ones, which is all the diff cares about.
+UUID_VANILLA_BEH = "11111111-1111-4111-8111-111111111111"
+UUID_VANILLA_RES = "22222222-2222-4222-8222-222222222222"
+UUID_CHEMISTRY = "33333333-3333-4333-8333-333333333333"
+
+
+def _manifest(uuid: str, name: str = "pack") -> str:
+    return _json.dumps({"format_version": 2,
+                        "header": {"uuid": uuid, "version": [1, 0, 0],
+                                   "name": name}})
+
+
+def _make_bds_zip(path: Path, *, with_worlds=False, exec_bit=True, extra=(),
+                  version="1.26.51"):
+    """A miniature BDS release zip, shaped like the real one.
+
+    Note the version-stamped pack directory names: this is what BDS actually
+    ships (``behavior_packs/vanilla_1.26.51``), and getting it wrong in this
+    fixture is what let a name-only pack diff look correct.
+    """
     with _zf.ZipFile(path, "w", _zf.ZIP_DEFLATED) as z:
         info = _zf.ZipInfo("bedrock_server")
         # external_attr is where the Unix mode lives; 0o755 << 16 is what a
@@ -317,9 +337,18 @@ def _make_bds_zip(path: Path, *, with_worlds=False, exec_bit=True, extra=()):
         z.writestr("server.properties", "level-name=DEFAULT\ngamemode=survival\n")
         z.writestr("permissions.json", "[]")
         z.writestr("allowlist.json", "[]")
-        z.writestr("behavior_packs/vanilla/manifest.json", "{}")
-        z.writestr("behavior_packs/chemistry/manifest.json", "{}")
-        z.writestr("resource_packs/vanilla/manifest.json", "{}")
+        # The real zip ships the whole historical chain, every entry under the
+        # SAME uuid -- not just the current version. Getting this wrong in the
+        # fixture is what made a name-only diff look correct.
+        for old_version in ("1.26.30", "1.26.40"):
+            z.writestr(f"behavior_packs/vanilla_{old_version}/manifest.json",
+                       _manifest(UUID_VANILLA_BEH, old_version))
+        z.writestr(f"behavior_packs/vanilla_{version}/manifest.json",
+                   _manifest(UUID_VANILLA_BEH, version))
+        z.writestr("behavior_packs/chemistry/manifest.json",
+                   _manifest(UUID_CHEMISTRY))
+        z.writestr(f"resource_packs/vanilla_{version}/manifest.json",
+                   _manifest(UUID_VANILLA_RES, version))
         if with_worlds:
             z.writestr("worlds/Bedrock level/level.dat", "NEW")
         for name in extra:
@@ -338,11 +367,23 @@ def _make_install(root: Path) -> Path:
     (mc / "allowlist.json").write_text('[{"name":"Kamion"}]')
     (mc / "console.log").write_text("history")
     (mc / ".diamondsign_chain").write_text("abcd1234")
-    for pack in ("vanilla", "chemistry", "diamondsign_events", "my_custom_pack"):
+    # What 1.26.45 left behind: its own version-stamped packs, plus the
+    # operator's. A real install looks exactly like this.
+    for pack, uuid in (("vanilla_1.26.30", UUID_VANILLA_BEH),
+                       ("vanilla_1.26.40", UUID_VANILLA_BEH),
+                       ("vanilla_1.26.45", UUID_VANILLA_BEH),
+                       ("chemistry", UUID_CHEMISTRY),
+                       ("diamondsign_events", "44444444-4444-4444-8444-4444"),
+                       ("my_custom_pack", "55555555-5555-4555-8555-5555")):
         (mc / "behavior_packs" / pack).mkdir(parents=True)
-        (mc / "behavior_packs" / pack / "manifest.json").write_text(pack)
+        (mc / "behavior_packs" / pack / "manifest.json").write_text(
+            _manifest(uuid))
+    (mc / "resource_packs" / "vanilla_1.26.45").mkdir(parents=True)
+    (mc / "resource_packs" / "vanilla_1.26.45" / "manifest.json").write_text(
+        _manifest(UUID_VANILLA_RES))
     (mc / "resource_packs" / "my_textures").mkdir(parents=True)
-    (mc / "resource_packs" / "my_textures" / "manifest.json").write_text("mine")
+    # No manifest at all: unreadable identity must not mean "discardable".
+    (mc / "resource_packs" / "my_textures" / "textures.json").write_text("mine")
     return mc
 
 
@@ -410,16 +451,26 @@ def test_custom_pack_diff():
         _make_bds_zip(root / "bds.zip")
         up._extract_bds(root / "bds.zip", staging, lambda m: None)
 
-        names = up.custom_pack_names(mc, staging)
+        said = []
+        names = up.custom_pack_names(mc, staging, said.append)
         check("behavior_packs/diamondsign_events" in names,
               "this bot's own pack is carried across")
         check("behavior_packs/my_custom_pack" in names,
               "an operator's own pack is carried across too")
         check("resource_packs/my_textures" in names,
-              "custom resource packs carried across")
-        check("behavior_packs/vanilla" not in names
-              and "behavior_packs/chemistry" not in names,
-              "packs the release ships are NOT carried (we want the new ones)")
+              "a pack with no readable manifest is kept, not discarded")
+        check("behavior_packs/chemistry" not in names,
+              "a pack the release ships under the SAME name is not carried")
+        check("behavior_packs/vanilla_1.26.40" not in names,
+              "a historical pack the release still ships is left alone")
+        check("behavior_packs/vanilla_1.26.45" not in names
+              and "resource_packs/vanilla_1.26.45" not in names,
+              "a pack the release DROPPED from its chain is not carried "
+              "across as if it were the operator's -- it shares a uuid with "
+              "the chain 1.26.51 does ship, and carrying it kept the outgoing "
+              "release's own pack for good, under the operator's name")
+        check(said and "vanilla_1.26.45" in said[0],
+              f"and it says which packs the release replaced ({said})")
 
 
 def test_bedrock_swap_end_to_end():
@@ -452,6 +503,15 @@ def test_bedrock_swap_end_to_end():
               "diamondsign behavior pack survived")
         check((mc / "behavior_packs" / "my_custom_pack").is_dir(),
               "operator's custom pack survived")
+        check((mc / "resource_packs" / "my_textures").is_dir(),
+              "manifest-less operator pack survived")
+        check((mc / "behavior_packs" / "vanilla_1.26.51").is_dir()
+              and (mc / "resource_packs" / "vanilla_1.26.51").is_dir(),
+              "the new release's vanilla packs are installed")
+        check(not (mc / "behavior_packs" / "vanilla_1.26.45").exists()
+              and not (mc / "resource_packs" / "vanilla_1.26.45").exists(),
+              "and the one the release dropped is GONE rather than being "
+              "kept for good as though the operator had installed it")
         check((mc / "definitions" / "new_thing.json").exists(),
               "new release's files are present")
         check((mc / "bedrock_server").read_text() == "#!binary\n",

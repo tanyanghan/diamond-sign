@@ -20,6 +20,7 @@ Two editions, two very different swaps:
            ``restore_core.swap_in_staging``.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -416,26 +417,85 @@ def _extract_bds(artifact: Path, staging: Path, log) -> None:
                           "collide with the live world -- update by hand")
 
 
-def custom_pack_names(mc_dir: Path, staging: Path) -> set:
+def _pack_uuid(pack_dir: Path) -> str | None:
+    """The pack's identity from its ``manifest.json``, or None if unreadable.
+
+    Every Bedrock pack carries a ``header.uuid`` that stays the same across
+    releases while its DIRECTORY NAME does not: BDS stamps the version in, so
+    ``behavior_packs/vanilla_1.26.45`` becomes ``vanilla_1.26.51``. The UUID is
+    the only stable way to recognise the two as the same pack.
+    """
+    try:
+        # utf-8-sig: some published packs ship a BOM, which plain utf-8 would
+        # choke on -- and a manifest we cannot read must not be treated as
+        # "not the operator's".
+        raw = (pack_dir / "manifest.json").read_text(encoding="utf-8-sig")
+        uuid = (json.loads(raw).get("header") or {}).get("uuid")
+    except Exception:
+        return None
+    return uuid.lower() if isinstance(uuid, str) else None
+
+
+def custom_pack_names(mc_dir: Path, staging: Path, say=None) -> set:
     """Pack directories the operator added, which the release does not ship.
 
     Diffed rather than hardcoded: the set of vanilla packs changes between
     releases, and the operator may have packs of their own beside this bot's
     ``diamondsign_events``. Anything the new release did not supply is theirs
     and has to be carried across, or the swap would silently delete it.
+
+    Matching on the directory name alone is not enough. BDS ships the whole
+    historical chain of vanilla packs (``vanilla_1.14`` through
+    ``vanilla_1.26.51``, all under ONE uuid at different manifest versions, so
+    that worlds pinned to an old version still load), and between releases it
+    occasionally drops one from that chain: 1.26.51 ships no
+    ``vanilla_1.26.45``. A name-only diff reads that absence as "the release
+    does not ship this, so it must be the operator's", and carries the
+    OUTGOING release's own pack across, where it then stays for good —
+    labelled in the log as one of the operator's packs.
+
+    The uuid is what separates the two cases: a pack the release superseded
+    shares its uuid with one the new release ships, an operator's does not.
+    Note that several directories legitimately share a uuid (the vanilla
+    chain), so a duplicate uuid is normal to BDS and not itself the problem.
+
+    A pack whose manifest cannot be read is kept, on the same principle as the
+    rest of this path: when in doubt, do not discard the operator's data.
     """
-    names = set()
+    names, superseded = set(), []
     for packs in _PACK_DIRS:
         old_dir, new_dir = mc_dir / packs, staging / packs
         if not old_dir.is_dir():
             continue
-        shipped = ({p.name for p in new_dir.iterdir()}
-                   if new_dir.is_dir() else set())
-        extra = [e.name for e in old_dir.iterdir() if e.name not in shipped]
+        shipped, shipped_uuids = set(), set()
+        if new_dir.is_dir():
+            for p in new_dir.iterdir():
+                shipped.add(p.name)
+                uuid = _pack_uuid(p)
+                if uuid:
+                    shipped_uuids.add(uuid)
+
+        extra = []
+        for entry in old_dir.iterdir():
+            if entry.name in shipped:
+                continue
+            uuid = _pack_uuid(entry)
+            if uuid is not None and uuid in shipped_uuids:
+                # Same pack, new directory name: the release renamed it. Let
+                # the new copy win instead of carrying the old one across as
+                # if it were the operator's.
+                superseded.append(f"{packs}/{entry.name}")
+                continue
+            extra.append(entry.name)
+
         if extra and not new_dir.is_dir():
             # Nothing to merge into: the move below needs the parent to exist.
             new_dir.mkdir(parents=True, exist_ok=True)
         names.update(f"{packs}/{name}" for name in extra)
+
+    if superseded and say is not None:
+        say(f"Replacing the previous release's packs: "
+            f"{', '.join(sorted(superseded))}")
     return names
 
 
@@ -447,7 +507,8 @@ def _install_bedrock(server, artifact: Path, say) -> Path:
     say("Unpacking the new server...")
     _extract_bds(artifact, staging, say)
 
-    preserve = set(_BEDROCK_PRESERVE) | custom_pack_names(mc_dir, staging)
+    preserve = set(_BEDROCK_PRESERVE) | custom_pack_names(
+        mc_dir, staging, say)
     kept = sorted(n for n in preserve if "/" in n)
     if kept:
         say(f"Keeping your packs: {', '.join(kept)}")
