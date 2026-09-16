@@ -38,6 +38,14 @@ logger = logging.getLogger("diamondsign")
 # ---------------------------------------------------------------------------
 # Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
+def _describe_version(record: dict) -> str:
+    """'26.2 build 124' / '1.26.45.1' -- a build-only bump otherwise logs as
+    the meaningless '26.2 -> 26.2'."""
+    version = record.get("mc_version") or "unknown"
+    build = record.get("build")
+    return f"{version} build {build}" if build else version
+
+
 class Server:
     """One Minecraft server's runtime: its config, backend, and per-server
     mutable state (online players, session xuids, pending UUID correlation, and
@@ -211,10 +219,23 @@ class Server:
         if (current.get("mc_version") == parsed.get("mc_version")
                 and current.get("build") == parsed.get("build")):
             return      # unchanged since the last restart
+        if (parsed.get("build") is None and current.get("build") is not None
+                and current.get("mc_version") == parsed.get("mc_version")):
+            # Paper prints vanilla's "Starting minecraft server version X"
+            # line BEFORE its own banner, and the tailer sees one line at a
+            # time, so the generic line arrives first. Taking it would record
+            # a Paper server as VANILLA for the few milliseconds until the
+            # Paper banner corrects it — and a version check landing in
+            # that window would poll Mojang instead of Paper, and offer a jar
+            # that replaces Paper. A build-less observation is strictly less
+            # specific, so it never displaces one carrying a build for the
+            # same version. (recover_server_version solves this by reading
+            # ahead; the live tailer cannot.)
+            return
         if current.get("mc_version"):
             self.log.info("Installed version changed: %s -> %s (the running "
-                          "server says so)", current.get("mc_version"),
-                          parsed.get("mc_version"))
+                          "server says so)", _describe_version(current),
+                          _describe_version(parsed))
         record = {"source": parsed.get("source", ""),
                   "mc_version": parsed.get("mc_version", ""),
                   "build": parsed.get("build"),

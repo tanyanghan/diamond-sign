@@ -244,32 +244,21 @@ def recover_server_version(server) -> dict | None:
                     f" build {best['build']}" if best.get("build") else "")
         server.record_observed_version(best)
     elif server.config.updates_enabled:
-        # Worth saying out loud: with no baseline the poll stays silent, and
-        # the reason is otherwise invisible.
-        logger.info("[%s] No version banner found in %s — the installed "
-                    "version is unknown, so update checks stay quiet until "
-                    "/update_server is run once", server.config.name,
-                    server.config.log_path.name)
+        # A banner that has simply scrolled out of the log (Java rotates
+        # latest.log; Bedrock's console.log outgrows the scan window) is
+        # not the same as having no idea what is installed. Only claim the
+        # latter when there really is no record, or this contradicts the
+        # "(installed: X)" the very next check prints.
+        if server.load_installed_version().get("mc_version"):
+            logger.info("[%s] No version banner in %s (rotated past it) — "
+                        "keeping the recorded version",
+                        server.config.name, server.config.log_path.name)
+        else:
+            logger.info("[%s] No version banner found in %s — the "
+                        "installed version is unknown, so update checks "
+                        "stay quiet until /update_server is run once",
+                        server.config.name, server.config.log_path.name)
     return best
-    best = None
-    try:
-        with open(server.config.log_path, encoding="utf-8",
-                  errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= _VERSION_SCAN_LINES:
-                    break
-                parsed = parse_version_line(line)
-                if parsed is None:
-                    continue
-                best = parsed
-                if parsed.get("build") is not None:
-                    break
-    except OSError:
-        return None
-    if best:
-        server.record_observed_version(best)
-    return best
-
 
 def refresh_installed_version(server) -> dict | None:
     """Ask a running Java server what it is, via Paper's `version` command.
