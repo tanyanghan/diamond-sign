@@ -95,7 +95,11 @@ def available_update(server, *, require_baseline: bool = True):
         if flavor == mc_versions.SOURCE_PAPER:
             pin = (installed.get("mc_version")
                    if cfg.updates_pin_mc_version else None)
-            release = mc_versions.latest_paper(pin)
+            # not_older_than: if the newest Minecraft version has only
+            # alpha builds, fall back to the newest one that has a stable
+            # build -- but never past what is installed.
+            release = mc_versions.latest_paper(
+                pin, not_older_than=installed.get("mc_version"))
         else:
             release = mc_versions.latest_vanilla()
     if release is None or release.same_build_as(installed):

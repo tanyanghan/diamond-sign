@@ -94,6 +94,66 @@ def test_paper():
     check(mv.parse_paper_build({}, "26.2") is None, "empty doc -> None")
 
 
+def test_paper_falls_back_past_alpha_versions():
+    print("Paper version fallback:")
+    import json as _json
+
+    # The exact shape seen in the wild on 2026-09-16: Paper had published a
+    # 26.3 key whose latest build was ALPHA, while the version the server ran
+    # (26.2) had stable build 124 available.
+    project = {"versions": {"26.3": ["26.3"], "26.2": ["26.2"],
+                            "26.1": ["26.1.2"]}}
+    alpha = {"id": 5, "channel": "ALPHA", "downloads": {"server:default": {
+        "name": "paper-26.3-5.jar", "url": "https://x/paper-26.3-5.jar",
+        "checksums": {"sha256": "a" * 64}, "size": 1}}}
+    stable_262 = {"id": 124, "channel": "STABLE", "downloads": {
+        "server:default": {"name": "paper-26.2-124.jar",
+                           "url": "https://x/paper-26.2-124.jar",
+                           "checksums": {"sha256": "b" * 64}, "size": 1}}}
+    stable_261 = {"id": 99, "channel": "STABLE", "downloads": {
+        "server:default": {"name": "paper-26.1-99.jar",
+                           "url": "https://x/paper-26.1-99.jar",
+                           "checksums": {"sha256": "c" * 64}, "size": 1}}}
+
+    routes = {mv.PAPER_PROJECT: project,
+              mv.PAPER_PROJECT + "/versions/26.3/builds/latest": alpha,
+              mv.PAPER_PROJECT + "/versions/26.2/builds/latest": stable_262,
+              mv.PAPER_PROJECT + "/versions/26.1/builds/latest": stable_261}
+    fetched = []
+
+    real = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=None: (
+        fetched.append(req.full_url),
+        _FakeResponse(_json.dumps(routes[req.full_url]).encode()))[1]
+    try:
+        rel = mv.latest_paper(not_older_than="26.2")
+        check(rel is not None, "a release is found despite 26.3 being ALPHA")
+        check(rel.mc_version == "26.2" and rel.build == 124,
+              f"falls back to the newest STABLE build ({rel and rel.describe()}) "
+              "-- previously this returned None and the server was told it "
+              "was up to date while build 124 was waiting")
+        check(any("26.3" in u for u in fetched),
+              "it did look at 26.3 first")
+
+        # The floor stops the walk before it can offer a downgrade.
+        fetched.clear()
+        rel = mv.latest_paper(not_older_than="26.3")
+        check(rel is None,
+              "with 26.3 installed and only an ALPHA available, nothing is "
+              "offered -- it does NOT fall back to 26.2 and propose a "
+              "downgrade")
+        check(not any("26.1" in u for u in fetched),
+              "and it stops walking rather than scanning every old version")
+
+        # Pinning still queries exactly one version.
+        fetched.clear()
+        rel = mv.latest_paper("26.1")
+        check(rel is not None and rel.build == 99, "pinned lookup unaffected")
+        check(len(fetched) == 1, "a pinned lookup makes exactly one request")
+    finally:
+        urllib.request.urlopen = real
+
+
 def test_vanilla():
     print("Vanilla parsing:")
     found = mv.parse_vanilla_manifest(MOJANG_MANIFEST)
@@ -1166,7 +1226,7 @@ def test_java_flavor_is_not_guessed():
     real_v, real_p = mv.latest_vanilla, mv.latest_paper
     try:
         mv.latest_vanilla = lambda: called.append("vanilla")
-        mv.latest_paper = lambda pin=None: called.append("paper")
+        mv.latest_paper = lambda pin=None, **kw: called.append("paper")
         check(upd.available_update(server) is None,
               "unknown flavour -> no check at all")
         check(called == [],
@@ -1227,7 +1287,8 @@ def test_update_comparison():
 
 
 def main():
-    for fn in (test_paper, test_vanilla, test_bedrock, test_version_ordering,
+    for fn in (test_paper, test_paper_falls_back_past_alpha_versions,
+               test_vanilla, test_bedrock, test_version_ordering,
                test_download_verification, test_fetch_json, test_prune,
                test_extract_preserves_exec_bit, test_extract_rejects_bad_zips,
                test_custom_pack_diff, test_bedrock_swap_end_to_end,
