@@ -565,6 +565,97 @@ def test_pre_update_backup_is_conditional():
           "explains the staleness risk")
 
 
+def test_paper_startup_does_not_record_vanilla():
+    print("Paper startup banner order:")
+    from core.server import Server
+    from core.logparse import parse_version_line
+
+    with tempfile.TemporaryDirectory() as td:
+        vp = Path(td) / "v.json"
+        logged = []
+        srv = types.SimpleNamespace(
+            version_path=vp,
+            log=types.SimpleNamespace(info=lambda f, *a: logged.append(f % a),
+                                      warning=lambda *a: None,
+                                      exception=lambda *a: None))
+        for m in ("load_installed_version", "save_installed_version",
+                  "record_observed_version"):
+            setattr(srv, m, types.MethodType(getattr(Server, m), srv))
+
+        srv.save_installed_version("paper", "26.2", 124)
+
+        # Paper's REAL startup order: the generic vanilla line first, its own
+        # banner second. The tailer sees one line at a time and cannot look
+        # ahead the way the startup backfill does.
+        srv.record_observed_version(parse_version_line(
+            "[11:51:52] [Server thread/INFO]: Starting minecraft server "
+            "version 26.2"))
+        mid = srv.load_installed_version()
+        check(mid["source"] == "paper" and mid["build"] == 124,
+              "the generic line does NOT downgrade the record to vanilla -- "
+              "a check landing in that window would have polled Mojang and "
+              "offered a jar that replaces Paper")
+        check(not logged, f"and logs nothing spurious ({logged})")
+
+        srv.record_observed_version(parse_version_line(
+            "[11:51:52] [Server thread/INFO]: This server is running Paper "
+            "version 26.2-124-main@abc (x)"))
+        check(srv.load_installed_version()["build"] == 124,
+              "the Paper banner that follows is a no-op (unchanged)")
+
+        # A genuine bump still records, and names both builds.
+        logged.clear()
+        srv.record_observed_version(parse_version_line(
+            "[x] [Server thread/INFO]: This server is running Paper version "
+            "26.2-125-main@abc (y)"))
+        changed = [l for l in logged if "changed" in l]
+        check(changed and "26.2 build 124 -> 26.2 build 125" in changed[0],
+              f"a build-only bump names the builds, not '26.2 -> 26.2' "
+              f"({changed and changed[0][:60]})")
+
+        # A real flavour switch (different version) is still believed.
+        srv.record_observed_version(parse_version_line(
+            "[x] [Server thread/INFO]: Starting minecraft server version 26.3"))
+        check(srv.load_installed_version()["mc_version"] == "26.3",
+              "a build-less observation of a DIFFERENT version is still taken")
+
+
+def test_missing_banner_message_matches_reality():
+    print("missing-banner message:")
+    import core.updates as upd
+    lines = []
+    real = upd.logger.info
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / "latest.log"
+        log.write_text("no banner in here" + chr(10), encoding="utf-8")
+
+        def run(record):
+            lines.clear()
+            srv = types.SimpleNamespace(
+                config=types.SimpleNamespace(edition="java", log_path=log,
+                                             name="world",
+                                             updates_enabled=True),
+                load_installed_version=lambda: record,
+                record_observed_version=lambda p: None)
+            upd.logger.info = lambda f, *a: lines.append(f % a)
+            try:
+                upd.recover_server_version(srv)
+            finally:
+                upd.logger.info = real
+            return lines[0]
+
+        msg = run({"mc_version": "26.2", "build": 124})
+        check("unknown" not in msg,
+              "with a record already on file it does NOT claim the version "
+              "is unknown -- that contradicted the '(installed: 26.2)' the "
+              "very next check printed")
+        check("rotated" in msg, f"it explains the real reason: {msg[-46:]}")
+
+        msg = run({})
+        check("unknown" in msg,
+              "with genuinely no record it still says so")
+
+
 def test_version_detection_from_logs():
     print("version detection from real log lines:")
     from core.logparse import parse_bedrock_version_line, parse_version_line
@@ -883,6 +974,7 @@ def test_missing_baseline_is_logged():
             config=types.SimpleNamespace(edition="bedrock", log_path=log,
                                          name="Square-Friends",
                                          updates_enabled=True),
+            load_installed_version=lambda: {},
             record_observed_version=lambda p: None)
         real = upd.logger.info
         try:
@@ -1293,6 +1385,8 @@ def main():
                test_extract_preserves_exec_bit, test_extract_rejects_bad_zips,
                test_custom_pack_diff, test_bedrock_swap_end_to_end,
                test_chain_is_rebased_not_preserved,
+               test_paper_startup_does_not_record_vanilla,
+               test_missing_banner_message_matches_reality,
                test_version_detection_from_logs,
                test_up_to_date_bedrock_is_quiet,
                test_backup_status_is_not_logged_twice,
