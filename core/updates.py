@@ -10,8 +10,12 @@ rather than inventing a second one.
 Two editions, two very different swaps:
 
   Java     one jar. Copy the cached artifact in beside the live one and
-           ``os.replace`` onto it -- atomic, and the outgoing jar is kept so a
-           bad build can be reverted by hand.
+           ``os.replace`` onto it -- atomic. The outgoing jar is set aside
+           until the relaunch is confirmed and then dropped: it is an undo for
+           an update that failed to come up, NOT a rollback. Once the new
+           server has opened the world it has migrated it, and the old jar may
+           no longer read what it finds (see ``_rebase_backup_chain``), so a
+           genuine rollback is a restore.
   Bedrock  a whole directory. The BDS zip ships server.properties,
            permissions.json and allowlist.json, so unpacking it over an
            install would overwrite the operator's config. Instead it is
@@ -654,7 +658,7 @@ def update_server(server, release, *, say) -> None:
             # never sees it. The server comes up fine, the wait times out,
             # and the retry injects the start command into a console that is
             # now a running server ("Unknown command: cd").
-            server.reattach_log_watch()
+            server.reattach_log_watch(_watch_reason(cfg))
         server.save_installed_version(release.source, release.mc_version,
                                       release.build, filename=release.filename)
         _invalidate_chain(server)
@@ -664,7 +668,7 @@ def update_server(server, release, *, say) -> None:
         server._prepare_relaunch_cwd(cfg.edition == EDITION_BEDROCK)
         if backend.relaunch(say):
             relaunched = True
-            server.reattach_log_watch()
+            server.reattach_log_watch(_watch_reason(cfg))
             reconcile_online(server, reason="after server update")
             _cleanup(server, release, kept, say)
             say(f"Update complete — now running {release.source} "
@@ -689,7 +693,7 @@ def update_server(server, release, *, say) -> None:
                 say("Bringing the server back up...")
                 server._prepare_relaunch_cwd(cfg.edition == EDITION_BEDROCK)
                 if backend.relaunch(say):
-                    server.reattach_log_watch()
+                    server.reattach_log_watch(_watch_reason(cfg))
                     reconcile_online(server, reason="after server update")
                     if installed_ok:
                         # The install already retired the old chain, but the
@@ -760,6 +764,17 @@ def _rebase_backup_chain(server, say, chat=None) -> None:
             "but incremental backups stay suspended until you run /backup.")
 
 
+def _watch_reason(cfg) -> str:
+    """Why the log watch is being rebound, in this edition's terms.
+
+    A Java update replaces one jar and nothing else, so reporting "server dir
+    was replaced" there described a swap that never happened — misleading in
+    a log that exists to be read after the fact.
+    """
+    return ("server dir was replaced" if cfg.edition == EDITION_BEDROCK
+            else "the jar was replaced")
+
+
 def _cleanup(server, release, kept, say) -> None:
     """Drop superseded artifacts once the new version is confirmed running."""
     try:
@@ -769,7 +784,33 @@ def _cleanup(server, release, kept, say) -> None:
     except OSError:
         logger.warning("[%s] Cache prune failed", server.config.name)
     # The Bedrock swap leaves the whole previous server dir aside; the Java
-    # swap only a jar. Both are the rollback path, so they are only dropped
-    # after the relaunch is confirmed.
-    if kept is not None and kept.is_dir():
-        server._discard_old_world(kept)
+    # swap only a jar. Both are the rollback path, so neither is touched until
+    # the relaunch is confirmed.
+    if kept is None:
+        return
+    if kept.is_dir():
+        server._discard_old_world(kept)     # Bedrock: a whole server dir
+        return
+
+    # Java: the outgoing jar goes the same way as Bedrock's set-aside server
+    # dir, and for the same reason. It exists to undo an update that never
+    # came up; once the new server has started it has migrated the world, and
+    # dropping the old jar back in may leave a binary that cannot read the
+    # data files beside it. A rollback is a restore.
+    #
+    # Sweep the whole set, not just this run's: the branch above tested
+    # is_dir(), so a FILE matched nothing and every Java update silently left
+    # its jar in minecraft_dir — the directory the full backup zips. One per
+    # update, in the server dir and in every backup taken after it.
+    base = kept.name.rsplit(".pre-update-", 1)[0]
+    removed = 0
+    for old_jar in sorted(kept.parent.glob(f"{base}.pre-update-*")):
+        try:
+            old_jar.unlink()
+            removed += 1
+        except OSError:
+            logger.warning("[%s] Could not remove %s", server.config.name,
+                           old_jar.name)
+    if removed:
+        say(f"Removed the previous {base} ({removed} file(s)) — roll "
+            f"back with /restore, not by swapping the jar back.")

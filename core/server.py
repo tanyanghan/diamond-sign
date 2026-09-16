@@ -750,7 +750,8 @@ class Server:
             self.log.info("Running final incremental backup before stop")
             threading.Thread(target=self.run_incremental_backup, daemon=True).start()
 
-    def reattach_log_watch(self) -> None:
+    def reattach_log_watch(self,
+                           why: str = "server dir was replaced") -> None:
         """Re-establish the log-directory watch after a restore replaced the
         server directory. A world restore wipes minecraft_dir, which for Java
         deletes the logs/ dir that inotify was watching — so the observer keeps
@@ -773,8 +774,7 @@ class Server:
             if old is not None:
                 old.stop()
                 old.join()
-            self.log.info("Re-attached log watch on %s (server dir was replaced)",
-                          log_dir)
+            self.log.info("Re-attached log watch on %s (%s)", log_dir, why)
         except Exception:
             self.log.exception("Failed to re-attach log watch after restore")
 

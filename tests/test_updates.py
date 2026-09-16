@@ -963,7 +963,7 @@ def test_chain_rebased_after_a_recovered_relaunch():
         save_manifest=lambda *a, **k: order.append("invalidate"),
         chain_marker_path=Path("/nonexistent/.diamondsign_chain"),
         run_backup=lambda status_cb=None, offline=False: None,
-        reattach_log_watch=lambda: None,
+        reattach_log_watch=lambda *a: None,
         _prepare_relaunch_cwd=lambda staged: None,
         _discard_old_world=lambda p: None,
         log=types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None,
@@ -1078,7 +1078,7 @@ def test_watcher_rebound_before_relaunch():
         save_manifest=lambda *a, **k: None,
         chain_marker_path=Path("/nonexistent/.diamondsign_chain"),
         run_backup=lambda status_cb=None, offline=False: None,
-        reattach_log_watch=lambda: order.append("reattach"),
+        reattach_log_watch=lambda *a: order.append("reattach"),
         _prepare_relaunch_cwd=lambda staged: None,
         _discard_old_world=lambda p: None,
         log=types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None,
@@ -1482,6 +1482,57 @@ def test_update_comparison():
           "unknown installed version is not claimed to be a major jump")
 
 
+def test_cleanup_drops_every_set_aside_jar():
+    print("Java rollback jars:")
+    with tempfile.TemporaryDirectory() as td:
+        mc = Path(td)
+        (mc / "server.jar").write_text("build 124")
+        olds = []
+        for ts in ("20260101_010101", "20260202_020202", "20260303_030303"):
+            p = mc / f"server.jar.pre-update-{ts}"
+            p.write_text(ts)
+            olds.append(p)
+        kept = olds[-1]          # this update's outgoing jar
+
+        said = []
+        srv = types.SimpleNamespace(config=types.SimpleNamespace(name="world"))
+        rel = types.SimpleNamespace(edition="java",
+                                    filename="paper-26.2-124.jar")
+        real = up.mc_versions.prune_cache
+        up.mc_versions.prune_cache = lambda *a, **k: []
+        try:
+            up._cleanup(srv, rel, kept, said.append)
+        finally:
+            up.mc_versions.prune_cache = real
+
+        check(not any(p.exists() for p in olds),
+              "every set-aside jar is gone once the relaunch is confirmed: "
+              "the new server has already migrated the world, so putting the "
+              "old jar back could leave a binary that cannot read the data "
+              "beside it -- a rollback is a restore")
+        check(not list(mc.glob("server.jar.pre-update-*")),
+              "including the ones EARLIER updates left: the branch tested "
+              "is_dir(), so a file matched nothing and one jar per update "
+              "piled up in minecraft_dir -- the directory the full backup "
+              "zips, every time")
+        check((mc / "server.jar").read_text() == "build 124",
+              "the live jar is not touched")
+        check(any("/restore" in m for m in said),
+              f"and the operator is pointed at the real rollback ({said})")
+
+
+def test_watch_reason_matches_the_edition():
+    print("log-watch reason:")
+    java = types.SimpleNamespace(edition="java")
+    bedrock = types.SimpleNamespace(edition=up.EDITION_BEDROCK)
+    check("jar" in up._watch_reason(java)
+          and "dir" not in up._watch_reason(java),
+          "a Java update does not claim the server dir was replaced -- only "
+          "the jar is")
+    check("dir" in up._watch_reason(bedrock),
+          "the Bedrock swap genuinely does replace it")
+
+
 def main():
     for fn in (test_paper, test_paper_falls_back_past_alpha_versions,
                test_vanilla, test_bedrock, test_version_ordering,
@@ -1513,7 +1564,9 @@ def main():
                test_refuses_while_players_online,
                test_pre_update_backup_is_conditional,
                test_java_preflight_refuses_missing_jar,
-               test_update_comparison):
+               test_update_comparison,
+               test_cleanup_drops_every_set_aside_jar,
+               test_watch_reason_matches_the_edition):
         fn()
     print()
     if _failures:
