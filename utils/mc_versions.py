@@ -78,6 +78,19 @@ class ReleaseInfo:
                 and record.get("build") == self.build)
 
 
+def describe_version(record: dict) -> str:
+    """Name an installed-version record: '26.2 build 124', or '26.2'.
+
+    One definition because it was previously written three times and two of
+    them dropped the build — so a log line read "installed: 26.2" for a
+    server whose whole reason to update was that it was on build 123 rather
+    than 124, and a build-only bump logged as "26.2 -> 26.2".
+    """
+    version = record.get("mc_version") or "unknown"
+    build = record.get("build")
+    return f"{version} build {build}" if build else version
+
+
 def version_tuple(v: str) -> tuple:
     """Sortable form of a dotted version ('26.2' -> (26, 2)).
 

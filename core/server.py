@@ -30,6 +30,7 @@ from utils.backup_utils import (
     wait_for_settle,
 )
 from utils.config import backup_exclude_names, EDITION_BEDROCK
+from utils.mc_versions import describe_version
 from utils import restore_core
 
 logger = logging.getLogger("diamondsign")
@@ -38,14 +39,6 @@ logger = logging.getLogger("diamondsign")
 # ---------------------------------------------------------------------------
 # Server runtime object (per-server state)
 # ---------------------------------------------------------------------------
-def _describe_version(record: dict) -> str:
-    """'26.2 build 124' / '1.26.45.1' -- a build-only bump otherwise logs as
-    the meaningless '26.2 -> 26.2'."""
-    version = record.get("mc_version") or "unknown"
-    build = record.get("build")
-    return f"{version} build {build}" if build else version
-
-
 class Server:
     """One Minecraft server's runtime: its config, backend, and per-server
     mutable state (online players, session xuids, pending UUID correlation, and
@@ -234,8 +227,8 @@ class Server:
             return
         if current.get("mc_version"):
             self.log.info("Installed version changed: %s -> %s (the running "
-                          "server says so)", _describe_version(current),
-                          _describe_version(parsed))
+                          "server says so)", describe_version(current),
+                          describe_version(parsed))
         record = {"source": parsed.get("source", ""),
                   "mc_version": parsed.get("mc_version", ""),
                   "build": parsed.get("build"),
