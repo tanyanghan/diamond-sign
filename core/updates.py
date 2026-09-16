@@ -132,11 +132,9 @@ def is_major(release, installed: dict) -> bool:
 
 def describe_update(server, release) -> str:
     installed = server.load_installed_version()
-    current = (installed.get("mc_version") or "unknown")
-    if installed.get("build"):
-        current += f" build {installed['build']}"
     line = (f"{server.config.name}: {release.source} {release.describe()} "
-            f"available (installed: {current}).")
+            f"available (installed: "
+            f"{mc_versions.describe_version(installed)}).")
     if is_major(release, installed):
         line += ("\n⚠️ This changes the Minecraft version. It migrates "
                  "the world format and CANNOT be undone -- the upgraded world "

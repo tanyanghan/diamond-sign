@@ -1110,6 +1110,50 @@ def test_backup_plan_matches_reality():
               "the narrated check agrees with the pure one")
 
 
+def test_installed_version_always_names_the_build():
+    print("installed-version wording:")
+    import types as _t
+    import bot as botmod
+    import core.updates as upd
+
+    check(mv.describe_version({"mc_version": "26.2", "build": 123})
+          == "26.2 build 123", "a Paper record names its build")
+    check(mv.describe_version({"mc_version": "1.26.45.1", "build": None})
+          == "1.26.45.1", "a build-less record is just the version")
+    check(mv.describe_version({}) == "unknown", "an empty record is 'unknown'")
+
+    # The chat message and the log line must agree -- the log used to say
+    # "installed: 26.2" for a server updating FROM build 123 TO 124, which
+    # made the reason for the update invisible.
+    rel = mv.parse_paper_build(PAPER_BUILD, "26.2")          # build 124
+    server = _t.SimpleNamespace(
+        config=_t.SimpleNamespace(name="world_han"),
+        load_installed_version=lambda: {"source": "paper",
+                                        "mc_version": "26.2", "build": 123})
+    chat = upd.describe_update(server, rel)
+    check("installed: 26.2 build 123" in chat,
+          f"chat message names the installed build: {chat[:64]}")
+
+    logged = []
+    real_log, real_fetch, real_prune = (botmod.logger,
+                                        botmod._fetch_shared_artifact,
+                                        botmod.updates.mc_versions.prune_cache)
+    try:
+        botmod.logger = _t.SimpleNamespace(
+            info=lambda fmt, *a: logged.append(fmt % a),
+            warning=lambda *a: None)
+        botmod._fetch_shared_artifact = lambda s, r: True
+        botmod.updates.mc_versions.prune_cache = lambda e, keep: []
+        botmod._announce_update(server, _t.SimpleNamespace(
+            alert_admins=lambda m: None), rel)
+    finally:
+        (botmod.logger, botmod._fetch_shared_artifact,
+         botmod.updates.mc_versions.prune_cache) = (real_log, real_fetch,
+                                                    real_prune)
+    check(any("installed: 26.2 build 123" in l for l in logged),
+          f"and so does the log line: {logged and logged[-1][-52:]}")
+
+
 def test_notification_goes_to_admin_dm_only():
     print("update notification routing:")
     import bot as botmod
@@ -1399,6 +1443,7 @@ def main():
                test_watcher_rebound_before_relaunch,
                test_relaunch_does_not_retry_into_a_live_server,
                test_backup_plan_matches_reality,
+               test_installed_version_always_names_the_build,
                test_notification_goes_to_admin_dm_only,
                test_version_command_both_flavours,
                test_live_version_query,

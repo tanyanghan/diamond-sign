@@ -480,7 +480,7 @@ def _announce_update(server, bot, release) -> None:
     bot.alert_admins(msg)
     logger.info("[%s] Update available: %s %s (installed: %s) \u2014 alerted the admin(s)",
                 server.config.name, release.source, release.describe(),
-                installed.get("mc_version") or "unknown")
+                updates.mc_versions.describe_version(installed))
 
 
 def _start_scheduled_backup(server, bot) -> None:
