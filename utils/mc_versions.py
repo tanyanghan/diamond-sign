@@ -122,17 +122,39 @@ def parse_paper_build(doc: dict, mc_version: str) -> ReleaseInfo | None:
         size=dl.get("size"))
 
 
-def latest_paper(mc_version: str | None = None) -> ReleaseInfo | None:
-    """Newest stable Paper build. Pass ``mc_version`` to stay on that
-    Minecraft version instead of following the newest one."""
+def latest_paper(mc_version: str | None = None, *,
+                 not_older_than: str | None = None) -> ReleaseInfo | None:
+    """Newest STABLE Paper build, or None.
+
+    ``mc_version`` pins the search to one Minecraft version. Otherwise the
+    newest version that actually HAS a stable build wins -- which is not the
+    same as the newest version key. Paper publishes a key as soon as ALPHA
+    builds exist for it, so looking only at the newest one meant reporting
+    "up to date" while the version the server really runs had a newer stable
+    build waiting. Seen in the wild: 26.3's latest build was ALPHA while 26.2
+    had stable build 124, and a server on 26.2 build 121 was told it was
+    current.
+
+    ``not_older_than`` stops the walk before it reaches versions older than
+    the one installed, so the fallback can never offer a downgrade.
+    """
     try:
-        if mc_version is None:
-            versions = parse_paper_versions(fetch_json(PAPER_PROJECT))
-            if not versions:
-                return None
-            mc_version = versions[0]
-        doc = fetch_json(f"{PAPER_PROJECT}/versions/{mc_version}/builds/latest")
-        return parse_paper_build(doc, mc_version)
+        if mc_version is not None:
+            return parse_paper_build(
+                fetch_json(f"{PAPER_PROJECT}/versions/{mc_version}"
+                           "/builds/latest"), mc_version)
+        floor = version_tuple(not_older_than) if not_older_than else None
+        for candidate in parse_paper_versions(fetch_json(PAPER_PROJECT)):
+            if floor is not None and version_tuple(candidate) < floor:
+                break       # sorted newest-first, so nothing below is newer
+            release = parse_paper_build(
+                fetch_json(f"{PAPER_PROJECT}/versions/{candidate}"
+                           "/builds/latest"), candidate)
+            if release is not None:
+                return release
+            logger.info("Paper %s has no stable build yet; looking further "
+                        "back", candidate)
+        return None
     except DownloadError as e:
         logger.warning("Paper version check failed: %s", e)
         return None
