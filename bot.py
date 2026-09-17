@@ -377,6 +377,19 @@ _UPDATE_CHECK_INTERVAL = 6 * 60 * 60
 # startup, with downloads already serialised behind their own lock.
 _UPDATE_FIRST_CHECK_DELAY = 3
 _UPDATE_CHECK_STAGGER = 2
+
+# A version change wakes the check early; this lets the restore (or whatever
+# else swapped the binary) finish first, and absorbs the second banner line
+# Paper prints, so one change costs one check rather than two.
+#
+# On a server with no edition.flavor set it is also a correctness backstop.
+# A restore forgets the recorded version, so a Paper server whose flavour is
+# not declared records the generic "Starting minecraft server version X" line
+# as vanilla until its own banner corrects it a line later, and the check
+# falls back to that record when there is no flavour to go on. Where the
+# flavour IS declared, record_observed_version refuses the contradicting line
+# outright and this delay is only about noise.
+_UPDATE_RECHECK_SETTLE = 10
 _update_check_slot = itertools.count()
 
 
@@ -396,6 +409,9 @@ def _start_update_check(server, bot) -> None:
         time.sleep(_UPDATE_FIRST_CHECK_DELAY
                    + _UPDATE_CHECK_STAGGER * next(_update_check_slot))
         while True:
+            # Cleared BEFORE the check, so a change arriving while it runs
+            # wakes the next wait instead of being swallowed by it.
+            server.version_changed.clear()
             try:
                 release = updates.available_update(server)
                 if release is not None:
@@ -407,7 +423,19 @@ def _start_update_check(server, bot) -> None:
                                  server.config.name)
             logger.info("[%s] Next version check in %d seconds",
                         server.config.name, _UPDATE_CHECK_INTERVAL)
-            time.sleep(_UPDATE_CHECK_INTERVAL)
+            if server.version_changed.wait(_UPDATE_CHECK_INTERVAL):
+                # A restore rolls the binary back to whatever the backup held,
+                # which can be older than what is available — exactly when an
+                # update is worth offering, and exactly when the poll is least
+                # likely to be due. Waiting out the remaining six hours left
+                # the server on a superseded build with nothing said.
+                time.sleep(_UPDATE_RECHECK_SETTLE)
+                # Absorb anything the settle window caught (Paper's second
+                # banner line), so one restart costs one check. A change
+                # arriving later still lands on the clear at the top.
+                server.version_changed.clear()
+                logger.info("[%s] Installed version changed — checking for "
+                            "updates now", server.config.name)
 
     threading.Thread(target=_loop, daemon=True,
                      name=f"update-check-{server.config.key}").start()

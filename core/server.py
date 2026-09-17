@@ -56,6 +56,13 @@ class Server:
         self.data_dir = config.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+        # Set whenever the running server turns out to be a different build
+        # from the one on record. A restore rewrites the binary from a backup,
+        # so the answer to "is there a newer version?" changes at a moment the
+        # six-hourly poll knows nothing about; the update check waits on this
+        # instead of sleeping straight through it.
+        self.version_changed = threading.Event()
+
         self.online_players: set = set()
         self.online_lock = threading.Lock()
         # Serializes reconcile_online passes for this server (a /status and an
@@ -212,6 +219,22 @@ class Server:
         if (current.get("mc_version") == parsed.get("mc_version")
                 and current.get("build") == parsed.get("build")):
             return      # unchanged since the last restart
+        flavor = getattr(self.config, "java_flavor", "")
+        if (parsed.get("build") is None and flavor
+                and self.config.edition != EDITION_BEDROCK
+                and parsed.get("source") != flavor):
+            # The operator has DECLARED what this server runs, and a build-less
+            # line cannot contradict it: "Starting minecraft server version X"
+            # is printed by Paper as well as by vanilla, so it identifies the
+            # Minecraft version and nothing else. available_update() already
+            # treats edition.flavor as the authority over anything the record
+            # says; letting the record disagree with it in the meantime only
+            # creates a window in which the two answer differently.
+            #
+            # This is the guard that survives a world restore, which forgets
+            # the record entirely -- leaving the check below nothing to
+            # compare against just as the ambiguous line arrives.
+            return
         if (parsed.get("build") is None and current.get("build") is not None
                 and current.get("mc_version") == parsed.get("mc_version")):
             # Paper prints vanilla's "Starting minecraft server version X"
@@ -241,6 +264,10 @@ class Server:
             self.log.info("Detected server version: %s %s%s",
                           record["software"], record["mc_version"],
                           f" build {record['build']}" if record["build"] else "")
+            # What is installed just changed, so whatever the last version
+            # check concluded is now stale. Wake it rather than leave the
+            # server sitting on a superseded build until the next poll.
+            self.version_changed.set()
         except OSError:
             self.log.exception("Failed to write installed_version.json")
 
