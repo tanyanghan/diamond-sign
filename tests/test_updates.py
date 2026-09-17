@@ -300,6 +300,7 @@ def test_prune():
 import os
 import stat
 import types
+import threading as _threading
 import json as _json
 import zipfile as _zf
 
@@ -635,6 +636,9 @@ def test_paper_startup_does_not_record_vanilla():
         logged = []
         srv = types.SimpleNamespace(
             version_path=vp,
+            version_changed=_threading.Event(),
+            config=types.SimpleNamespace(java_flavor="",
+                                         edition="java"),
             log=types.SimpleNamespace(info=lambda f, *a: logged.append(f % a),
                                       warning=lambda *a: None,
                                       exception=lambda *a: None))
@@ -889,6 +893,7 @@ def test_restore_downgrade_is_noticed():
         log.write_text(banner + chr(10), encoding="utf-8")
         srv = types.SimpleNamespace(
             version_path=vp,
+            version_changed=_threading.Event(),
             config=types.SimpleNamespace(edition="bedrock", log_path=log,
                                          name="XPS-Bedrock",
                                          updates_enabled=True),
@@ -1533,6 +1538,108 @@ def test_watch_reason_matches_the_edition():
           "the Bedrock swap genuinely does replace it")
 
 
+def test_version_change_wakes_the_check():
+    print("re-check after the binary changes:")
+    import threading
+    import time as _time
+    from core.server import Server
+    from core.logparse import parse_version_line
+    import bot as botmod
+
+    # 1. The record itself signals when, and only when, something changed.
+    with tempfile.TemporaryDirectory() as td:
+        srv = types.SimpleNamespace(
+            version_path=Path(td) / "v.json",
+            version_changed=threading.Event(),
+            config=types.SimpleNamespace(java_flavor="",
+                                         edition="java"),
+            log=types.SimpleNamespace(info=lambda *a: None,
+                                      warning=lambda *a: None,
+                                      exception=lambda *a: None))
+        for m in ("load_installed_version", "save_installed_version",
+                  "record_observed_version"):
+            setattr(srv, m, types.MethodType(getattr(Server, m), srv))
+
+        srv.save_installed_version("paper", "26.2", 124)
+        srv.version_changed.clear()
+
+        paper_123 = ("[x] [Server thread/INFO]: This server is running Paper "
+                     "version 26.2-123-main@abc (y)")
+        srv.record_observed_version(parse_version_line(paper_123))
+        check(srv.version_changed.is_set(),
+              "a restore that rolls the binary back to build 123 signals the "
+              "version check -- it used to just update the file and sit on a "
+              "superseded build until the six-hourly poll came round")
+
+        srv.version_changed.clear()
+        srv.record_observed_version(parse_version_line(paper_123))
+        check(not srv.version_changed.is_set(),
+              "the same banner on an ordinary restart signals nothing (it "
+              "reappears every start; waking on it would poll on every boot)")
+
+        # A restore FORGETS the record, so the guard that needs an existing
+        # build has nothing to work with. The declared flavour still does.
+        vanilla_line = ("[x] [Server thread/INFO]: Starting minecraft server "
+                        "version 26.2")
+        srv.forget_installed_version = types.MethodType(
+            Server.forget_installed_version, srv)
+        srv.config.java_flavor = "paper"
+        srv.forget_installed_version()
+        srv.record_observed_version(parse_version_line(vanilla_line))
+        check(srv.load_installed_version() == {},
+              "with edition.flavor=paper the generic line is refused even "
+              "with NOTHING on record -- Paper prints that line too, so it "
+              "names the Minecraft version and nothing else, and the operator "
+              "has already said what this server runs")
+
+        srv.record_observed_version(parse_version_line(paper_123))
+        check(srv.load_installed_version().get("build") == 123,
+              "and Paper's own banner, a line later, is taken normally")
+
+        # Declared vanilla: the same line is the real thing, so it is kept.
+        srv.config.java_flavor = "vanilla"
+        srv.forget_installed_version()
+        srv.record_observed_version(parse_version_line(vanilla_line))
+        check(srv.load_installed_version().get("mc_version") == "26.2",
+              "a genuinely vanilla server still records its own banner")
+
+    # 2. The loop actually acts on it instead of sleeping through.
+    checks = []
+    real_available = botmod.updates.available_update
+    saved = (botmod._UPDATE_FIRST_CHECK_DELAY, botmod._UPDATE_CHECK_STAGGER,
+             botmod._UPDATE_RECHECK_SETTLE, botmod._UPDATE_CHECK_INTERVAL)
+    botmod.updates.available_update = lambda s: checks.append(1) and None
+    botmod._UPDATE_FIRST_CHECK_DELAY = 0
+    botmod._UPDATE_CHECK_STAGGER = 0
+    botmod._UPDATE_RECHECK_SETTLE = 0
+    botmod._UPDATE_CHECK_INTERVAL = 300      # would never fire again in time
+    try:
+        server = types.SimpleNamespace(
+            version_changed=threading.Event(),
+            config=types.SimpleNamespace(name="world", key="world",
+                                         updates_enabled=True))
+        botmod._start_update_check(server, object())
+
+        def wait_for(n, limit=3.0):
+            end = _time.monotonic() + limit
+            while _time.monotonic() < end:
+                if len(checks) >= n:
+                    return True
+                _time.sleep(0.02)
+            return False
+
+        check(wait_for(1), "the first check runs")
+        server.version_changed.set()
+        check(wait_for(2),
+              "and a version change triggers another within seconds, despite "
+              "a 300s interval -- the whole point, since a restore is exactly "
+              "when the poll is least likely to be due")
+    finally:
+        botmod.updates.available_update = real_available
+        (botmod._UPDATE_FIRST_CHECK_DELAY, botmod._UPDATE_CHECK_STAGGER,
+         botmod._UPDATE_RECHECK_SETTLE, botmod._UPDATE_CHECK_INTERVAL) = saved
+
+
 def main():
     for fn in (test_paper, test_paper_falls_back_past_alpha_versions,
                test_vanilla, test_bedrock, test_version_ordering,
@@ -1565,6 +1672,7 @@ def main():
                test_pre_update_backup_is_conditional,
                test_java_preflight_refuses_missing_jar,
                test_update_comparison,
+               test_version_change_wakes_the_check,
                test_cleanup_drops_every_set_aside_jar,
                test_watch_reason_matches_the_edition):
         fn()
