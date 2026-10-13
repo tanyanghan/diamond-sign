@@ -728,8 +728,18 @@ class Server:
 
     def _incremental_cycle(self):
         """Run one incremental backup, then reschedule if the cycle is still
-        active."""
+        active.
+
+        The cycle is stopped by a parsed leave line, so a missed one (e.g. a
+        server update changing the log format) would leave it running forever.
+        Ask the server who is actually online first: reconcile_online stops the
+        cycle itself (with a final backup) when nobody is. Java only — Bedrock's
+        query types ``list`` into the console. A failed query (None) changes
+        nothing."""
         try:
+            if (self.config.edition != EDITION_BEDROCK
+                    and reconcile_online(self, reason="incremental cycle") == []):
+                return
             self.run_incremental_backup()
         finally:
             with self.incr_lock:

@@ -15,11 +15,19 @@ from datetime import datetime
 from core.state import register_player
 from utils.config import EDITION_BEDROCK
 
-RE_JOIN = re.compile(r'^\[[\d:]+\] \[Server thread/INFO\]: (\w+) joined the game')
-RE_LEAVE = re.compile(r'^\[[\d:]+\] \[Server thread/INFO\]: (\w+) left the game')
+# Paper 26.3+ prefixes server-broadcast lines (join/leave/advancement/death)
+# with "System chat: "; older versions and vanilla print the bare message:
+#
+#   26.2  [01:47:20] [Server thread/INFO]: Steve joined the game
+#   26.3  [09:59:45] [Server thread/INFO]: System chat: Steve joined the game
+#
+# Optional, so both shapes parse. Player chat and the UUID line are unchanged.
+_SYS = r'(?:System chat: )?'
+RE_JOIN = re.compile(r'^\[[\d:]+\] \[Server thread/INFO\]: ' + _SYS + r'(\w+) joined the game')
+RE_LEAVE = re.compile(r'^\[[\d:]+\] \[Server thread/INFO\]: ' + _SYS + r'(\w+) left the game')
 RE_UUID = re.compile(r'^\[[\d:]+\] \[User Authenticator #\d+/INFO\]: UUID of player (\w+) is ([0-9a-f-]+)')
 RE_ACHIEVEMENT = re.compile(
-    r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) has '
+    r'^\[([\d:]+)\] \[Server thread/INFO\]: ' + _SYS + r'(\w+) has '
     r'(made the advancement|reached the goal|completed the challenge) '
     r'\[(.+?)\]'
 )
@@ -30,7 +38,7 @@ ACH_TYPE_MAP = {
 }
 ACH_VERB_MAP = {v: k for k, v in ACH_TYPE_MAP.items()}
 
-RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: (\w+) (.+)$')
+RE_SERVER_MSG = re.compile(r'^\[([\d:]+)\] \[Server thread/INFO\]: ' + _SYS + r'(\w+) (.+)$')
 # Player chat, e.g. "[12:34:56] [Server thread/INFO]: <Steve> hello" (or a
 # Paper-style "[Async Chat Thread - #0/INFO]:"). The <> brackets distinguish it
 # from join/leave/death lines (which start with a bare \w name).
