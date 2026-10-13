@@ -24,7 +24,7 @@ from core.state import (
 )
 from core.presence import reconcile_online
 from core.logparse import (
-    categorize_death, DEATH_CATEGORIES, DEATH_PHRASES, ACH_TYPE_MAP,
+    death_cause, DEATH_PHRASES, ACH_TYPE_MAP,
     RE_UUID, RE_ACHIEVEMENT, RE_SERVER_MSG,
 )
 
@@ -110,6 +110,32 @@ def _scan_log_for_deaths(file_path: Path, date_str: str, server) -> int:
                     else:
                         server.log.warning("Scan: no UUID for player %s, skipping death", player)
     return count
+
+
+def _format_death_summary(deaths: dict, names: dict) -> str:
+    """Render /death_summary: deaths grouped by what killed the player (most
+    frequent cause first, "Other" last), each listed with player and time."""
+    causes = {}
+    for uuid, entries in deaths.items():
+        player_name = names.get(uuid, uuid)
+        for e in entries:
+            causes.setdefault(death_cause(e["message"]), []).append(
+                (e["timestamp"], player_name))
+    total = sum(len(v) for v in causes.values())
+    lines = [f"Death Summary ({total} total)", ""]
+    for cause, entries in sorted(
+            causes.items(),
+            key=lambda x: (x[0] == "Other", -len(x[1]), x[0].lower())):
+        lines.append(f"{cause}: {len(entries)}")
+        for timestamp, player_name in sorted(entries):
+            date_part, _, time_part = timestamp.partition(" ")
+            try:
+                date_part = datetime.strptime(date_part, "%Y-%m-%d").strftime("%d-%b-%Y")
+            except ValueError:
+                pass
+            lines.append(f"  {player_name} ({date_part} {time_part})")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _scan_logs(scan_fn, server) -> int:
@@ -582,32 +608,7 @@ def register_commands(router, auth: dict) -> None:
         if not deaths:
             ctx.reply("No deaths recorded yet.")
             return
-        categories = {}
-        grand_total = 0
-        for uuid, entries in deaths.items():
-            player_name = names.get(uuid, uuid)
-            for e in entries:
-                cat = categorize_death(e["message"])
-                counts = categories.setdefault(cat, {})
-                counts[player_name] = counts.get(player_name, 0) + 1
-                grand_total += 1
-        lines = [f"Death Summary ({grand_total} total)", ""]
-        ordered = [cat for cat, _ in DEATH_CATEGORIES]
-        for cat in ordered:
-            if cat not in categories:
-                continue
-            counts = categories.pop(cat)
-            lines.append(f"{cat}: {sum(counts.values())}")
-            for player_name, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
-                lines.append(f"  {player_name:<16} {count}")
-            lines.append("")
-        if "Other" in categories:
-            counts = categories["Other"]
-            lines.append(f"Other: {sum(counts.values())}")
-            for player_name, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
-                lines.append(f"  {player_name:<16} {count}")
-            lines.append("")
-        ctx.reply("\n".join(lines).rstrip(), monospace=True)
+        ctx.reply(_format_death_summary(deaths, names), monospace=True)
     router.register("death_summary", cmd_death_summary,
                     cap=lambda ctx: ctx.server.backend.supports(EVENT_DEATH),
                     cap_message="Deaths are not tracked on this server edition.")

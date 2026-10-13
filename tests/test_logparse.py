@@ -121,6 +121,28 @@ def test_chat_and_non_events():
               and not srv.online, f"no event: {line[34:74]}")
 
 
+def test_death_cause():
+    print("death cause")
+    for message, cause in (
+        ("was slain by Iron Golem", "Iron Golem"),
+        ("was shot by Skeleton", "Skeleton"),
+        ("was shot by Skeleton using [Bow]", "Skeleton"),
+        ("was blown up by Creeper", "Creeper"),
+        ("was killed by Witch using magic", "Witch"),
+        ("was killed by magic", "Magic"),
+        ("was killed by even more magic", "Magic"),
+        ("was slain by Kamion_of_Riva using [Diamond Sword]", "Kamion_of_Riva"),
+        ("tried to swim in lava", "Lava"),
+        ("tried to swim in lava to escape Zombie", "Lava"),
+        ("fell from a high place", "Falls"),
+        ("drowned", "Drowning"),
+        ("was slain", "Other"),
+        ("did something unheard of", "Other"),
+    ):
+        got = logparse.death_cause(message)
+        check(got == cause, f"{message!r} -> {cause} (got {got})")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

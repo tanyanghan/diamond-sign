@@ -211,6 +211,29 @@ def categorize_death(message: str) -> str:
     return "Other"
 
 
+# Death phrases that name the killer: "was slain by Iron Golem", "was shot by
+# Skeleton using [Bow]", "was killed by Witch using magic".
+_KILLER_PHRASES = (
+    "was slain by ", "was shot by ", "was blown up by ", "was fireballed by ",
+    "was pummeled by ", "was stung to death by ", "was impaled by ",
+    "was killed by ",
+)
+
+
+def death_cause(message: str) -> str:
+    """What killed the player, for /death_summary: the killer when the message
+    names one ("Iron Golem"), else the ``categorize_death`` label ("Lava")."""
+    category = categorize_death(message)
+    if category == "Magic":  # "was killed by magic" names no killer
+        return category
+    for phrase in _KILLER_PHRASES:
+        if message.startswith(phrase):
+            killer = message[len(phrase):].split(" using ", 1)[0].strip()
+            if killer:
+                return killer
+    return category
+
+
 # The name->uuid pending map lives on the Server (server.pending_uuids).
 
 

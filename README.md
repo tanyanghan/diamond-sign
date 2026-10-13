@@ -462,7 +462,7 @@ its pause state.
 | `/playtime` | Playtime leaderboard |
 | `/achievements [player]` | Show player achievements with timestamps |
 | `/deaths [player]` | Show death history |
-| `/death_summary` | Deaths grouped by cause with per-player counts |
+| `/death_summary` | Deaths grouped by cause (the killer, e.g. `Iron Golem`, or `Lava`, `Falls`, …), listing each death with player and time |
 | `/chat_id` | Show the current chat's ID |
 | `/use [<server>]` | *(Admin)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only) |
 | `/chats` | *(Admin)* List authorised chats, numbered (name + bound server + pause state) |
