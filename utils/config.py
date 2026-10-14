@@ -265,6 +265,9 @@ def validate_config(app: AppConfig) -> list:
 
     seen_bots = set()
     seen_keys = {}
+    # (rcon_host, rcon_port) -> server name. Both default, so two Java servers
+    # that simply omit edition.rcon.port share localhost:25575 without a word.
+    seen_rcon = {}
     for bi, bot in enumerate(app.bots):
         blabel = bot.name or f"bot[{bi}]"
         if not bot.name:
@@ -307,6 +310,31 @@ def validate_config(app: AppConfig) -> list:
                     f"{slabel}: chat_relay needs edition.bedrock_script_events = "
                     "true on Bedrock (chat is relayed through the behavior pack's "
                     "script events). Enable script events, or turn chat_relay off.")
+            # Two Java servers cannot share one RCON endpoint. It is not
+            # merely ambiguous: is_online() is a bare TCP connect to this
+            # host:port, so whichever server actually holds the port answers
+            # for BOTH -- a stopped server reports itself online as soon as the
+            # other one starts. send_command() goes to the same address, so
+            # /seed, /list, /stats and the backup's save-off/save-all for one
+            # server are executed against the other; a backup can then zip an
+            # unfrozen world while flushing somebody else's.
+            #
+            # Checked regardless of rcon.password: the liveness connect does
+            # not authenticate, so the conflation happens even where RCON is
+            # otherwise unused.
+            if s.edition == EDITION_JAVA:
+                endpoint = (s.rcon_host, s.rcon_port)
+                if endpoint in seen_rcon:
+                    problems.append(
+                        f"{slabel}: RCON endpoint {s.rcon_host}:{s.rcon_port} "
+                        f"is already used by '{seen_rcon[endpoint]}' — two Java "
+                        "servers cannot share one. Each would report the "
+                        "other's liveness, and RCON commands for one would run "
+                        "on the other. Set edition.rcon.port per server to "
+                        "match the rcon.port in that server's "
+                        "server.properties.")
+                else:
+                    seen_rcon[endpoint] = s.name
             if not s.name:
                 problems.append(f"{slabel}: could not determine a server name; "
                                 "set \"name\"")
@@ -466,7 +494,8 @@ _EXAMPLE_DOC = {
                 {
                     "name": "survival",
                     "edition": {"type": "java",
-                                "rcon": {"password": "your_rcon_password"}},
+                                "rcon": {"password": "your_rcon_password",
+                                         "port": 25575}},
                     "minecraft_dir": "/path/to/your/server",
                     "chat_relay": True,   # relay in-game chat to the chat platform(s)
                     "backup": {"dir": "~/minecraft_backup", "schedule": "daily",

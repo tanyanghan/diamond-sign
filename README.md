@@ -311,6 +311,10 @@ The bot drives a Java server over **RCON** (used for backups, `/list`,
 2. Restart the server.
 3. Set the same password in the server's `edition.rcon.password` (and
    `edition.rcon.port`/`edition.rcon.host` if not the defaults).
+   With more than one Java server, set `edition.rcon.port` on **each**:
+   they all default to `25575`, and two servers sharing an RCON endpoint
+   makes each answer for the other's liveness and sends each one's
+   commands to the other. Diamond Sign refuses to start on that.
 
 To also use **`/restore` and `/start`** (whole-world restore / bring-up), Java
 needs a way to *restart* the JVM — RCON can stop it but can't relaunch it. Run the
