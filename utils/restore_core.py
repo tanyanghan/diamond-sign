@@ -103,18 +103,24 @@ def scan_backups(backup_dir: Path, server_name: str | None = None) -> tuple:
         if m:
             if name_mismatch(f, m.group(1)):
                 continue
+            st = f.stat()
             incrs.append({
                 "path": f, "server": m.group(1), "chain_id": m.group(2),
-                "timestamp": m.group(3), "size": f.stat().st_size,
+                "timestamp": m.group(3), "size": st.st_size,
+                # When the file was WRITTEN, which is not what its name says:
+                # a restore's merged incremental is named after the restore
+                # POINT. See group_by_chain's sort_key.
+                "mtime": st.st_mtime,
             })
             continue
         m = RE_FULL.match(f.name)
         if m:
             if name_mismatch(f, m.group(1)):
                 continue
+            st = f.stat()
             fulls[f.name] = {
                 "path": f, "server": m.group(1), "timestamp": m.group(2),
-                "size": f.stat().st_size,
+                "size": st.st_size, "mtime": st.st_mtime,
             }
     return fulls, incrs
 
@@ -164,15 +170,25 @@ def group_by_chain(fulls: dict, incrs: list) -> list:
         # Two chains can share the same base full (a merged-incremental
         # restore keeps riding on the original full instead of cutting a new
         # one), tying the primary key — so the tie-break must reflect which
-        # chain is more CURRENT. chain_incrs[-1] (latest, since already
-        # sorted ascending) is the chain's most recent activity; chain_incrs
-        # [0] (earliest/chain-start) was used previously and is wrong — a
-        # chain that merely started a few minutes later than another, but
-        # then went stale while the other kept taking real incrementals for
-        # hours, sorted as "newer" and displayed above the actually-current
-        # chain in /restore.
+        # chain is more CURRENT.
+        #
+        # The tie-break is the newest member's MTIME, not the timestamp in its
+        # name. A restore's merged incremental is named after the restore
+        # POINT, so the chain a restore has just created carries whatever
+        # timestamp the operator restored TO: restoring to an 11:20 point at
+        # 11:24 produced a brand-new chain whose latest member read "11:20",
+        # which sorted it BELOW the stale chain it had just replaced, and
+        # /restore then listed the superseded chain first under a header that
+        # promises "latest first". The mtime says 11:24, which is when the
+        # chain actually became current.
+        #
+        # (chain_incrs[0], the chain's start, was used before [-1] and was
+        # wrong for a different reason: a chain that merely started later than
+        # another, then went stale while the other kept taking real
+        # incrementals for hours, still sorted as "newer".)
         ts = c["full"]["timestamp"]
-        return (ts, c["incrementals"][-1]["timestamp"] if c["incrementals"] else "")
+        newest = c["incrementals"][-1] if c["incrementals"] else c["full"]
+        return (ts, newest.get("mtime", 0.0))
 
     chains.sort(key=sort_key)
     return chains
@@ -248,6 +264,10 @@ def list_restore_points(chains: list) -> list:
                 "size": incr["size"], "pretty_size": format_size(incr["size"]),
                 "chain_id": chain["chain_id"], "chain_idx": ci, "point_idx": ii,
                 "base_full": full["path"].name,
+                # The point's own zip. chain_idx/point_idx are positions in a
+                # list rebuilt from the backup directory, so they shift the
+                # moment a backup is added or pruned; the filename does not.
+                "file": incr["path"].name,
             })
             n += 1
         points.append({
@@ -255,10 +275,40 @@ def list_restore_points(chains: list) -> list:
             "pretty_ts": parse_timestamp(full["timestamp"]),
             "size": full["size"], "pretty_size": format_size(full["size"]),
             "chain_id": chain["chain_id"], "chain_idx": ci, "point_idx": -1,
-            "base_full": full["path"].name,
+            "base_full": full["path"].name, "file": full["path"].name,
         })
         n += 1
     return points
+
+
+def locate_point(chains: list, point: dict):
+    """Find the chain and point index for a point described by a PAST listing.
+
+    ``/restore <n>`` happens seconds or minutes after the list was printed, and
+    the backup directory keeps moving in between — an incremental lands every
+    few minutes while players are online. Re-deriving the list and indexing it
+    by ``n`` therefore resolves the number against a DIFFERENT list than the
+    operator read: in the wild, a listing at 11:30:43 was followed by a new
+    incremental at 11:30:46, and the selection at 11:31:37 landed three rows
+    away from the row the operator had chosen.
+
+    So points are matched by identity (chain id + filename), never by position.
+    Returns ``(chain, point_idx)``, or ``None`` if that backup is no longer
+    there — pruned, renamed, or quarantined since the list was printed.
+    """
+    want_file = point.get("file")
+    want_chain = point.get("chain_id")
+    for chain in chains:
+        if chain["chain_id"] != want_chain:
+            continue
+        if point.get("kind") == "FULL":
+            if chain["full"]["path"].name == want_file:
+                return chain, -1
+            continue
+        for idx, incr in enumerate(chain["incrementals"]):
+            if incr["path"].name == want_file:
+                return chain, idx
+    return None
 
 
 # ---------------------------------------------------------------------------

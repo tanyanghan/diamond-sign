@@ -905,16 +905,26 @@ def register_commands(router, auth: dict) -> None:
                                              server_name))
 
         # Bare /restore or "/restore more": (re)show the paged list.
+        #
+        # The list is SNAPSHOT here and every later step reads that snapshot.
+        # Re-deriving it per command used to renumber the rows underneath the
+        # operator: an incremental lands every few minutes while players are
+        # online, and one that arrived 3 seconds after a listing moved the
+        # chosen row three places by the time the selection came in. Paging
+        # reads the snapshot too, so page 2 continues page 1 rather than
+        # describing a directory that has moved on.
         if sub is None or sub.lower() == "more":
-            points = discover()
             if sub is None:
+                points = discover()
                 offset = 0
-                _set_pending_world_restore(pkey, stage="listed", offset=0)
+                _set_pending_world_restore(pkey, stage="listed", offset=0,
+                                           points=points)
             else:
                 entry = _get_pending_world_restore(pkey)
-                if entry is None:
+                if entry is None or entry.get("points") is None:
                     ctx.reply("Send /restore first to see the list.")
                     return
+                points = entry["points"]
                 offset = entry.get("offset", 0) + _RESTORE_PAGE_SIZE
                 if offset >= len(points):
                     ctx.reply("No more restore points.")
@@ -932,13 +942,34 @@ def register_commands(router, auth: dict) -> None:
             ctx.reply("Usage: /restore  |  /restore <N>  |  /restore <N> confirm")
             return
         confirm = len(ctx.args) >= 2 and ctx.args[1].lower() == "confirm"
-        points = discover()
+
+        # n is an index into the list the operator was SHOWN, which is the
+        # only list they could have counted rows in.
+        listing = _get_pending_world_restore(pkey)
+        points = (listing or {}).get("points")
+        if not points:
+            ctx.reply("Send /restore first to see the list, then /restore "
+                      f"{n}. (The numbering belongs to a specific listing — "
+                      "backups are added and pruned, so a number from an "
+                      "older list can mean a different point.)")
+            return
         if not (1 <= n <= len(points)):
             ctx.reply(f"Invalid selection: {n}. Choose 1-{len(points)}.")
             return
         point = points[n - 1]
+
+        # Match the remembered row to a backup that is still on disk, by
+        # identity rather than by position.
         chains = restore_core.discover_chains(server.config.backup_dir,
                                               server_name)
+        found = restore_core.locate_point(chains, point)
+        if found is None:
+            ctx.reply(f"Point {n} ([{point['kind']}] {point['pretty_ts']}) is "
+                      f"no longer in the backup directory — {point.get('file')} "
+                      "has been pruned, renamed or quarantined since that list "
+                      "was printed.\nSend /restore for a fresh list.")
+            return
+        chain, point_idx = found
 
         if not confirm:
             # Check every zip this point needs BEFORE offering the confirm
@@ -952,8 +983,7 @@ def register_commands(router, auth: dict) -> None:
             # is a long time to leave /restore <N> unanswered. Nothing is lost
             # by deferring it: the restore extracts before touching the world
             # and zipfile raises BadZipFile: Bad CRC-32 on any bad entry.
-            problems = restore_core.validate_chain_structure(
-                chains[point["chain_idx"]], point["point_idx"])
+            problems = restore_core.validate_chain_structure(chain, point_idx)
             if problems:
                 server.log.warning("Restore: point %d unusable: %s",
                                    n, "; ".join(problems))
@@ -961,7 +991,9 @@ def register_commands(router, auth: dict) -> None:
                           "file(s):\n  " + "\n  ".join(problems)
                           + "\nChoose another restore point.")
                 return
-            _set_pending_world_restore(pkey, stage="selected", selected_n=n)
+            _set_pending_world_restore(pkey, stage="selected",
+                                       selected_n=n,
+                                       selected_point=point)
             server.log.info("Restore: [%s] on [%s] selected point %d ([%s] %s)",
                             ctx.sender_label, ctx.chat_label, n,
                             point["kind"], point["pretty_ts"])
@@ -984,6 +1016,18 @@ def register_commands(router, auth: dict) -> None:
         if entry is None or entry.get("selected_n") != n:
             ctx.reply(f"Select first: /restore {n}")
             return
+        # Restore what the confirm prompt named. Re-resolving n here read the
+        # directory a third time, so a backup arriving between the prompt and
+        # the confirmation could restore a point the operator was never shown.
+        point = entry.get("selected_point", point)
+        found = restore_core.locate_point(chains, point)
+        if found is None:
+            _clear_pending_world_restore(pkey)
+            ctx.reply(f"[{point['kind']}] {point['pretty_ts']} is no longer in "
+                      f"the backup directory ({point.get('file')}). Nothing "
+                      "was touched — send /restore for a fresh list.")
+            return
+        chain, point_idx = found
         _clear_pending_world_restore(pkey)
         server.log.info("Restore: [%s] on [%s] confirmed world restore to %s (%s)",
                         ctx.sender_label, ctx.chat_label,
@@ -1001,8 +1045,7 @@ def register_commands(router, auth: dict) -> None:
                 say("A backup or restore is already in progress.")
                 return
             try:
-                server.restore_world(chains[point["chain_idx"]],
-                                     point["point_idx"], say=say)
+                server.restore_world(chain, point_idx, say=say)
             finally:
                 server.backup_lock.release()
 
