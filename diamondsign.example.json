@@ -39,7 +39,7 @@
           "name": "creative",
           "edition": {
             "type": "java",
-            "rcon": { "password": "your_rcon_password" }
+            "rcon": { "password": "your_rcon_password", "port": 25576 }
           },
           "minecraft_dir": "/srv/creative",
           "backup": { "dir": "~/backup/creative" }
