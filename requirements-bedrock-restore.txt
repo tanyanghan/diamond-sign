@@ -2,7 +2,7 @@
 # Only needed on a Bedrock host that wants per-player restore; the bot lazily
 # imports them, so it runs fine without them (the feature is just unavailable).
 #
-# amulet-leveldb has NO Linux wheels and its 1.0.6 sdist does not compile with
+# amulet-leveldb 1.0.x has NO Linux wheels and its sdist does not compile with
 # Cython 3.1+. It was published built with Cython 3.0.x, so pin the *build*
 # Cython to 3.0.x. On Debian/Ubuntu, in the bot's virtualenv:
 #
@@ -13,6 +13,11 @@
 #       pip install -r requirements-bedrock-restore.txt
 #
 # (macOS/Windows have prebuilt wheels and need no build constraint.)
+#
+# Pinned below 1.1: 1.1 is a pybind11 rebuild whose only Linux wheels are for
+# Python 3.14, where amulet-nbt can't run (it needs numpy 1.x). On 3.11/3.12
+# pip would pick the 1.1 sdist, which the Cython constraint above can't build.
+# The bot's calls work on both lines: lift the pin once amulet-nbt runs on 3.14.
 
-amulet-leveldb
+amulet-leveldb<1.1
 amulet-nbt

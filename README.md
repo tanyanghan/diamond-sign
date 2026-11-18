@@ -938,8 +938,8 @@ runs fine without the pack (deaths/chat simply absent).
 ### Bedrock per-player restore
 
 `/restore_player` on Bedrock needs two extra Python libraries to read/write the
-world LevelDB. amulet-leveldb has no Linux wheels and its sdist needs Cython
-3.0.x, so install it separately (one-time, in the bot's virtualenv):
+world LevelDB. amulet-leveldb (pinned below 1.1) has no Linux wheels and its sdist
+needs Cython 3.0.x, so install it separately (one-time, in the bot's virtualenv):
 
 ```bash
 sudo apt install -y build-essential zlib1g-dev
