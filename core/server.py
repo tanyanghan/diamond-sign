@@ -554,8 +554,9 @@ class Server:
         # (verifiably) exist. Do not reorder.
         try:
             chain_id = new_chain_id(backup_dir)
-            fresh_files = build_file_manifest(mc_dir, backup_dir,
-                                              self.backup_exclude_names)
+            fresh_files = _snapshot_manifest(
+                build_file_manifest(mc_dir, backup_dir, self.backup_exclude_names),
+                ready_map, mc_dir)
             self.save_manifest(fresh_files, chain_id=chain_id,
                                base_full=final_path.name)
             self.write_chain_marker(chain_id)
@@ -640,10 +641,12 @@ class Server:
                     ready_map = None
                 else:
                     # Bedrock: snapshot lengths are authoritative; no settle needed.
-                    new_manifest = build_file_manifest(mc_dir, backup_dir,
-                                                       self.backup_exclude_names)
                     ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
                                  for p, n in ready}
+                    new_manifest = _snapshot_manifest(
+                        build_file_manifest(mc_dir, backup_dir,
+                                            self.backup_exclude_names),
+                        ready_map, mc_dir)
                 changed, deleted = _diff_manifest(old_files, new_manifest)
 
                 # Build the incremental zip with chain ID in the filename.
@@ -1173,15 +1176,58 @@ def _add_world_file_to_zip(zf, fp: Path, rel: str, ready_map: dict | None) -> No
 #   - Stops when the last player leaves (with one final backup)
 # ---------------------------------------------------------------------------
 
+# Manifest value for a file whose zipped copy may not match what is on disk.
+# Never equal to a real mtime, so the next backup copies the file again.
+_RECOPY = -1.0
+
+
+def _snapshot_manifest(files: dict, ready_map: dict | None, mc_dir: Path) -> dict:
+    """Make a Bedrock manifest record what the zip holds, not what is on disk.
+
+    The manifest is built from a directory walk after ``save query``, but BDS
+    keeps writing past its snapshot: listed files are zipped truncated to their
+    snapshot length, and unlisted db/ files (compaction output not yet in the
+    snapshot) are not zipped at all. Recording their live mtimes marked data as
+    backed up that never was: the next backup saw "unchanged" and skipped it,
+    leaving restore points whose LevelDB MANIFEST names tables the chain never
+    stored (the 2026-11-17 19:17:54 restore lost 5 of 7 players this way).
+
+    - listed ``db/*.ldb`` at its full length: keep the mtime (tables are
+      immutable once written, so the zipped copy is the whole file),
+    - any other listed file (MANIFEST, .log, CURRENT, level.dat, ...):
+      ``_RECOPY``, as later writes can't be detected from a post-snapshot mtime,
+    - unlisted ``db/`` file: omitted, so it counts as new once it is listed,
+    - everything else: unchanged.
+
+    Java (``ready_map`` None) is returned unchanged.
+    """
+    if ready_map is None:
+        return files
+    out = {}
+    for rel, mtime in files.items():
+        if rel in ready_map:
+            full = False
+            if "/db/" in rel and rel.endswith(".ldb"):
+                try:
+                    full = (mc_dir / rel).stat().st_size == ready_map[rel]
+                except OSError:
+                    pass
+            out[rel] = mtime if full else _RECOPY
+        elif "/db/" not in rel:
+            out[rel] = mtime
+    return out
+
+
 def _diff_manifest(old: dict, new: dict) -> tuple:
     """Compare two file manifests and return (changed_or_added, deleted).
 
     Each manifest is {relative_path: mtime}. A file is "changed" if its mtime
-    differs or it's new. A file is "deleted" if it was in old but not in new.
+    differs, it's new, or it was marked ``_RECOPY`` last time. A file is
+    "deleted" if it was in old but not in new.
     """
     changed = []
     for path, mtime in new.items():
-        if path not in old or old[path] != mtime:
+        if path not in old or old[path] != mtime or old[path] == _RECOPY:
             changed.append(path)
     deleted = [path for path in old if path not in new]
     return changed, deleted
