@@ -848,7 +848,13 @@ class BedrockBackend(ServerBackend):
             live_key = live_key or backup_key
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             undo = self.config.backup_dir / f"{live_key}.pre-restore-{ts}.nbt"
-            bedrock_player.backup_player_value(db_path, live_key, undo)
+            if bedrock_player.backup_player_value(db_path, live_key, undo) is None:
+                # Not in the current world (e.g. it was reset or restored to
+                # before they first joined): BDS would give them a fresh
+                # identity on join and never read a value written here.
+                status(f"{username} has no data in the current world (have "
+                       "they joined since it was reset?). Nothing restored.")
+                return
             status(f"Saved current data as {undo.name}")
             bedrock_player.write_player_value(db_path, live_key, value)
             status(f"Restored {username} to {version['timestamp']} "

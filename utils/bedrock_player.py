@@ -55,6 +55,15 @@ def world_db_path(minecraft_dir) -> Path:
 # watch console.log); never open the world db to probe a running server.
 
 
+def _db_get(db, key: bytes) -> bytes | None:
+    """``db.get`` that returns None for a missing key. amulet-leveldb raises
+    KeyError instead (unlike plyvel), which escaped as a failed restore."""
+    try:
+        return db.get(key)
+    except KeyError:
+        return None
+
+
 def open_db(db_path, create: bool = False):
     """Open a Bedrock world LevelDB (always read-write — amulet-leveldb has no
     read-only mode, so it acquires the LOCK and raises if another process, i.e.
@@ -107,10 +116,10 @@ def lookup_server_key(db, identity_uuid: str) -> str | None:
     (MsaId is account-stable but not derivable), so it's learned once and kept
     in bedrock_players.json. Returns the data key string, or None if no mapping.
     """
-    import amulet_nbt
-    raw = db.get(("player_" + identity_uuid).encode("latin1"))
+    raw = _db_get(db, ("player_" + identity_uuid).encode("latin1"))
     if raw is None:
         return None
+    import amulet_nbt
     try:
         comp = amulet_nbt.load(raw, little_endian=True, compressed=False).compound
         server = comp.get("ServerId")
@@ -133,7 +142,7 @@ def backup_player_value(db_path, key: str, dest: Path) -> bytes | None:
     bytes, or None if the key is absent."""
     db = open_db(db_path)
     try:
-        cur = db.get(key.encode("latin1"))
+        cur = _db_get(db, key.encode("latin1"))
     finally:
         db.close()
     if cur is None:
