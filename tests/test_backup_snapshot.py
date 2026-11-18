@@ -28,13 +28,14 @@ def check(cond, label):
 
 
 DB = "worlds/Square Friends/db/"
+T0 = 1_763_400_000  # 2025-11-17; zip entries can't store pre-1980 times
 
 
 def write(mc, rel, size, mtime):
     p = mc / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"x" * size)
-    os.utime(p, (mtime, mtime))
+    os.utime(p, (T0 + mtime, T0 + mtime))
 
 
 def test_unlisted_table_is_captured_later():
@@ -60,7 +61,7 @@ def test_unlisted_table_is_captured_later():
               "MANIFEST zipped truncated is marked for re-copy")
         check(DB + "099140.ldb" not in changed,
               "complete, unchanged table is not re-copied")
-        check(new["server.properties"] == 1000, "non-world file keeps its mtime")
+        check(new["server.properties"] == T0 + 1000, "non-world file keeps its mtime")
 
         # 19:17:54 -- both are now in the snapshot; nothing changed on disk.
         ready = {DB + "099140.ldb": 50, DB + "099148.ldb": 70,
@@ -98,6 +99,65 @@ def test_partial_table_is_recopied():
         new = _snapshot_manifest(build_file_manifest(mc),
                                  {DB + "099150.ldb": 60}, mc)
         check(new[DB + "099150.ldb"] == _RECOPY, "truncated table re-copied")
+
+
+class JavaBackend:
+    """save-off/save-all stand-in. ``end_save`` (save-on) lets the server
+    write again: it rewrites a region file, as an autosave or a chunk unload
+    right after a full backup would."""
+
+    def __init__(self, mc):
+        self.mc = mc
+
+    def is_available(self):
+        return True
+
+    def begin_save(self, log):
+        pass
+
+    def files_ready(self, log):
+        return None
+
+    def end_save(self, log):
+        write(self.mc, "world/region/r.0.0.mca", 120, 2000)
+
+
+def test_full_backup_baseline_predates_save_on():
+    print("java full backup baseline")
+    import types
+    import core.server as server_mod
+    real_settle = server_mod.wait_for_settle
+    server_mod.wait_for_settle = lambda *a, **k: real_settle(
+        *a, **{**k, "settle_seconds": 0})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mc, backups = root / "server", root / "backups"
+            write(mc, "world/region/r.0.0.mca", 100, 1000)
+            write(mc, "server.properties", 10, 1000)
+            saved = {}
+            srv = types.SimpleNamespace(
+                backend=JavaBackend(mc), backup_exclude_names=set(),
+                config=types.SimpleNamespace(
+                    minecraft_dir=mc, backup_dir=backups, edition="java",
+                    backup_copy_cmd=""),
+                log=types.SimpleNamespace(info=lambda *a, **k: None,
+                                          exception=lambda *a, **k: None),
+                write_player_sidecar=lambda *a, **k: None,
+                write_chain_marker=lambda chain_id: None,
+                save_manifest=lambda files, chain_id, base_full:
+                    saved.update(files=files))
+            server_mod.Server.run_backup(srv)
+
+            region = "world/region/r.0.0.mca"
+            check(saved.get("files", {}).get(region) == T0 + 1000,
+                  "baseline holds the zipped mtime, not the post-save-on one "
+                  f"(got {saved.get('files', {}).get(region)})")
+            changed, _ = _diff_manifest(saved["files"], build_file_manifest(mc))
+            check(region in changed,
+                  "the write after save-on is picked up by the next incremental")
+    finally:
+        server_mod.wait_for_settle = real_settle
 
 
 def test_java_unchanged():

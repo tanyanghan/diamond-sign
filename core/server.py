@@ -483,14 +483,22 @@ class Server:
                 ready = self.backend.files_ready(status)
             ready_map = None
             if ready is None:
-                if not offline:
+                if offline:
+                    baseline = build_file_manifest(mc_dir, backup_dir,
+                                                   self.backup_exclude_names)
+                else:
                     # Java: the server may still be flushing to disk after
                     # save-all, so wait for the filesystem to settle first.
-                    wait_for_settle(mc_dir, backup_dir, log_fn=status,
-                                    exclude_names=self.backup_exclude_names)
+                    baseline = wait_for_settle(
+                        mc_dir, backup_dir, log_fn=status,
+                        exclude_names=self.backup_exclude_names)
             else:
                 ready_map = {str(p.relative_to(mc_dir)).replace("\\", "/"): n
                              for p, n in ready}
+                baseline = _snapshot_manifest(
+                    build_file_manifest(mc_dir, backup_dir,
+                                        self.backup_exclude_names),
+                    ready_map, mc_dir)
 
             status(f"Zipping {mc_dir} ...")
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -545,7 +553,11 @@ class Server:
         # Step 5: Start a new incremental chain
         # Every full backup starts a fresh chain. The manifest records the mtime
         # of every file, which becomes the baseline for detecting changes in
-        # subsequent incremental backups. The chain marker is written to the
+        # subsequent incremental backups. That baseline was taken in step 2,
+        # while saving was still frozen and before zipping: building it here,
+        # after save-on and the copy command, recorded writes the zip never
+        # held as backed up, and the next incremental skipped them. The chain
+        # marker is written to the
         # server directory so the bot can detect if the server state is replaced
         # while it's offline.
         # INVARIANT: chain state only advances after finalize_backup_zip
@@ -554,10 +566,7 @@ class Server:
         # (verifiably) exist. Do not reorder.
         try:
             chain_id = new_chain_id(backup_dir)
-            fresh_files = _snapshot_manifest(
-                build_file_manifest(mc_dir, backup_dir, self.backup_exclude_names),
-                ready_map, mc_dir)
-            self.save_manifest(fresh_files, chain_id=chain_id,
+            self.save_manifest(baseline, chain_id=chain_id,
                                base_full=final_path.name)
             self.write_chain_marker(chain_id)
             self.log.info("Backup: new chain %s established (base: %s)",
