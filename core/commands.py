@@ -1372,7 +1372,7 @@ def register_commands(router, auth: dict) -> None:
                     if online else None
             except Exception as e:
                 finish(None)
-                server.log.exception("Msg failed")
+                server.log.exception("Say failed")
                 ctx.adapter.send(ctx.chat_id, f"Couldn't send the message: {e}")
                 return
             if not online:
