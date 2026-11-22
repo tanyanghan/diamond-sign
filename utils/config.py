@@ -464,7 +464,7 @@ def load_config() -> AppConfig:
                           f"{_CONFIG_PATH}:\n"
                           + "\n".join(f"  - {p}" for p in problems))
     # Non-fatal: a Java server without an RCON password still gets log-driven
-    # notifications, but /status, /backup save-flush, and /allowlist need RCON.
+    # notifications, but /online, /backup save-flush, and /allowlist need RCON.
     for s in app.all_servers():
         if s.edition == EDITION_JAVA and not s.rcon_password:
             print(f"Warning: server '{s.name}' has no rcon.password — "

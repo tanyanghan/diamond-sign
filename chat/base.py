@@ -80,9 +80,10 @@ class ChatAdapter(ABC):
     def command_label(self, name: str) -> str:
         """The user-facing ``/command`` string for a canonical command name on
         this platform. Defaults to ``/name``; a platform overrides this where it
-        must expose a command under a different name (e.g. Slack reserves
-        ``/status`` and ``/help``, so it renames them). Used to render help text
-        that matches what users can actually type."""
+        must expose a command under a different name (Slack reserves some names,
+        e.g. ``/status`` and ``/help`` -- which is why the bot's are ``/online``
+        and ``/commands`` everywhere). Used to render help text that matches
+        what users can actually type."""
         return "/" + name
 
 
@@ -161,7 +162,7 @@ class CommandRouter:
         if not text.startswith("/"):
             return
         name = text[1:].split(maxsplit=1)[0].lstrip("/")
-        # Strip a Telegram-style @botname suffix (/status@MyBot).
+        # Strip a Telegram-style @botname suffix (/online@MyBot).
         name = name.split("@", 1)[0].lower()
         spec = self._cmds.get(name)
         if spec is None:

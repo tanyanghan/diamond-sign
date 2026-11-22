@@ -1,7 +1,7 @@
 """Slack adapter — slack_bolt in Socket Mode (no public URL).
 
 Socket Mode opens an outbound websocket, so the bot works behind NAT like the
-Telegram long-poller. Commands are Slack **slash commands** (``/status`` …);
+Telegram long-poller. Commands are Slack **slash commands** (``/online`` …);
 each must be declared in the Slack app manifest (see README), but a single
 regex catch-all here routes them all into the shared CommandRouter. Replies and
 announcements go out via ``chat.postMessage``; monospace uses triple backticks.
@@ -73,11 +73,12 @@ class _SlackNetworkErrorFilter(logging.Filter):
                     lg.addHandler(h)
             lg.propagate = False  # don't also hit the unformatted last-resort handler
 
-# Slack reserves some slash-command names (e.g. /status, /help) and rejects them
-# in an app manifest. Those commands are declared under alternate names in the
-# manifest (see README) and mapped back to the bot's canonical command here, so
-# routing — and parity with Telegram — is unchanged. Canonical name -> Slack name.
-_RENAMED = {"status": "online", "help": "commands"}
+# Slack reserves some slash-command names (e.g. /status, /help, /msg) and
+# rejects them in an app manifest, so every command uses a name Slack allows
+# (/online, /commands, /say) on all platforms. If a command ever has to be
+# exposed under a different name on Slack only, map it here (canonical name ->
+# Slack name) and the router and help text follow.
+_RENAMED: dict = {}
 _RENAMED_INV = {slack: canon for canon, slack in _RENAMED.items()}
 
 
@@ -104,7 +105,7 @@ class SlackAdapter(ChatAdapter):
             try:
                 cmd = command.get("command", "")           # e.g. "/online"
                 name = cmd[1:] if cmd.startswith("/") else cmd
-                cmd = "/" + _RENAMED_INV.get(name, name)    # map "/online" -> "/status"
+                cmd = "/" + _RENAMED_INV.get(name, name)    # Slack-only renames, if any
                 arg_text = command.get("text", "") or ""    # args after the command
                 full = cmd + ((" " + arg_text) if arg_text else "")
                 channel_id = command["channel_id"]

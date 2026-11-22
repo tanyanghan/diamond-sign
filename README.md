@@ -191,7 +191,7 @@ pick your bot, and paste this list (keep it in sync with the Slack manifest
 below when commands change):
 
 ```
-status - Show server status and who's online
+online - Show server status and who's online
 list - List known players
 seed - Show the world seed
 update_server - Check for and install a new server version
@@ -212,11 +212,11 @@ chat_id - Show this chat's ID and your user ID
 use - Pick the server your commands act on
 chats - List/authorize/revoke/pause chats
 mods - List/add/remove moderators
-help - Show commands
+commands - Show commands
 ```
 
-(Telegram uses the native `/status` and `/help`; only Slack needs the
-`/online`/`/commands` renames explained below.)
+(The names match the Slack manifest below exactly: every command is the same
+on both platforms.)
 
 ### Slack
 
@@ -281,12 +281,11 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
 }
 ```
 
-> **Why `/online` and `/commands` instead of `/status` and `/help`?** Slack
-> reserves `/status` and `/help` for its own built-in commands and rejects an app
-> manifest that tries to register them ("invalid name"). The Slack adapter maps
-> `/online → status` and `/commands → help` internally, so they behave exactly
-> like the Telegram `/status` and `/help`. All other commands are identical
-> across platforms.
+> **Why `/online`, `/commands` and `/say` instead of `/status`, `/help` and
+> `/msg`?** Slack reserves those names for its own built-in commands and rejects
+> an app manifest that tries to register them ("invalid name"). So the bot uses
+> the Slack-safe names on every platform, and every command is identical across
+> Telegram and Slack.
 
 Slack uses string IDs (`U…` users, `C…`/`D…` channels), which `/chats authorize`
 and `auth.json` handle automatically.
@@ -415,7 +414,7 @@ One process runs **any mix of bots × servers** from `diamondsign.json`:
   routes each server's events to the chats **bound** to that server, and
   server-scoped commands (`/backup`, `/restore`, …) target a server you pick with
   **`/use <server>`** (or the channel's binding). `/chats authorize <chat_id>
-  <server>` binds a chat to a server. (`/status` is the exception: in a DM it lists
+  <server>` binds a chat to a server. (`/online` is the exception: in a DM it lists
   every server you can act on — all of them for the admin, a moderator's granted
   ones — so it never needs `/use`.)
 - **Many bots** — add more entries to `bots` (e.g. a separate Telegram bot per
@@ -440,7 +439,7 @@ stored namespaced in `auth.json`). On each platform you use:
 
 1. Send the bot a private message / DM — the first sender becomes that bot's
    **admin** on that platform (on Telegram, any message; on Slack, any slash
-   command such as `/status`).
+   command such as `/online`).
 2. In the group/channel you want notifications in, send `/chat_id` to get its ID
    (works even before the chat is authorised; on Slack, invite the bot first).
 3. In a DM to the bot, send `/chats authorize <chat_id>` to whitelist it. On a
@@ -470,7 +469,7 @@ and `/mods` stay admin-only, and operational alerts still go only to the admin.
 2. In a DM to the bot, the admin sends `/mods add <user_id>` — on a multi-server
    bot, `/mods add <user_id> <server>`, once per server to grant.
 3. The moderator runs the commands **in a DM with the bot**, like the admin. They
-   only ever reach their granted servers: `/use` and `/status` list just those, a
+   only ever reach their granted servers: `/use` and `/online` list just those, a
    single granted server is picked automatically, and any command aimed at another
    server is refused. In that DM they also get the read-only commands anyone can
    use in an authorised group (`/list`, `/stats`, `/deaths`, …), for their
@@ -489,7 +488,7 @@ send it from, so a Slack moderator is added from Slack — and are stored in
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show whether the server is online, and who's playing. In a DM it lists every server you can act on (all of them for the admin); in an authorized group/channel it reports just that chat's bound server |
+| `/online` | Show whether the server is online, and who's playing. In a DM it lists every server you can act on (all of them for the admin); in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
 | `/update_server [confirm]` | *(Admin)* Show the installed vs available server version; `confirm` backs up, stops, updates and restarts |
 | `/seed` | Show the world seed — Java runs the server's `seed` command (needs the server up); Bedrock reads `RandomSeed` from the world's `level.dat` (works either way) |
@@ -525,9 +524,9 @@ it up with `/start`). Read commands (`/list`, `/stats`, `/deaths`, …) read sto
 data/world files and work whether the server is up or down. `/restore` works
 offline (it's the recovery path).
 
-**Slack note.** Slack reserves `/status` and `/help`, so on Slack they're
-`/online` and `/commands` respectively (the bot maps them back internally). Every
-other command name is the same on both platforms.
+**Same names everywhere.** Every command has the same name on Telegram and
+Slack. (Slack reserves `/status`, `/help` and `/msg`, which is why these are
+`/online`, `/commands` and `/say`.)
 
 **Edition notes.** On **Bedrock**, `/achievements` and `/scan_achievements` are
 unavailable (achievements are Xbox-bound and not exposed to servers). `/deaths`

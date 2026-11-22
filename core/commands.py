@@ -427,7 +427,7 @@ def _cmd_log(ctx, action: str, extra: str = "") -> None:
 
 
 def _status_line(server) -> str:
-    """One-line up/down + player summary for a server (used by /status).
+    """One-line up/down + player summary for a server (used by /online).
 
     Liveness first, so a down server gets a clear 'offline' answer instead of a
     slow/last-known one; when online, the server is queried live (reconciling
@@ -436,7 +436,7 @@ def _status_line(server) -> str:
     if not server.backend.is_online():
         hint = " Start it with /start." if server.backend.can_restart else ""
         return f"🔴 {name} is offline.{hint}"
-    online = reconcile_online(server, reason="/status")
+    online = reconcile_online(server, reason="/online")
     suffix = ""
     if online is None:  # reachable a moment ago but the query failed — last-known
         online = server.get_online_players()
@@ -453,13 +453,13 @@ def register_commands(router, auth: dict) -> None:
     server-scoped handler acts on ``ctx.server`` (set by the router's resolve
     hook) — its backend, name registry, achievements, and deaths."""
 
-    # --- /start, /help ---
+    # --- /start, /commands ---
     def cmd_help(ctx):
         _cmd_log(ctx, "Help")
         backend = ctx.server.backend
         lines = [
             "Available commands:",
-            f"{ctx.adapter.command_label('status')} — show online players",
+            f"{ctx.adapter.command_label('online')} — show online players",
             "/list — list all known players",
             "/seed — show the world seed",
         ]
@@ -508,9 +508,9 @@ def register_commands(router, auth: dict) -> None:
             lines.append(f"/allowlist <on|off|add|remove|list|reload> [player] "
                          f"— server {backend.ALLOWLIST_VERB}")
         ctx.reply("\n".join(lines))
-    router.register(["start", "help"], cmd_help)
+    router.register(["start", "commands"], cmd_help)
 
-    # --- /status ---
+    # --- /online ---
     def cmd_status(ctx):
         _cmd_log(ctx, "Status")
         # A DM reports every server the sender may act on — all of them for the
@@ -534,7 +534,7 @@ def register_commands(router, auth: dict) -> None:
         ctx.reply(reply)
         ctx.bot.log.info("Status: replied to [%s] — %d server(s)",
                          ctx.sender_label, len(servers))
-    router.register("status", cmd_status, needs_server=False)
+    router.register("online", cmd_status, needs_server=False)
 
     # --- /stats ---
     def cmd_stats(ctx):

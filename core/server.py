@@ -65,7 +65,7 @@ class Server:
 
         self.online_players: set = set()
         self.online_lock = threading.Lock()
-        # Serializes reconcile_online passes for this server (a /status and an
+        # Serializes reconcile_online passes for this server (an /online and an
         # on_server_start resync may race).
         self.reconcile_lock = threading.Lock()
 
