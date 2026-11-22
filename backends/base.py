@@ -98,9 +98,12 @@ _BLANK_LOOKING = frozenset({0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x034F,
 
 def has_visible_text(text: str) -> bool:
     """True if ``text`` would show something: at least one letter, number,
-    punctuation or symbol that isn't one of the blank-looking ones. (Marks,
-    format characters and separators alone show nothing.)"""
-    return any(unicodedata.category(c)[0] in "LNPS"
+    punctuation or symbol that isn't one of the blank-looking ones, or a
+    private-use or unassigned code point (Bedrock draws its button/emoji
+    icons from private use; unassigned may be an emoji newer than this
+    Python). Marks, format characters and separators alone show nothing."""
+    return any((unicodedata.category(c)[0] in "LNPS"
+                or unicodedata.category(c) in ("Co", "Cn"))
                and ord(c) not in _BLANK_LOOKING for c in text)
 
 
@@ -114,11 +117,10 @@ def clean_chat_name(name: str) -> str:
     return " ".join(kept.split())
 
 
-# Trailing pieces of an emoji sequence that a cut can leave dangling: ZWJ,
-# variation selectors, tag characters.
+# A cut can leave a ZWJ joining nothing. (Variation selectors and tag
+# characters are left alone: they may complete the emoji before them.)
 def _dangling(c: str) -> bool:
-    cp = ord(c)
-    return (cp == 0x200D or 0xFE00 <= cp <= 0xFE0F or 0xE0000 <= cp <= 0xE007F)
+    return c == "\u200d"
 
 
 class ServerBackend(ABC):
@@ -308,12 +310,12 @@ class ServerBackend(ABC):
                 text = text[:-1]
             trimmed = True
             line = self._tellraw_line(name, text + "…")
-        if trimmed and not has_visible_text(text):
-            raise ValueError("nothing visible is left after shortening")
         if len(line.encode("utf-8")) > self.MSG_LINE_LIMIT:
             # Only a name too long to leave room for any text gets here (/msg
             # caps names at 32 characters, which always fits).
             raise ValueError("name too long to fit a message line")
+        if trimmed and not has_visible_text(text):
+            raise ValueError("nothing visible is left after shortening")
         return line, (text + "…" if trimmed else text), trimmed
 
     def broadcast(self, message: str) -> None:

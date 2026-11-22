@@ -1318,46 +1318,69 @@ def register_commands(router, auth: dict) -> None:
             ctx.reply(f"Usage: {label} <message> — shows it to everyone in "
                       f"game on {server.config.name}.")
             return
-        key = (ctx.platform, ctx.user_id)
-        now = time.monotonic()
-        with _msg_last_lock:
-            last = _msg_last.get(key)
-            if last is not None and now - last < _MSG_COOLDOWN:
-                ctx.reply("Please wait a few seconds between messages.")
-                return
-            # In flight until the worker finishes (inf never ages out), so a
-            # slow send can't let the same user's next message through early.
-            _msg_last[key] = float("inf")
         name = clean_chat_name(str(ctx.sender_label).lstrip("@"))[:32].strip()
         if not has_visible_text(name):
             name = str(ctx.user_id)
         _cmd_log(ctx, "Msg")
 
+        # Cooldown slot: (time it counts from, owner). Reserved as in flight
+        # (inf never ages out) until this request settles it, so a slow send
+        # can't let the same user's next message through early. The owner
+        # token means a request only ever settles its own slot, once.
+        key = (ctx.platform, ctx.user_id)
+        token = object()
+        settled = []
+        with _msg_last_lock:
+            entry = _msg_last.get(key)
+            busy = entry is not None and (
+                entry[0] == float("inf")
+                or time.monotonic() - entry[0] < _MSG_COOLDOWN)
+            if not busy:
+                _msg_last[key] = (float("inf"), token)
+        if busy:  # replied outside the lock: a slow chat API mustn't stall /msg
+            ctx.reply("Please wait a few seconds between messages.")
+            return
+
         def finish(stamp):
             # stamp=None: refused or failed -- give the slot back, "try again"
             # must mean now. Otherwise the cooldown runs from ``stamp``.
             with _msg_last_lock:
+                if settled:
+                    return
+                settled.append(stamp)
+                entry = _msg_last.get(key)
+                if entry is None or entry[1] is not token:
+                    return
                 if stamp is None:
                     _msg_last.pop(key, None)
                 else:
-                    _msg_last[key] = stamp
+                    _msg_last[key] = (stamp, token)
 
         def run():
+            try:
+                _deliver()
+            finally:
+                finish(None)  # no-op unless an unexpected exit left it open
+
+        def _deliver():
             backend = server.backend
             try:
                 # Probed WITHOUT the lifecycle lock (a Bedrock probe takes ~3 s);
-                # tell_all takes the lock only around the send. An offline
-                # reply keeps the cooldown: it still typed a probe into the pane.
-                if not backend.is_online():
-                    finish(now)
-                    ctx.adapter.send(ctx.chat_id, f"\u26a0\ufe0f {server.config.name} "
-                                     "is offline — the message wasn't sent.")
-                    return
-                result = backend.tell_all(name, text, server.lifecycle_lock)
+                # tell_all takes the lock only around the send.
+                online = backend.is_online()
+                result = backend.tell_all(name, text, server.lifecycle_lock) \
+                    if online else None
             except Exception as e:
                 finish(None)
                 server.log.exception("Msg failed")
                 ctx.adapter.send(ctx.chat_id, f"Couldn't send the message: {e}")
+                return
+            if not online:
+                # Keeps the cooldown (from now): it still typed a probe into
+                # the pane.
+                finish(time.monotonic())
+                ctx.adapter.send(ctx.chat_id, f"\u26a0\ufe0f {server.config.name} "
+                                 "is offline — the message wasn't sent.")
                 return
             if result is None:
                 finish(None)
@@ -1375,7 +1398,11 @@ def register_commands(router, auth: dict) -> None:
                              f"Sent (shortened to {len(sent)} characters)."
                              if trimmed else "Sent.")
 
-        threading.Thread(target=run, daemon=True).start()
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except BaseException:
+            finish(None)  # the worker never ran: don't leave the slot in flight
+            raise
     router.register("msg", cmd_msg)
 
     # --- /use (multi-server: pick this user's target server) ---

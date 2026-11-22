@@ -428,11 +428,78 @@ def test_cooldown_in_flight():
             break
         time.sleep(0.02)
     check(srv.backend.told == [("u300", "first")], "the first is sent")
+    slot = cmds._msg_last.get(("telegram", MEMBER))
+    check(slot is not None and slot[0] != float("inf"),
+          "after the send the slot holds the send time, not 'in flight'")
     c3 = ctx_for("/msg third")
     c3.server = srv
     h(c3)
     check("wait a few seconds" in c3.replies[-1],
           "after a send, the 5 s cooldown applies")
+
+
+def test_cooldown_settles_on_every_path():
+    print("/msg cooldown on failure, offline and a failed thread start")
+    key = ("telegram", MEMBER)
+
+    def wait_sent(c):
+        for _ in range(100):
+            if c.sent:
+                return
+            time.sleep(0.02)
+
+    srv = make_server()
+
+    def boom(*a):
+        raise RuntimeError("rcon down")
+    srv.backend.tell_all = boom
+    cmds._msg_last.clear()
+    h = msg_handler()
+    c = ctx_for("/msg one")
+    c.server = srv
+    h(c)
+    wait_sent(c)
+    check("Couldn't send" in c.sent[-1] and key not in cmds._msg_last,
+          "a failed send gives the slot back")
+
+    srv = make_server(online=False)
+    c = ctx_for("/msg one")
+    c.server = srv
+    h(c)
+    wait_sent(c)
+    c2 = ctx_for("/msg two")
+    c2.server = srv
+    h(c2)
+    check("offline" in c.sent[-1] and "wait a few seconds" in c2.replies[-1],
+          "offline keeps the cooldown (a probe was still typed)")
+
+    cmds._msg_last.clear()
+    real = cmds.threading.Thread
+
+    class NoThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+    cmds.threading.Thread = NoThread
+    try:
+        c = ctx_for("/msg one")
+        c.server = make_server()
+        try:
+            h(c)
+        except RuntimeError:
+            pass
+    finally:
+        cmds.threading.Thread = real
+    check(key not in cmds._msg_last,
+          "a worker that never starts doesn't leave the user stuck 'in flight'")
+
+
+def test_visible_icons():
+    print("Bedrock icons and new emoji count as visible")
+    check(has_visible_text(chr(0xE000)), "a private-use glyph (Bedrock icon) shows")
+    check(has_visible_text(chr(0x0378)), "an unassigned code point (maybe a new emoji) shows")
 
 
 def test_bedrock_concurrency_and_capture():
