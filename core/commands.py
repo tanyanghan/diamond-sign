@@ -361,6 +361,20 @@ def _release_both(server) -> None:
     server.backup_lock.release()
 
 
+def _claim_pending(store: dict, lock, pkey: str, entry: dict, **expect) -> bool:
+    """Take ``entry`` out of ``store`` -- once. Called after the operation's
+    locks are held: only if it is still the pending entry for ``pkey`` and
+    still holds ``expect`` (the setters update entries in place, so identity
+    alone wouldn't show a re-selection). Two identical confirms racing each
+    other then start the operation once, not twice."""
+    with lock:
+        if store.get(pkey) is not entry or any(
+                entry.get(k) != v for k, v in expect.items()):
+            return False
+        store.pop(pkey)
+        return True
+
+
 # One log scan per server at a time: _scan_logs unpacks each archive to a
 # fixed path beside it, which two concurrent scans would fight over.
 _scan_locks: dict = {}
@@ -786,9 +800,11 @@ def register_commands(router, auth: dict) -> None:
 
         with _pending_update_lock:
             entry = _pending_update.get(pkey)
-        if entry is None or time.time() - entry["ts"] > _PENDING_UPDATE_TTL:
-            with _pending_update_lock:
+            if entry is not None and \
+                    time.time() - entry["ts"] > _PENDING_UPDATE_TTL:
                 _pending_update.pop(pkey, None)
+                entry = None
+        if entry is None:
             ctx.reply("Nothing to confirm \u2014 run /update_server first to see what "
                       "is available.")
             return
@@ -806,9 +822,11 @@ def register_commands(router, auth: dict) -> None:
             finally:
                 _release_both(server)
 
+        if not _claim_pending(_pending_update, _pending_update_lock, pkey, entry):
+            _release_both(server)
+            ctx.reply("That confirmation was already used — nothing more was started.")
+            return
         try:
-            with _pending_update_lock:
-                _pending_update.pop(pkey, None)
             ctx.reply(f"Updating to {release.describe()}...")
             threading.Thread(target=run, daemon=True).start()
         except BaseException:
@@ -994,12 +1012,16 @@ def register_commands(router, auth: dict) -> None:
                 finally:
                     _release_both(server)
 
+            if not _claim_pending(_pending_player_restore, _pending_player_lock,
+                                  pkey, entry, stage="selected", selected_n=n):
+                _release_both(server)
+                ctx.reply("That confirmation was already used — nothing more was started.")
+                return
             try:
                 server.log.info("RestorePlayer: [%s] on [%s] confirmed restore "
                                 "of %s to %s (source: %s)", ctx.sender_label,
                                 ctx.chat_label, canonical, version["timestamp"],
                                 version["source"])
-                _clear_pending_player_restore(pkey)
                 ctx.reply(f"Starting restore of {canonical} to "
                           f"{version['timestamp']}...")
                 threading.Thread(target=run, daemon=True).start()
@@ -1187,8 +1209,12 @@ def register_commands(router, auth: dict) -> None:
             finally:
                 _release_both(server)
 
+        if not _claim_pending(_pending_world_restore, _pending_world_lock, pkey,
+                              entry, stage="selected", selected_n=n):
+            _release_both(server)
+            ctx.reply("That confirmation was already used — nothing more was started.")
+            return
         try:
-            _clear_pending_world_restore(pkey)
             server.log.info("Restore: [%s] on [%s] confirmed world restore to "
                             "%s (%s)", ctx.sender_label, ctx.chat_label,
                             point["pretty_ts"], point["kind"])

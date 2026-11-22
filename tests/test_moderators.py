@@ -669,6 +669,29 @@ def test_lifecycle_fail_fast():
           "both released")
 
 
+def test_claim_pending_once():
+    print("a confirmation is claimed once")
+    lock = threading.Lock()
+    entry = {"stage": "selected", "selected_n": 2}
+    store = {"k": entry}
+    check(cmds._claim_pending(store, lock, "k", entry, stage="selected",
+                              selected_n=2) and "k" not in store,
+          "the first confirm claims it")
+    check(not cmds._claim_pending(store, lock, "k", entry, stage="selected",
+                                  selected_n=2),
+          "an identical confirm racing it gets nothing -- no second restore")
+    store["k"] = entry
+    entry["selected_n"] = 3                  # re-selected in place meanwhile
+    check(not cmds._claim_pending(store, lock, "k", entry, stage="selected",
+                                  selected_n=2) and store.get("k") is entry,
+          "a re-selection made meanwhile is neither run nor deleted")
+    newer = {"release": "b"}
+    store["k"] = newer
+    check(not cmds._claim_pending(store, lock, "k", {"release": "a"})
+          and store.get("k") is newer,
+          "a newer /update_server offer isn't consumed by an older confirm")
+
+
 def test_admin_with_no_servers_up():
     print("admin on a bot whose servers all failed")
     auth = make_auth()
