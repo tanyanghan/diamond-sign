@@ -349,8 +349,9 @@ def _acquire_both(server, say) -> bool:
         return False
     if not server.lifecycle_lock.acquire(blocking=False):
         server.backup_lock.release()
-        say("The server is being started (or restored/updated) — try again "
-            "once that's finished.")
+        say("A start, restore, update or allowlist change is running on "
+            f"{server.config.name} — send the same command again once it's "
+            "finished.")
         return False
     return True
 
@@ -709,12 +710,6 @@ def register_commands(router, auth: dict) -> None:
     # --- /backup ---
     def cmd_backup(ctx):
         server = ctx.server
-        if not server.backup_lock.acquire(blocking=False):
-            ctx.reply("A backup is already in progress.")
-            return
-        server.log.info("Backup: manually triggered by [%s] on [%s]",
-                        ctx.sender_label, ctx.chat_label)
-        ctx.reply("Starting backup...")
         say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
         def run():
@@ -727,7 +722,19 @@ def register_commands(router, auth: dict) -> None:
             finally:
                 server.backup_lock.release()
 
-        threading.Thread(target=run, daemon=True).start()
+        if not server.backup_lock.acquire(blocking=False):
+            ctx.reply("A backup is already in progress.")
+            return
+        # Until the worker is running, the lock is ours to release: anything
+        # failing before that must not leave it held.
+        try:
+            server.log.info("Backup: manually triggered by [%s] on [%s]",
+                            ctx.sender_label, ctx.chat_label)
+            ctx.reply("Starting backup...")
+            threading.Thread(target=run, daemon=True).start()
+        except BaseException:
+            server.backup_lock.release()
+            raise
     router.register("backup", cmd_backup, private_only=True, admin_only=True,
                     moderator=True, needs_online=True)
 
@@ -778,16 +785,19 @@ def register_commands(router, auth: dict) -> None:
             return
 
         with _pending_update_lock:
-            entry = _pending_update.pop(pkey, None)
+            entry = _pending_update.get(pkey)
         if entry is None or time.time() - entry["ts"] > _PENDING_UPDATE_TTL:
+            with _pending_update_lock:
+                _pending_update.pop(pkey, None)
             ctx.reply("Nothing to confirm \u2014 run /update_server first to see what "
                       "is available.")
             return
 
         release = entry["release"]
+        # Locks first: if something else is running, the confirmation stays
+        # pending so the same command can simply be sent again.
         if not _acquire_both(server, ctx.reply):
             return
-        ctx.reply(f"Updating to {release.describe()}...")
         say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
         def run():
@@ -796,7 +806,14 @@ def register_commands(router, auth: dict) -> None:
             finally:
                 _release_both(server)
 
-        threading.Thread(target=run, daemon=True).start()
+        try:
+            with _pending_update_lock:
+                _pending_update.pop(pkey, None)
+            ctx.reply(f"Updating to {release.describe()}...")
+            threading.Thread(target=run, daemon=True).start()
+        except BaseException:
+            _release_both(server)
+            raise
     router.register("update_server", cmd_update, private_only=True, admin_only=True,
                     cap=lambda c: c.server.backend.can_restart,
                     cap_message="Updating needs a restart transport \u2014 set "
@@ -835,7 +852,7 @@ def register_commands(router, auth: dict) -> None:
             # would interpret may get through. A name with a space (a Bedrock
             # gamertag) is sent double-quoted, as BDS requires -- still inert
             # to a shell, given those characters.
-            name = " ".join(ctx.args[1:]).strip().strip('"').strip()
+            name = " ".join(ctx.args[1:]).strip().strip('"\u201c\u201d').strip()
             if not _RE_ALLOWLIST_NAME.fullmatch(name):
                 ctx.reply(f"Invalid player name '{name}' — use letters, "
                           "digits, _ and single spaces only.")
@@ -960,16 +977,13 @@ def register_commands(router, auth: dict) -> None:
                 ctx.reply("The selected backup is no longer available. "
                           f"Run /restore_player {canonical} again.")
                 return
-            server.log.info("RestorePlayer: [%s] on [%s] confirmed restore of %s "
-                        "to %s (source: %s)", ctx.sender_label, ctx.chat_label,
-                        canonical, version["timestamp"], version["source"])
-            ctx.reply(f"Starting restore of {canonical} to {version['timestamp']}...")
-            _clear_pending_player_restore(pkey)
+            # Locks first: if something else is running, the selection stays
+            # pending so the same confirm can simply be sent again.
+            if not _acquire_both(server, ctx.reply):
+                return
             say = lambda m: ctx.adapter.send(ctx.chat_id, m)
 
             def run():
-                if not _acquire_both(server, say):
-                    return
                 try:
                     backend.restore_player(canonical, uuid, version, say)
                     # A Bedrock restore restarts the server (stop -> edit ->
@@ -980,7 +994,18 @@ def register_commands(router, auth: dict) -> None:
                 finally:
                     _release_both(server)
 
-            threading.Thread(target=run, daemon=True).start()
+            try:
+                server.log.info("RestorePlayer: [%s] on [%s] confirmed restore "
+                                "of %s to %s (source: %s)", ctx.sender_label,
+                                ctx.chat_label, canonical, version["timestamp"],
+                                version["source"])
+                _clear_pending_player_restore(pkey)
+                ctx.reply(f"Starting restore of {canonical} to "
+                          f"{version['timestamp']}...")
+                threading.Thread(target=run, daemon=True).start()
+            except BaseException:
+                _release_both(server)
+                raise
             return
 
         entry = _get_pending_player_restore(pkey, expected_username=canonical)
@@ -1145,11 +1170,10 @@ def register_commands(router, auth: dict) -> None:
                       "was touched — send /restore for a fresh list.")
             return
         chain, point_idx = found
-        _clear_pending_world_restore(pkey)
-        server.log.info("Restore: [%s] on [%s] confirmed world restore to %s (%s)",
-                        ctx.sender_label, ctx.chat_label,
-                        point["pretty_ts"], point["kind"])
-        ctx.reply(f"Starting world restore to {point['pretty_ts']}...")
+        # Locks first: if something else is running, the selection stays
+        # pending so the same confirm can simply be sent again.
+        if not _acquire_both(server, ctx.reply):
+            return
 
         # Log every status line as well as sending it to chat, so the restore is
         # fully traced in the bot log (mirrors restore_player's status()).
@@ -1158,14 +1182,21 @@ def register_commands(router, auth: dict) -> None:
             ctx.adapter.send(ctx.chat_id, m)
 
         def run():
-            if not _acquire_both(server, say):
-                return
             try:
                 server.restore_world(chain, point_idx, say=say)
             finally:
                 _release_both(server)
 
-        threading.Thread(target=run, daemon=True).start()
+        try:
+            _clear_pending_world_restore(pkey)
+            server.log.info("Restore: [%s] on [%s] confirmed world restore to "
+                            "%s (%s)", ctx.sender_label, ctx.chat_label,
+                            point["pretty_ts"], point["kind"])
+            ctx.reply(f"Starting world restore to {point['pretty_ts']}...")
+            threading.Thread(target=run, daemon=True).start()
+        except BaseException:
+            _release_both(server)
+            raise
     router.register("restore", cmd_restore, private_only=True, admin_only=True,
                     moderator=True,
                     cap=lambda ctx: ctx.server.backend.can_restart,

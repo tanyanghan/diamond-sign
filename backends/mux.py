@@ -40,9 +40,10 @@ class ConsoleMultiplexer:
 
         This is the single chokepoint for Bedrock console injection. Every legit
         command is either a fixed literal (``save hold``, ``list``, …) or
-        ``allowlist <sub> <name>`` whose ``<name>`` came from ``str.split()`` and
-        so can hold no whitespace — a control char here means the input was not
-        what the caller thinks. Refuse rather than send a partial or a second
+        ``allowlist <sub> <name>`` whose ``<name>`` /allowlist validated as words
+        of ``[A-Za-z0-9_]`` separated by single spaces (double-quoted when it has
+        a space) — inert even at a shell prompt. A control char here means the
+        input was not what the caller thinks. Refuse rather than send a partial or a second
         line: a newline would submit an extra console command (injection), and a
         CR/other control byte can corrupt the keystroke stream. Defence in depth
         so a future caller that forwards richer text (e.g. shlex-quoted args or a

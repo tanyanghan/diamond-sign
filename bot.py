@@ -132,6 +132,10 @@ class Bot:
         if names.get(ctx.chat_id) == ctx.chat_name:
             return  # unchanged — no write
         with auth_lock:
+            # Re-checked under the lock: a /chats revoke landing in between
+            # must not get the revoked chat's name written back.
+            if ctx.chat_id not in ns.get("authorized_chat_ids", []):
+                return
             names[ctx.chat_id] = ctx.chat_name
             save_auth(self.auth_doc, AUTH_PATH)
         self.log.info("Chat name learned: %s = [%s]", ctx.chat_id, ctx.chat_name)

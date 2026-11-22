@@ -547,6 +547,26 @@ def test_restore_player_pin():
         check("no longer available" in msg and not restored,
               "a live file that changed since it was listed is refused")
 
+        # A confirm while something else holds the lock is refused but kept:
+        # sending the same confirm again afterwards works.
+        restored.clear()
+        done.clear()
+        versions[:] = [v("2026-11-18 09:46:10"), v("2026-11-17 18:12:24"),
+                       v("2026-11-17 17:00:00")]
+        send("Hongy1618")
+        send("Hongy1618", "3")
+        srv.lifecycle_lock.acquire()                   # e.g. an /allowlist
+        msg = send("Hongy1618", "3", "confirm")
+        srv.lifecycle_lock.release()
+        check("send the same command again" in msg and not restored
+              and not srv.backup_lock.locked(),
+              f"busy: refused, nothing restored, no lock left held ({msg!r})")
+        send("Hongy1618", "3", "confirm")
+        done.wait(2)
+        check(restored and restored[0]["timestamp"] == "2026-11-17 17:00:00",
+              "the same confirm works once the lock is free")
+        _wait_free(srv.backup_lock)
+
         restored.clear()
         send("Hongy1618")
         send("Hongy1618", "1")
@@ -638,7 +658,7 @@ def test_lifecycle_fail_fast():
     srv.lifecycle_lock.acquire()       # a /start relaunch in progress
     said = []
     check(not cmds._acquire_both(srv, said.append)
-          and not srv.backup_lock.locked() and "being started" in said[-1],
+          and not srv.backup_lock.locked() and "again" in said[-1],
           "refused at once, backup_lock left free for scheduled backups")
     srv.lifecycle_lock.release()
     check(cmds._acquire_both(srv, said.append)
