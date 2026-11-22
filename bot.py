@@ -16,6 +16,7 @@ from core.logutil import TagLogAdapter
 from core.state import uuid_by_name
 from core.auth import (
     AUTH_PATH, auth_lock, load_auth, save_auth, is_admin, is_authorized,
+    is_moderator, moderated_servers,
 )
 from core.presence import reconcile_online, recover_online_identities
 from core.notifications import make_notify_callback
@@ -94,7 +95,8 @@ class Bot:
         self.servers = list(servers)
         self.by_name = {s.config.name: s for s in self.servers}
         self.by_key = {s.config.key: s for s in self.servers}
-        # Per-admin /use selection, in-memory only: {platform: {user_id: key}}.
+        # Per-user (admin or moderator) /use selection, in-memory only:
+        # {platform: {user_id: key}}.
         self._admin_session: dict = {}
         # Set in main() once the adapters and auth doc are built.
         self.adapters: list = []
@@ -134,6 +136,34 @@ class Bot:
             save_auth(self.auth_doc, AUTH_PATH)
         self.log.info("Chat name learned: %s = [%s]", ctx.chat_id, ctx.chat_name)
 
+    def note_moderator_name(self, ctx) -> None:
+        """Remember a moderator's display name for /mods, refreshed when they run
+        a command and their name changed. Re-checked under the lock so a refresh
+        racing /mods remove can't bring a removed moderator's entry back."""
+        if not ctx.is_private or is_admin(ctx.platform, ctx.user_id, self.auth):
+            return
+        ns = self.auth.get(ctx.platform) or {}
+        if ns.get("moderator_names", {}).get(ctx.user_id) == ctx.sender_label:
+            return  # unchanged — no write
+        with auth_lock:
+            if not is_moderator(ctx.platform, ctx.user_id, self.auth):
+                return
+            ns.setdefault("moderator_names", {})[ctx.user_id] = ctx.sender_label
+            save_auth(self.auth_doc, AUTH_PATH)
+
+    def allowed_servers(self, ctx) -> list:
+        """Servers a DM sender may act on: every server for the admin, otherwise
+        the ones they moderate (in this bot's server order)."""
+        if is_admin(ctx.platform, ctx.user_id, self.auth):
+            return list(self.servers)
+        keys = moderated_servers(ctx.platform, ctx.user_id, self.auth)
+        return [s for s in self.servers if s.config.key in keys]
+
+    def clear_use(self, platform: str, user_id: str) -> None:
+        """Forget a user's /use selection (e.g. when their moderator rights on it
+        are removed)."""
+        (self._admin_session.get(platform) or {}).pop(str(user_id), None)
+
     def chat_display(self, platform: str, chat_id: str) -> str:
         """Human label for a chat ID from the persisted names, else the ID —
         for logs/listings that have no live inbound message to read a name from."""
@@ -145,25 +175,38 @@ class Bot:
         """Pick the Server a server-scoped command should act on, or None if it's
         ambiguous (a multi-server bot with no channel binding and no /use
         selection). Resolution order:
-          1. single-server bot -> its only server (implicit);
-          2. a bound group/channel -> the server in its chat_servers binding;
-          3. an admin DM -> the /use session selection.
+          1. a group/channel -> the bot's only server, else its chat_servers
+             binding;
+          2. a DM -> the sender's only allowed server (the single server of a
+             one-server bot, or a moderator's one granted server), else their
+             /use selection -- which must be a server they are allowed.
+
+        A DM only ever resolves to a server in ``allowed_servers``: a moderator
+        never reaches a server they don't moderate, whatever the command.
         """
-        if len(self.servers) == 1:
-            return self.servers[0]
-        ns = self.auth.get(ctx.platform) or {}
         if not ctx.is_private:
+            if len(self.servers) == 1:
+                return self.servers[0]
+            ns = self.auth.get(ctx.platform) or {}
             key = (ns.get("chat_servers") or {}).get(ctx.chat_id)
             return self.by_key.get(key)
-        sel = (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id)
-        return self.by_key.get(sel)
+        allowed = self.allowed_servers(ctx)
+        if len(allowed) == 1:
+            return allowed[0]
+        sel = self.by_key.get(
+            (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id))
+        return sel if sel in allowed else None
 
-    def _server_menu(self, current=None) -> str:
+    def _server_menu(self, current=None, allowed=None) -> str:
         """Numbered server list for /use and the disambiguation prompt. The
         numbers are 1-based over ``self.servers`` (stable order) so a user can
-        pick with ``/use <number>``. ``current`` (a Server or None) is marked."""
+        pick with ``/use <number>``. ``current`` (a Server or None) is marked.
+        ``allowed`` limits the rows (a moderator's servers) without renumbering
+        them, so a shown number still means that server to ``/use``."""
         lines = []
         for i, s in enumerate(self.servers, 1):
+            if allowed is not None and s not in allowed:
+                continue
             mark = "*" if s is current else " "
             lines.append(f" {mark} {i}. {s.config.name}")
         return "\n".join(lines)
@@ -184,26 +227,46 @@ class Bot:
         disambiguation message and return False."""
         server = self.resolve_target_server(ctx)
         if server is None:
+            allowed = self.allowed_servers(ctx) if ctx.is_private else None
+            if allowed == []:
+                ctx.reply("You're not a moderator of any server on this bot.")
+                return False
+            sel = self.by_key.get(
+                (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id))
+            if ctx.is_private and sel is not None and sel not in allowed:
+                ctx.reply(f"You're not a moderator of {sel.config.name}. "
+                          "Pick one of yours with /use <number>:\n"
+                          + self._server_menu(allowed=allowed))
+                return False
             ctx.reply("This bot serves multiple servers. Pick one with "
-                      "/use <number> (or /use <name>):\n" + self._server_menu())
+                      "/use <number> (or /use <name>):\n"
+                      + self._server_menu(allowed=allowed))
             return False
         ctx.server = server
         return True
 
     def set_use(self, ctx) -> None:
         """Handle /use: bare form lists servers (numbered) + current selection;
-        /use <number> or /use <server> sets this admin's session target for
-        subsequent commands."""
+        /use <number> or /use <server> sets this user's session target for
+        subsequent commands. A moderator sees and may pick only their servers."""
+        allowed = self.allowed_servers(ctx)
         current = (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id)
         cur = self.by_key.get(current)
+        if cur not in allowed:
+            cur = None  # e.g. a moderator's selection whose grant was removed
         if not ctx.args:
             ctx.reply("Servers (pick with /use <number> or /use <name>):\n"
-                      + self._server_menu(cur)
+                      + self._server_menu(cur, allowed)
                       + f"\n\nCurrent: {cur.config.name if cur else '(none)'}")
             return
         target = self._resolve_use_token(ctx.args[0])
         if target is None:
-            ctx.reply(f"Unknown server '{ctx.args[0]}'.\n" + self._server_menu(cur))
+            ctx.reply(f"Unknown server '{ctx.args[0]}'.\n"
+                      + self._server_menu(cur, allowed))
+            return
+        if target not in allowed:
+            ctx.reply(f"You're not a moderator of {target.config.name}.\n"
+                      + self._server_menu(cur, allowed))
             return
         self._admin_session.setdefault(ctx.platform, {})[ctx.user_id] = target.config.key
         ctx.reply(f"Now using {target.config.name} for your commands.")
@@ -667,6 +730,7 @@ def _bring_up_bot(bot) -> None:
     # chat. bot + resolve give handlers ctx.bot and the resolved ctx.server.
     router = CommandRouter(
         is_admin=lambda platform, uid: is_admin(platform, uid, auth),
+        is_moderator=lambda platform, uid: is_moderator(platform, uid, auth),
         is_authorized=lambda platform, cid, uid, priv:
             is_authorized(platform, cid, uid, priv, auth),
         on_unclaimed=make_unclaimed_handler(auth),

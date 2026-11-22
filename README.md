@@ -207,9 +207,10 @@ allowlist - Manage the allow/whitelist
 restore_player - Restore one player
 restore - Restore the whole world (stops + restarts the server)
 start - Start the server if it's offline
-chat_id - Show this chat's ID
+chat_id - Show this chat's ID and your user ID
 use - Pick the server your commands act on
 chats - List/authorize/revoke/pause chats
+mods - List/add/remove moderators
 help - Show commands
 ```
 
@@ -262,6 +263,7 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
       { "command": "/chat_id", "description": "Show this chat's ID", "should_escape": false },
       { "command": "/use", "description": "Pick the server your commands act on", "should_escape": false },
       { "command": "/chats", "description": "List/authorize/revoke/pause chats", "should_escape": false },
+      { "command": "/mods", "description": "List/add/remove moderators", "should_escape": false },
       { "command": "/commands", "description": "Show commands", "should_escape": false }
     ]
   },
@@ -411,8 +413,9 @@ One process runs **any mix of bots × servers** from `diamondsign.json`:
   routes each server's events to the chats **bound** to that server, and
   server-scoped commands (`/backup`, `/restore`, …) target a server you pick with
   **`/use <server>`** (or the channel's binding). `/chats authorize <chat_id>
-  <server>` binds a chat to a server. (`/status` is the exception: in an admin DM it lists
-  every server the bot fronts, so it never needs `/use`.)
+  <server>` binds a chat to a server. (`/status` is the exception: in a DM it lists
+  every server you can act on — all of them for the admin, a moderator's granted
+  ones — so it never needs `/use`.)
 - **Many bots** — add more entries to `bots` (e.g. a separate Telegram bot per
   community). Each bot has its own tokens, its own admin, and its own slice of
   `auth.json`. All run in one process with independent pollers (N tokens = N
@@ -452,13 +455,37 @@ without revoking it — commands sent from the chat still work — and
 state survives bot restarts (stored in `auth.json`), and revoking a chat clears
 its pause state.
 
+### Moderators
+
+The admin can let other people run the server-operation commands — `/backup`,
+`/allowlist`, `/restore_player`, `/restore`, `/start`, `/scan_achievements`,
+`/scan_deaths` and `/use` — on the servers they choose. `/update_server`, `/chats`
+and `/mods` stay admin-only, and operational alerts still go only to the admin.
+
+1. The would-be moderator sends `/chat_id` in an authorised group/channel; the
+   reply includes **their user ID**. (They can also DM it to the bot, but only once
+   that platform already has an admin — until then the first DM claims admin.)
+2. In a DM to the bot, the admin sends `/mods add <user_id>` — on a multi-server
+   bot, `/mods add <user_id> <server>`, once per server to grant.
+3. The moderator runs the commands **in a DM with the bot**, like the admin. They
+   only ever reach their granted servers: `/use` and `/status` list just those, a
+   single granted server is picked automatically, and any command aimed at another
+   server is refused.
+
+`/mods` lists moderators (with their names once they've used the bot) and their
+servers; `/mods remove <user_id> [<server>]` revokes one server, or all of them
+when no server is given. Grants are per platform — `/mods` edits the platform you
+send it from, so a Slack moderator is added from Slack — and are stored in
+`auth.json`. On an existing Slack app, re-apply the manifest above (or add the
+`/mods` slash command by hand) before using it.
+
 ---
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Show whether the server is online, and who's playing. In an admin DM it lists every server the bot fronts; in an authorized group/channel it reports just that chat's bound server |
+| `/status` | Show whether the server is online, and who's playing. In a DM it lists every server you can act on (all of them for the admin); in an authorized group/channel it reports just that chat's bound server |
 | `/list` | List all known players |
 | `/update_server [confirm]` | *(Admin)* Show the installed vs available server version; `confirm` backs up, stops, updates and restarts |
 | `/seed` | Show the world seed — Java runs the server's `seed` command (needs the server up); Bedrock reads `RandomSeed` from the world's `level.dat` (works either way) |
@@ -467,19 +494,25 @@ its pause state.
 | `/achievements [player]` | Show player achievements with timestamps |
 | `/deaths [player]` | Show death history |
 | `/death_summary` | Deaths grouped by cause (the killer, e.g. `Iron Golem`, or `Lava`, `Falls`, …), listing each death with player and time |
-| `/chat_id` | Show the current chat's ID |
-| `/use [<server>]` | *(Admin)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only) |
+| `/chat_id` | Show the current chat's ID and your user ID (for `/mods add`) |
+| `/use [<server>]` | *(Admin/Mod)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only; a moderator sees only theirs) |
 | `/chats` | *(Admin)* List authorised chats, numbered (name + bound server + pause state) |
 | `/chats authorize <chat_id> [<server>]` | *(Admin)* Whitelist a chat; on a multi-server bot bind it to `<server>` |
 | `/chats revoke <chat_id>` | *(Admin)* Remove a chat from the whitelist |
 | `/chats pause\|resume <N>` | *(Admin)* Mute/unmute the bot's announcements to chat `N` (commands from it still work) |
-| `/scan_achievements` | *(Admin)* Scan all log files for achievements |
-| `/scan_deaths` | *(Admin)* Scan all log files for deaths |
-| `/backup` | *(Admin)* Trigger a server backup now |
-| `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin)* Manage the server allow/whitelist; the server's response is piped back |
-| `/restore_player <username> [<N> [confirm]]` | *(Admin)* List, select, and restore one player's data |
-| `/restore [<N> [confirm]]` | *(Admin)* Restore the whole world to a backup point — warns players in-game, then stops, replaces, and restarts the server |
-| `/start` | *(Admin)* Start the server if it's offline (via `mux.start_cmd`) |
+| `/mods` | *(Admin)* List moderators and the servers each may act on |
+| `/mods add <user_id> [<server>]` | *(Admin)* Let a user run the moderator commands on `<server>` (the only server, on a one-server bot) |
+| `/mods remove <user_id> [<server>]` | *(Admin)* Revoke one server, or every server when none is given |
+| `/scan_achievements` | *(Admin/Mod)* Scan all log files for achievements |
+| `/scan_deaths` | *(Admin/Mod)* Scan all log files for deaths |
+| `/backup` | *(Admin/Mod)* Trigger a server backup now |
+| `/allowlist <on\|off\|add\|remove\|list\|reload> [player]` | *(Admin/Mod)* Manage the server allow/whitelist; the server's response is piped back |
+| `/restore_player <username> [<N> [confirm]]` | *(Admin/Mod)* List, select, and restore one player's data |
+| `/restore [<N> [confirm]]` | *(Admin/Mod)* Restore the whole world to a backup point — warns players in-game, then stops, replaces, and restarts the server |
+| `/start` | *(Admin/Mod)* Start the server if it's offline (via `mux.start_cmd`) |
+
+*(Admin/Mod)* commands can also be run by a [moderator](#moderators), in a DM with
+the bot, on the servers they've been granted.
 
 **Online-only commands.** `/backup`, `/allowlist`, and `/restore_player` need the
 server **running** and are refused with a clear message when it's offline (bring
@@ -762,8 +795,9 @@ destructive restore, and the player must be offline:
 3. `/restore_player <username> <N> confirm` — performs the restore, keeping the
    current data as a pre-restore safety copy first.
 
-Steps must run in order and within 5 minutes; the selection state is per-admin and
-in-memory (a bot restart clears it).
+Steps must run in order and within 5 minutes; the selection state is per user (admin
+or moderator) and in-memory (a bot restart clears it). The confirm restores exactly the
+version you selected, even if a newer backup has since shifted the list.
 
 The mechanics differ by edition:
 
@@ -993,9 +1027,11 @@ servers in one process never collide. All of it is git-ignored:
 
 Process-wide state (repo root, git-ignored):
 
-- `auth.json` — bot-namespaced admin + authorised chats:
+- `auth.json` — bot-namespaced admin, authorised chats and moderators:
   `{ "<bot>": { "<platform>": { "admin_user_id", "authorized_chat_ids",
-  "chat_servers", "chat_names" } } }`. An older flat / platform-level file is
+  "chat_servers", "chat_names", "paused_chats", "moderators",
+  "moderator_names" } } }` (`moderators` maps a user ID to the server keys they
+  may act on). An older flat / platform-level file is
   auto-migrated on load.
 - `diamondsign.json` — your config. `.env` (if present) is legacy, read only to
   migrate once.
@@ -1033,5 +1069,5 @@ Each run writes a timestamped log under `logs/`. Per-server lines are prefixed
 `[<server>]` and per-bot lines `[<bot>]`, so multi-server output stays
 attributable: join/leave, death, and achievement notifications; every command
 (`[<bot>] <Action>: requested by [<user>] on [<chat>]`); admin actions (claim,
-authorise, revoke); player-registry updates; backup progress; log-rotation and
+authorise, revoke, moderator add/remove); player-registry updates; backup progress; log-rotation and
 server-(re)start detection; and errors.

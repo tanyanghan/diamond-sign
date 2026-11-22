@@ -17,7 +17,9 @@ from pathlib import Path
 from backends import CAP_PLAYER_RESTORE, CAP_STATS, EVENT_DEATH, EVENT_ACHIEVEMENT
 from utils import restore_core
 from core import updates
-from core.auth import AUTH_PATH, auth_lock, save_auth, auth_ns, is_admin
+from core.auth import (
+    AUTH_PATH, auth_lock, save_auth, auth_ns, is_admin, is_moderator,
+)
 from core.state import (
     refresh_player_names, register_player, uuid_by_name,
     record_achievement, record_death,
@@ -315,6 +317,41 @@ def _clear_pending_player_restore(user_id: int) -> None:
         _pending_player_restore.pop(user_id, None)
 
 
+def _version_id(version: dict) -> tuple:
+    """What makes a /restore_player version the one the operator chose: its
+    time, source and backing file. Matching on this, not on the row number,
+    keeps a confirm from landing on a backup that arrived after the listing."""
+    return (version["timestamp"], version["source"], str(version.get("path")))
+
+
+# One log scan per server at a time: _scan_logs unpacks each archive to a
+# fixed path beside it, which two concurrent scans would fight over.
+_scan_locks: dict = {}
+_scan_locks_guard = threading.Lock()
+
+
+def _scan_lock(server) -> threading.Lock:
+    with _scan_locks_guard:
+        return _scan_locks.setdefault(server.config.key, threading.Lock())
+
+
+def _run_scan(ctx, what: str, scan_fn) -> int | None:
+    """Shared body of /scan_achievements and /scan_deaths: the number of new
+    records, or None if another scan of this server was already running."""
+    lock = _scan_lock(ctx.server)
+    if not lock.acquire(blocking=False):
+        ctx.reply(f"A log scan is already running on {ctx.server.config.name}.")
+        return
+    try:
+        refresh_player_names(ctx.server)
+        ctx.reply(f"Scanning log files for {what}s...")
+        total = _scan_logs(scan_fn, ctx.server)
+    finally:
+        lock.release()
+    ctx.reply(f"Scan complete. {total} new {what}(s) recorded.")
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Bot Commands
 # ---------------------------------------------------------------------------
@@ -375,16 +412,23 @@ def register_commands(router, auth: dict) -> None:
                 "/deaths [player] — death history",
                 "/death_summary — deaths grouped by cause",
             ]
-        lines.append("/chat_id — show this chat's ID")
-        if ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth):
-            if len(ctx.bot.servers) > 1:
+        lines.append("/chat_id — show this chat's ID and your user ID")
+        admin = ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth)
+        mod = ctx.is_private and not admin and is_moderator(
+            ctx.platform, ctx.user_id, auth, ctx.server.config.key)
+        if admin or mod:
+            if len(ctx.bot.allowed_servers(ctx)) > 1:
                 lines.append("/use [number|server] — list/pick the server your commands act on")
-            lines += [
-                "/chats — list authorized chats (numbered)",
-                "/chats authorize <chat_id> — whitelist a chat",
-                "/chats revoke <chat_id> — remove a chat from whitelist",
-                "/chats pause|resume <N> — mute/unmute announcements to a chat",
-            ]
+            if admin:
+                lines += [
+                    "/chats — list authorized chats (numbered)",
+                    "/chats authorize <chat_id> — whitelist a chat",
+                    "/chats revoke <chat_id> — remove a chat from whitelist",
+                    "/chats pause|resume <N> — mute/unmute announcements to a chat",
+                    "/mods — list moderators",
+                    "/mods add <user_id> [server] — let a user run moderator commands",
+                    "/mods remove <user_id> [server] — revoke a moderator",
+                ]
             if backend.supports(EVENT_ACHIEVEMENT):
                 lines.append("/scan_achievements — scan all logs for achievements")
             if backend.supports(EVENT_DEATH):
@@ -404,12 +448,14 @@ def register_commands(router, auth: dict) -> None:
     # --- /status ---
     def cmd_status(ctx):
         _cmd_log(ctx, "Status")
-        # An admin DM reports every server this bot fronts (a whole-bot overview);
-        # an authorized group/channel reports just the server bound to it, as
-        # before. A private chat is only reachable by the admin (is_authorized),
-        # so is_private here implies admin — the is_admin check is belt-and-braces.
-        if ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth):
-            servers = ctx.bot.servers
+        # A DM reports every server the sender may act on — all of them for the
+        # admin (a whole-bot overview), a moderator's granted ones otherwise;
+        # an authorized group/channel reports just the server bound to it.
+        if ctx.is_private:
+            servers = ctx.bot.allowed_servers(ctx)
+            if not servers:
+                ctx.reply("You're not a moderator of any server on this bot.")
+                return
         else:
             server = ctx.bot.resolve_target_server(ctx)
             if server is None:
@@ -548,13 +594,11 @@ def register_commands(router, auth: dict) -> None:
     # --- /scan_achievements ---
     def cmd_scan_achievements(ctx):
         _cmd_log(ctx, "ScanAchievements")
-        refresh_player_names(ctx.server)
-        ctx.reply("Scanning log files for achievements...")
-        total = _scan_logs(_scan_log_for_achievements, ctx.server)
-        ctx.reply(f"Scan complete. {total} new achievement(s) recorded.")
-        ctx.bot.log.info("ScanAchievements: %d new achievement(s) found", total)
+        total = _run_scan(ctx, "achievement", _scan_log_for_achievements)
+        if total is not None:
+            ctx.bot.log.info("ScanAchievements: %d new achievement(s) found", total)
     router.register("scan_achievements", cmd_scan_achievements,
-                    private_only=True, admin_only=True,
+                    private_only=True, admin_only=True, moderator=True,
                     cap=lambda ctx: ctx.server.backend.supports(EVENT_ACHIEVEMENT),
                     cap_message="Achievements are not tracked on this server edition.")
 
@@ -616,13 +660,11 @@ def register_commands(router, auth: dict) -> None:
     # --- /scan_deaths ---
     def cmd_scan_deaths(ctx):
         _cmd_log(ctx, "ScanDeaths")
-        refresh_player_names(ctx.server)
-        ctx.reply("Scanning log files for deaths...")
-        total = _scan_logs(_scan_log_for_deaths, ctx.server)
-        ctx.reply(f"Scan complete. {total} new death(s) recorded.")
-        ctx.bot.log.info("ScanDeaths: %d new death(s) found", total)
+        total = _run_scan(ctx, "death", _scan_log_for_deaths)
+        if total is not None:
+            ctx.bot.log.info("ScanDeaths: %d new death(s) found", total)
     router.register("scan_deaths", cmd_scan_deaths,
-                    private_only=True, admin_only=True,
+                    private_only=True, admin_only=True, moderator=True,
                     cap=lambda ctx: ctx.server.backend.supports(EVENT_DEATH),
                     cap_message="Deaths are not tracked on this server edition.")
 
@@ -649,7 +691,7 @@ def register_commands(router, auth: dict) -> None:
 
         threading.Thread(target=run, daemon=True).start()
     router.register("backup", cmd_backup, private_only=True, admin_only=True,
-                    needs_online=True)
+                    moderator=True, needs_online=True)
 
     # --- /update_server (server version) ---
     # Named update_server, not update: Slack reserves /update.
@@ -744,6 +786,13 @@ def register_commands(router, auth: dict) -> None:
         if not backend.is_available():
             ctx.reply("Server is not reachable right now — try again once it's up.")
             return
+        # A change made while a restore or update swaps the server directory
+        # would be lost with the old directory; a backup only briefly holds
+        # the lock, so asking again shortly is cheap.
+        if sub != "list" and ctx.server.backup_lock.locked():
+            ctx.reply("A backup, restore or update is running — try again in "
+                      "a moment.")
+            return
         ctx.server.log.info("Allowlist: '%s %s' by [%s] on [%s]", verb,
                             " ".join(ctx.args), ctx.sender_label, ctx.chat_label)
 
@@ -761,7 +810,7 @@ def register_commands(router, auth: dict) -> None:
 
         threading.Thread(target=run, daemon=True).start()
     router.register("allowlist", cmd_allowlist, private_only=True,
-                    admin_only=True, needs_online=True)
+                    admin_only=True, moderator=True, needs_online=True)
 
     # --- /restore_player ---
     def cmd_restore_player(ctx):
@@ -835,14 +884,17 @@ def register_commands(router, auth: dict) -> None:
                 ctx.reply(f"You must select a timestamp first with "
                           f"/restore_player {canonical} {n}")
                 return
+            # Restore the version that was selected and shown in the confirm
+            # prompt -- not whatever row N is now: a backup taken meanwhile
+            # shifts the list. Re-list only to check it still exists.
+            chosen = _version_id(entry["versions"][n - 1])
             versions = backend.list_player_versions(uuid, server.load_manifest()[:2])
-            if not (1 <= n <= len(versions)):
+            version = next((v for v in versions if _version_id(v) == chosen), None)
+            if version is None:
                 _clear_pending_player_restore(pkey)
-                ctx.reply(f"Selection {n} is no longer valid (only "
-                          f"{len(versions)} version(s) available). "
-                          f"Run /restore_player {canonical} again.")
+                ctx.reply(f"The selected backup ({chosen[0]}) is no longer "
+                          f"available. Run /restore_player {canonical} again.")
                 return
-            version = versions[n - 1]
             server.log.info("RestorePlayer: [%s] on [%s] confirmed restore of %s "
                         "to %s (source: %s)", ctx.sender_label, ctx.chat_label,
                         canonical, version["timestamp"], version["source"])
@@ -883,7 +935,8 @@ def register_commands(router, auth: dict) -> None:
                     ctx.sender_label, ctx.chat_label, n, version["source"], canonical)
         ctx.reply(_format_confirm_reply(canonical, uuid, n, version))
     router.register("restore_player", cmd_restore_player,
-                    private_only=True, admin_only=True, needs_online=True,
+                    private_only=True, admin_only=True, moderator=True,
+                    needs_online=True,
                     cap=lambda ctx: ctx.server.backend.supports(CAP_PLAYER_RESTORE),
                     cap_message="Per-player restore is not available on this server edition.")
 
@@ -1051,15 +1104,24 @@ def register_commands(router, auth: dict) -> None:
 
         threading.Thread(target=run, daemon=True).start()
     router.register("restore", cmd_restore, private_only=True, admin_only=True,
+                    moderator=True,
                     cap=lambda ctx: ctx.server.backend.can_restart,
                     cap_message="World restore needs a restart transport — set "
                                 "mux.session + mux.start_cmd for this server.")
 
-    # --- /start (admin: bring the server up via its start command) ---
+    # --- /start (admin/moderator: bring the server up via its start command) ---
     def cmd_start(ctx):
         server = ctx.server
         _cmd_log(ctx, "Start")
+        # Held through the relaunch: a restore or update stops the server
+        # while holding it, and starting it then would bring it up on a
+        # half-replaced world or binary. It also stops two /starts racing.
+        if not server.backup_lock.acquire(blocking=False):
+            ctx.reply("A backup, restore or update is running — "
+                      f"{server.config.name} will be started by it if needed.")
+            return
         if server.backend.is_online():
+            server.backup_lock.release()
             ctx.reply(f"{server.config.name} is already running.")
             return
         ctx.reply(f"Starting {server.config.name}...")
@@ -1071,8 +1133,12 @@ def register_commands(router, auth: dict) -> None:
         def run():
             # relaunch = type the start command into the mux session, then wait
             # for the server to report ready. We deliberately do NOT auto-start
-            # from other commands — the admin invokes /start explicitly.
-            if server.backend.relaunch(say):
+            # from other commands — an operator invokes /start explicitly.
+            try:
+                ok = server.backend.relaunch(say)
+            finally:
+                server.backup_lock.release()
+            if ok:
                 reconcile_online(server, reason="after /start")
                 say(f"{server.config.name} is up.")
             else:
@@ -1081,22 +1147,24 @@ def register_commands(router, auth: dict) -> None:
 
         threading.Thread(target=run, daemon=True).start()
     router.register("start", cmd_start, private_only=True, admin_only=True,
+                    moderator=True,
                     cap=lambda ctx: ctx.server.backend.can_restart,
                     cap_message="/start needs a start transport — set "
                                 "mux.session + mux.start_cmd for this server.")
 
-    # --- /chat_id (public — lets an unauthorized chat learn its ID) ---
+    # --- /chat_id (public — lets an unauthorized chat learn its ID, and a
+    # would-be moderator learn their user ID for /mods add) ---
     def cmd_chat_id(ctx):
         _cmd_log(ctx, "ChatID", f" (chat_id={ctx.chat_id})")
-        ctx.reply(f"Chat ID: {ctx.chat_id}")
+        ctx.reply(f"Chat ID: {ctx.chat_id}\nYour user ID: {ctx.user_id}")
     router.register("chat_id", cmd_chat_id, public=True, needs_server=False)
 
-    # --- /use (multi-server: pick this admin's target server) ---
+    # --- /use (multi-server: pick this user's target server) ---
     def cmd_use(ctx):
         _cmd_log(ctx, "Use", f" (args={ctx.args})")
         ctx.bot.set_use(ctx)
     router.register("use", cmd_use, private_only=True, admin_only=True,
-                    needs_server=False)
+                    moderator=True, needs_server=False)
 
     # --- /chats (list / authorize / revoke / pause / resume) ---
     # One umbrella for chat administration. /chat_id stays separate on
@@ -1244,16 +1312,138 @@ def register_commands(router, auth: dict) -> None:
     router.register("chats", cmd_chats, private_only=True,
                     admin_only=True, needs_server=False)
 
+    # --- /mods (list / add / remove moderators) ---
+    # A moderator may run the moderator commands (/backup, /allowlist,
+    # /restore_player, /restore, /start, /scan_*, /use) in a DM with the bot,
+    # on the servers granted here. Grants are per platform: /mods edits the
+    # platform it is sent from.
+
+    def _mods_server_arg(ctx, args, usage):
+        """The <server> for /mods add|remove: the sole server of a one-server
+        bot, else the named one. Replies and returns None if missing/unknown."""
+        if len(args) >= 2:
+            server = ctx.bot.find_server(args[1])
+            if server is None:
+                names = ", ".join(sorted(ctx.bot.by_name)) or "(none)"
+                ctx.reply(f"Unknown server '{args[1]}'.\nServers: {names}")
+            return server
+        if len(ctx.bot.servers) == 1:
+            return ctx.bot.servers[0]
+        ctx.reply(f"{usage}\nServers: {', '.join(sorted(ctx.bot.by_name))}")
+        return None
+
+    def _mods_add(ctx, args):
+        multi = len(ctx.bot.servers) > 1
+        usage = ("Usage: /mods add <user_id> <server>" if multi
+                 else "Usage: /mods add <user_id>")
+        uid = args[0].strip() if args else ""
+        if not uid:
+            ctx.reply(usage + "\n(They can get their user ID by sending /chat_id.)")
+            return
+        if is_admin(ctx.platform, uid, auth):
+            ctx.reply("That's the admin — they can already run every command.")
+            return
+        server = _mods_server_arg(ctx, args, usage)
+        if server is None:
+            return
+        key = server.config.key
+        with auth_lock:
+            mods = auth_ns(auth, ctx.platform)["moderators"]
+            granted = mods.setdefault(uid, [])
+            already = key in granted
+            if not already:
+                granted.append(key)
+                save_auth(ctx.bot.auth_doc, AUTH_PATH)
+        if already:
+            ctx.reply(f"{uid} is already a moderator of {server.config.name}.")
+            return
+        ctx.bot.log.info("Mods: add %s -> %s by [%s] on [%s]", uid,
+                         server.config.name, ctx.sender_label, ctx.chat_label)
+        ctx.reply(f"{uid} is now a moderator of {server.config.name}. They run "
+                  "moderator commands in a DM with the bot.")
+
+    def _mods_remove(ctx, args):
+        usage = "Usage: /mods remove <user_id> [<server>]"
+        uid = args[0].strip() if args else ""
+        if not uid:
+            ctx.reply(usage)
+            return
+        server = None
+        if len(args) >= 2:
+            server = _mods_server_arg(ctx, args, usage)
+            if server is None:
+                return
+        with auth_lock:
+            ns = auth_ns(auth, ctx.platform)
+            granted = ns["moderators"].get(uid)
+            if not granted or (server is not None
+                               and server.config.key not in granted):
+                where = f" of {server.config.name}" if server else ""
+                ctx.reply(f"{uid} is not a moderator{where}.")
+                return
+            if server is not None:
+                granted.remove(server.config.key)
+            if server is None or not granted:
+                ns["moderators"].pop(uid, None)
+                ns["moderator_names"].pop(uid, None)
+            save_auth(ctx.bot.auth_doc, AUTH_PATH)
+        # Drop any /use selection so nothing stays pointed at a server they
+        # lost (resolution would refuse it anyway).
+        ctx.bot.clear_use(ctx.platform, uid)
+        what = server.config.name if server else "all servers"
+        ctx.bot.log.info("Mods: remove %s from %s by [%s] on [%s]", uid, what,
+                         ctx.sender_label, ctx.chat_label)
+        ctx.reply(f"{uid} is no longer a moderator of {what}.")
+
+    def _mods_list(ctx):
+        ns = auth.get(ctx.platform) or {}
+        mods = ns.get("moderators") or {}
+        if not mods:
+            ctx.reply("No moderators. Add one with /mods add <user_id>"
+                      + (" <server>" if len(ctx.bot.servers) > 1 else "") + ".")
+            return
+        names = ns.get("moderator_names") or {}
+        lines = ["Moderators:"]
+        for uid, keys in mods.items():
+            who = f"{names[uid]} ({uid})" if uid in names else uid
+            servers = ", ".join(
+                (ctx.bot.by_key[k].config.name if k in ctx.bot.by_key else k)
+                for k in keys)
+            lines.append(f"  {who} -> {servers}")
+        ctx.reply("\n".join(lines))
+
+    _MODS_USAGE = ("Usage: /mods  |  /mods add <user_id> [<server>]"
+                   "  |  /mods remove <user_id> [<server>]")
+
+    def cmd_mods(ctx):
+        _cmd_log(ctx, "Mods", f" (args={ctx.args})" if ctx.args else "")
+        sub = ctx.args[0].lower() if ctx.args else None
+        rest = ctx.args[1:]
+        if sub is None:
+            _mods_list(ctx)
+        elif sub == "add":
+            _mods_add(ctx, rest)
+        elif sub == "remove":
+            _mods_remove(ctx, rest)
+        else:
+            ctx.reply(_MODS_USAGE)
+    router.register("mods", cmd_mods, private_only=True, admin_only=True,
+                    needs_server=False)
+
 
 def make_unclaimed_handler(auth: dict):
     """Build the admin-claim hook: the first private message on a platform with
     no admin yet claims that platform's admin."""
     def on_unclaimed(ctx) -> bool:
         ns = auth.get(ctx.platform) or {}
-        if ns.get("admin_user_id") is not None or not ctx.is_private:
+        # A namespace with moderators but no admin is not a fresh install (its
+        # admin_user_id was lost) — never hand admin to whoever DMs next.
+        if ns.get("admin_user_id") is not None or not ctx.is_private \
+                or ns.get("moderators"):
             return False
         with auth_lock:
-            if auth_ns(auth, ctx.platform).get("admin_user_id") is not None:
+            fresh = auth_ns(auth, ctx.platform)
+            if fresh.get("admin_user_id") is not None or fresh.get("moderators"):
                 return False
             auth_ns(auth, ctx.platform)["admin_user_id"] = ctx.user_id
             save_auth(ctx.bot.auth_doc, AUTH_PATH)

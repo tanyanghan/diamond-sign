@@ -106,13 +106,17 @@ class CommandRouter:
 
     Replaces telebot's ``@bot.message_handler`` decorators and the per-handler
     ``guard``/``is_admin``/``chat.type`` boilerplate. Authorization is delegated
-    to the ``is_admin``/``is_authorized`` callables (see ``bot`` auth helpers).
+    to the ``is_admin``/``is_moderator``/``is_authorized`` callables (see
+    ``bot`` auth helpers).
     """
 
     def __init__(self, is_admin, is_authorized, on_unclaimed=None,
-                 logger=None, bot=None, resolve=None):
+                 logger=None, bot=None, resolve=None, is_moderator=None):
         self._cmds = {}              # name -> spec dict
         self._is_admin = is_admin
+        # is_moderator(platform, user_id) -> moderates any server. Which server
+        # is checked by the resolve hook, once ctx.server is known.
+        self._is_moderator = is_moderator or (lambda platform, uid: False)
         self._is_authorized = is_authorized
         self._on_unclaimed = on_unclaimed  # called for any message when admin unclaimed
         self._log = logger
@@ -124,13 +128,17 @@ class CommandRouter:
 
     def register(self, names, handler, *, private_only=False, admin_only=False,
                  cap=None, cap_message=None, public=False, needs_server=True,
-                 needs_online=False):
+                 needs_online=False, moderator=False):
+        """``moderator`` lets a moderator run an ``admin_only`` command too. It
+        must be ``private_only``: moderator access is granted only in a DM."""
         if isinstance(names, str):
             names = [names]
+        assert not moderator or (admin_only and private_only), \
+            "moderator commands must be admin_only and private_only"
         spec = {"handler": handler, "private_only": private_only,
                 "admin_only": admin_only, "cap": cap, "cap_message": cap_message,
                 "public": public, "needs_server": needs_server,
-                "needs_online": needs_online}
+                "needs_online": needs_online, "moderator": moderator}
         for n in names:
             self._cmds[n] = spec
 
@@ -167,12 +175,16 @@ class CommandRouter:
             return
         if spec["private_only"] and not ctx.is_private:
             return
-        if spec["admin_only"] and not self._is_admin(ctx.platform, ctx.user_id):
+        if spec["admin_only"] and not self._is_admin(ctx.platform, ctx.user_id) \
+                and not (spec["moderator"]
+                         and self._is_moderator(ctx.platform, ctx.user_id)):
             return
         # Target-server resolution for server-scoped commands: sets ctx.server,
         # or (on a multi-server bot with no binding/selection) replies with a
-        # disambiguation message and short-circuits. Runs before cap so cap
-        # checks can consult ctx.server.backend.
+        # disambiguation message and short-circuits. It also refuses a
+        # moderator's DM aimed at a server they don't moderate — before the
+        # liveness/cap checks, so they never learn another server's state.
+        # Runs before cap so cap checks can consult ctx.server.backend.
         if spec["needs_server"] and self._resolve is not None:
             if not self._resolve(ctx):
                 return
@@ -189,6 +201,9 @@ class CommandRouter:
             if spec["cap_message"]:
                 ctx.reply(spec["cap_message"])
             return
+        # Keep a moderator's display name current for /mods (no-op otherwise).
+        if self._bot is not None and ctx.is_private:
+            self._bot.note_moderator_name(ctx)
         try:
             spec["handler"](ctx)
         except Exception:

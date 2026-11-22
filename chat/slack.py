@@ -109,8 +109,10 @@ class SlackAdapter(ChatAdapter):
                 full = cmd + ((" " + arg_text) if arg_text else "")
                 channel_id = command["channel_id"]
                 channel_name = command.get("channel_name")
-                is_private = (channel_name == "directmessage"
-                              or channel_id.startswith("D"))
+                # A DM is identified by its channel ID ("D…"), which Slack
+                # assigns, not by the "directmessage" name: DMs carry admin and
+                # moderator powers, so the check must not hinge on a string.
+                is_private = channel_id.startswith("D")
                 ctx = Context(
                     adapter=self,
                     chat_id=channel_id,
