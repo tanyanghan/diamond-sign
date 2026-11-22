@@ -455,7 +455,7 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /start, /commands ---
     def cmd_help(ctx):
-        _cmd_log(ctx, "Help")
+        _cmd_log(ctx, "Commands")
         backend = ctx.server.backend
         lines = [
             "Available commands:",
@@ -512,7 +512,7 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /online ---
     def cmd_status(ctx):
-        _cmd_log(ctx, "Status")
+        _cmd_log(ctx, "Online")
         # A DM reports every server the sender may act on — all of them for the
         # admin (a whole-bot overview), a moderator's granted ones otherwise;
         # an authorized group/channel reports just the server bound to it.
@@ -532,7 +532,7 @@ def register_commands(router, auth: dict) -> None:
             servers = [server]
         reply = "\n".join(_status_line(s) for s in servers)
         ctx.reply(reply)
-        ctx.bot.log.info("Status: replied to [%s] — %d server(s)",
+        ctx.bot.log.info("Online: replied to [%s] — %d server(s)",
                          ctx.sender_label, len(servers))
     router.register("online", cmd_status, needs_server=False)
 
