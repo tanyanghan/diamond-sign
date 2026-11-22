@@ -377,7 +377,7 @@ def _claim_pending(store: dict, lock, pkey: str, entry: dict, **expect) -> bool:
         return True
 
 
-# /msg: one message per user per _MSG_COOLDOWN seconds, so a group can't flood
+# /say: one message per user per _MSG_COOLDOWN seconds, so a group can't flood
 # the game (or the shared Bedrock console) with them.
 _MSG_COOLDOWN = 5.0
 _msg_last: dict = {}
@@ -475,7 +475,7 @@ def register_commands(router, auth: dict) -> None:
                 "/deaths [player] — death history",
                 "/death_summary — deaths grouped by cause",
             ]
-        lines.append(f"{ctx.adapter.command_label('msg')} <text> — send a message "
+        lines.append(f"{ctx.adapter.command_label('say')} <text> — send a message "
                      "to players in game")
         lines.append("/chat_id — show this chat's ID and your user ID")
         admin = ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth)
@@ -878,7 +878,7 @@ def register_commands(router, auth: dict) -> None:
         args = [sub]
         if sub in ("add", "remove"):
             # One name: the rest of the line, with any quotes the user typed
-            # dropped. (The other user text typed into the pane is /msg, which
+            # dropped. (The other user text typed into the pane is /say, which
             # Bedrock escapes to [A-Za-z0-9] + \uXXXX.) Letters, digits, _ and
             # single spaces only: on Bedrock
             # the line is typed into the server's tmux/screen pane, which is a
@@ -1302,13 +1302,13 @@ def register_commands(router, auth: dict) -> None:
         ctx.reply(f"Chat ID: {ctx.chat_id}\nYour user ID: {ctx.user_id}")
     router.register("chat_id", cmd_chat_id, public=True, needs_server=False)
 
-    # --- /msg (Slack: /say) — a chat user's line in the game chat ---
+    # --- /say — a chat user's line in the game chat ---
     # Shown to every player as "<ethereal voice> <handle>: <text>". Open to
     # anyone who can run commands here: an authorised group (its bound server)
     # or the admin/moderators in a DM (their servers).
-    def cmd_msg(ctx):
+    def cmd_say(ctx):
         server = ctx.server
-        label = ctx.adapter.command_label("msg")
+        label = ctx.adapter.command_label("say")
         parts = (ctx.text or "").split(maxsplit=1)
         text = parts[1] if len(parts) > 1 else ""
         if ctx.platform == "slack":
@@ -1321,7 +1321,7 @@ def register_commands(router, auth: dict) -> None:
         name = clean_chat_name(str(ctx.sender_label).lstrip("@"))[:32].strip()
         if not has_visible_text(name):
             name = str(ctx.user_id)
-        _cmd_log(ctx, "Msg")
+        _cmd_log(ctx, "Say")
 
         # Cooldown slot: (time it counts from, owner). Reserved as in flight
         # (inf never ages out) until this request settles it, so a slow send
@@ -1337,7 +1337,7 @@ def register_commands(router, auth: dict) -> None:
                 or time.monotonic() - entry[0] < _MSG_COOLDOWN)
             if not busy:
                 _msg_last[key] = (float("inf"), token)
-        if busy:  # replied outside the lock: a slow chat API mustn't stall /msg
+        if busy:  # replied outside the lock: a slow chat API mustn't stall /say
             ctx.reply("Please wait a few seconds between messages.")
             return
 
@@ -1389,7 +1389,7 @@ def register_commands(router, auth: dict) -> None:
                 return
             finish(time.monotonic())  # spacing counts from the actual send
             sent, trimmed = result
-            server.log.info("Msg: [%s] (%s) on [%s] -> %s: %s",
+            server.log.info("Say: [%s] (%s) on [%s] -> %s: %s",
                             clean_chat_text(ctx.sender_label), ctx.user_id,
                             clean_chat_text(ctx.chat_label), server.config.name,
                             sent)
@@ -1403,7 +1403,7 @@ def register_commands(router, auth: dict) -> None:
         except BaseException:
             finish(None)  # the worker never ran: don't leave the slot in flight
             raise
-    router.register("msg", cmd_msg)
+    router.register("say", cmd_say)
 
     # --- /use (multi-server: pick this user's target server) ---
     def cmd_use(ctx):

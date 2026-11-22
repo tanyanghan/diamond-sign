@@ -258,7 +258,7 @@ class ServerBackend(ABC):
         return strip_minecraft_formatting(
             self.capture_command("seed", timeout=timeout))
 
-    # --- /msg: a chat user's line in the game chat ---
+    # --- /say: a chat user's line in the game chat ---
     # Encoded line budget (bytes), per edition; subclasses set their own.
     MSG_LINE_LIMIT = 600
     # Longest message considered before fitting it to the budget.
@@ -311,7 +311,7 @@ class ServerBackend(ABC):
             trimmed = True
             line = self._tellraw_line(name, text + "…")
         if len(line.encode("utf-8")) > self.MSG_LINE_LIMIT:
-            # Only a name too long to leave room for any text gets here (/msg
+            # Only a name too long to leave room for any text gets here (/say
             # caps names at 32 characters, which always fits).
             raise ValueError("name too long to fit a message line")
         if trimmed and not has_visible_text(text):

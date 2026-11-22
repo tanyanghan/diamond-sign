@@ -1,6 +1,6 @@
-"""Self-contained tests for /msg: a chat user's line in the game chat.
+"""Self-contained tests for /say: a chat user's line in the game chat.
 
-Run with plain ``python tests/test_msg.py`` (needs the bot's requirements: it
+Run with plain ``python tests/test_say.py`` (needs the bot's requirements: it
 imports bot.py, which loads a config -- a throwaway one is generated from
 diamondsign.example.json, so nothing in the repo is touched).
 
@@ -168,7 +168,7 @@ def test_size_caps():
           f"({len(line.encode())} bytes)")
     worst = "\U0001f600" * 32
     line, _, _ = b._fit_tellraw(worst, "hi")
-    check(len(line.encode()) <= 600, "the longest /msg name (32 emoji) still fits")
+    check(len(line.encode()) <= 600, "the longest /say name (32 emoji) still fits")
     try:
         b._fit_tellraw("\u4e2d" * 200, "hi")
         check(False, "a name too long for any line is refused")
@@ -204,7 +204,7 @@ def test_real_tell_all_busy():
         check(not guard.locked(), f"{type(backend).__name__}: lock released")
 
 
-# --- /msg command --------------------------------------------------------------
+# --- /say command --------------------------------------------------------------
 ADMIN, MOD, MEMBER, STRANGER = "100", "200", "300", "400"
 
 
@@ -263,7 +263,7 @@ class _Router:
 def msg_handler():
     r = _Router()
     cmds.register_commands(r, {})
-    return r.handlers["msg"]
+    return r.handlers["say"]
 
 
 def run_msg(c, server):
@@ -278,45 +278,45 @@ def run_msg(c, server):
 
 
 def test_text_extraction_and_name():
-    print("/msg text and name")
+    print("/say text and name")
     srv = make_server()
-    c = run_msg(ctx_for("/msg Hello   there,\neveryone!"), srv)
+    c = run_msg(ctx_for("/say Hello   there,\neveryone!"), srv)
     check(srv.backend.told == [("u300", "Hello there, everyone!")] and
           c.sent[-1] == "Sent.", f"text after the command word, cleaned ({srv.backend.told})")
     srv = make_server()
-    run_msg(ctx_for("/msg@DiamondSignBot hi"), srv)
-    check(srv.backend.told == [("u300", "hi")], "Telegram /msg@Bot form")
+    run_msg(ctx_for("/say@DiamondSignBot hi"), srv)
+    check(srv.backend.told == [("u300", "hi")], "Telegram /say@Bot form")
     srv = make_server()
-    run_msg(ctx_for("/msg a &lt; b &amp;&amp; c", platform="slack"), srv)
+    run_msg(ctx_for("/say a &lt; b &amp;&amp; c", platform="slack"), srv)
     check(srv.backend.told == [("u300", "a < b && c")], "Slack entities unescaped")
-    for bare in ("/msg", "/msg   ", "/msg §\u202e", "/msg \u200b\u200d"):
+    for bare in ("/say", "/say   ", "/say §\u202e", "/say \u200b\u200d"):
         srv = make_server()
         c = ctx_for(bare)
         c.server = srv
         cmds._msg_last.clear()
         msg_handler()(c)
-        check(not srv.backend.told and "Usage: /msg" in c.replies[-1],
+        check(not srv.backend.told and "Usage: /say" in c.replies[-1],
               f"{bare!r} -> usage, nothing sent")
     srv = make_server()
-    run_msg(ctx_for("/msg hi", label="@" + "x" * 50), srv)
+    run_msg(ctx_for("/say hi", label="@" + "x" * 50), srv)
     check(srv.backend.told[0][0] == "x" * 32, "@ dropped, name capped at 32")
     srv = make_server()
-    run_msg(ctx_for("/msg hi", user="777", label="\u202e\u200b"), srv)
+    run_msg(ctx_for("/say hi", user="777", label="\u202e\u200b"), srv)
     check(srv.backend.told[0][0] == "777", "empty name after cleaning -> user id")
-    check(SlackAdapter.command_label(None, "msg") == "/say"
-          and _RENAMED_INV.get("say") == "msg",
-          "Slack: /say is shown and routes back to msg")
+    check(SlackAdapter.command_label(None, "say") == "/say"
+          and "say" not in _RENAMED_INV,
+          "Slack uses the same /say name, with no rename")
 
 
 def test_cooldown_busy_offline():
-    print("/msg cooldown, busy, offline")
+    print("/say cooldown, busy, offline")
     srv = make_server()
     cmds._msg_last.clear()
     h = msg_handler()
-    c1 = ctx_for("/msg one")
+    c1 = ctx_for("/say one")
     c1.server = srv
     h(c1)
-    c2 = ctx_for("/msg two")
+    c2 = ctx_for("/say two")
     c2.server = srv
     h(c2)
     time.sleep(0.2)
@@ -326,11 +326,11 @@ def test_cooldown_busy_offline():
 
     srv = make_server()
     srv.lifecycle_lock.acquire()
-    c = run_msg(ctx_for("/msg hi"), srv)
+    c = run_msg(ctx_for("/say hi"), srv)
     srv.lifecycle_lock.release()
     check(not srv.backend.told and "try again" in c.sent[-1],
           "busy lifecycle lock: nothing sent")
-    c = ctx_for("/msg hi again")             # no _msg_last.clear(): a real retry
+    c = ctx_for("/say hi again")             # no _msg_last.clear(): a real retry
     c.server = srv
     msg_handler()(c)
     for _ in range(100):
@@ -340,13 +340,13 @@ def test_cooldown_busy_offline():
     check(srv.backend.told == [("u300", "hi again")],
           "...and an immediate retry isn't refused by the cooldown")
     srv = make_server(online=False)
-    c = run_msg(ctx_for("/msg hi"), srv)
+    c = run_msg(ctx_for("/say hi"), srv)
     check(not srv.backend.told and "offline" in c.sent[-1],
           "offline server: nothing sent")
 
 
 def test_lock_only_around_send():
-    print("/msg holds lifecycle_lock only around the send")
+    print("/say holds lifecycle_lock only around the send")
     srv = make_server()
     probing, release = threading.Event(), threading.Event()
 
@@ -355,7 +355,7 @@ def test_lock_only_around_send():
         release.wait(2)
         return True
     srv.backend.is_online = slow_probe
-    c = ctx_for("/msg hi")
+    c = ctx_for("/say hi")
     c.server = srv
     cmds._msg_last.clear()
     msg_handler()(c)
@@ -402,7 +402,7 @@ def test_trim_keeps_sequences_and_content():
 
 
 def test_cooldown_in_flight():
-    print("/msg cooldown while a send is in flight")
+    print("/say cooldown while a send is in flight")
     srv = make_server()
     probing, release = threading.Event(), threading.Event()
 
@@ -413,15 +413,15 @@ def test_cooldown_in_flight():
     srv.backend.is_online = slow_probe
     cmds._msg_last.clear()
     h = msg_handler()
-    c1 = ctx_for("/msg first")
+    c1 = ctx_for("/say first")
     c1.server = srv
     h(c1)
     probing.wait(2)
-    c2 = ctx_for("/msg second")
+    c2 = ctx_for("/say second")
     c2.server = srv
     h(c2)
     check("wait a few seconds" in c2.replies[-1],
-          "a second /msg is refused while the first is still in flight")
+          "a second /say is refused while the first is still in flight")
     release.set()
     for _ in range(100):
         if c1.sent:
@@ -431,7 +431,7 @@ def test_cooldown_in_flight():
     slot = cmds._msg_last.get(("telegram", MEMBER))
     check(slot is not None and slot[0] != float("inf"),
           "after the send the slot holds the send time, not 'in flight'")
-    c3 = ctx_for("/msg third")
+    c3 = ctx_for("/say third")
     c3.server = srv
     h(c3)
     check("wait a few seconds" in c3.replies[-1],
@@ -439,7 +439,7 @@ def test_cooldown_in_flight():
 
 
 def test_cooldown_settles_on_every_path():
-    print("/msg cooldown on failure, offline and a failed thread start")
+    print("/say cooldown on failure, offline and a failed thread start")
     key = ("telegram", MEMBER)
 
     def wait_sent(c):
@@ -455,7 +455,7 @@ def test_cooldown_settles_on_every_path():
     srv.backend.tell_all = boom
     cmds._msg_last.clear()
     h = msg_handler()
-    c = ctx_for("/msg one")
+    c = ctx_for("/say one")
     c.server = srv
     h(c)
     wait_sent(c)
@@ -463,11 +463,11 @@ def test_cooldown_settles_on_every_path():
           "a failed send gives the slot back")
 
     srv = make_server(online=False)
-    c = ctx_for("/msg one")
+    c = ctx_for("/say one")
     c.server = srv
     h(c)
     wait_sent(c)
-    c2 = ctx_for("/msg two")
+    c2 = ctx_for("/say two")
     c2.server = srv
     h(c2)
     check("offline" in c.sent[-1] and "wait a few seconds" in c2.replies[-1],
@@ -484,7 +484,7 @@ def test_cooldown_settles_on_every_path():
             raise RuntimeError("can't start new thread")
     cmds.threading.Thread = NoThread
     try:
-        c = ctx_for("/msg one")
+        c = ctx_for("/say one")
         c.server = make_server()
         try:
             h(c)
@@ -503,7 +503,7 @@ def test_visible_icons():
 
 
 def test_bedrock_concurrency_and_capture():
-    print("Bedrock: concurrent /msgs and captures")
+    print("Bedrock: concurrent /say messages and captures")
     b = bedrock_backend()
     log = _TMP / "console.log"
     log.write_text("")
@@ -526,7 +526,7 @@ def test_bedrock_concurrency_and_capture():
     for t in threads:
         t.join(5)
     check(len(results) == 2 and all(r is not None for r in results),
-          "two concurrent /msgs are both sent (no false busy)")
+          "two concurrent /say messages are both sent (no false busy)")
 
     # A tellraw must not be typed while a `list` capture is reading its reply.
     in_list, finish_list = threading.Event(), threading.Event()
@@ -561,7 +561,7 @@ def test_bedrock_concurrency_and_capture():
 
 
 def test_permissions():
-    print("who can /msg")
+    print("who can /say")
     auth = {"telegram": _normalize_ns({
         "admin_user_id": ADMIN, "authorized_chat_ids": ["-5"],
         "chat_servers": {"-5": "b"}, "moderators": {MOD: ["a"]}})}
@@ -577,14 +577,14 @@ def test_permissions():
         bot=types.SimpleNamespace(note_chat_name=lambda c: None,
                                   note_moderator_name=lambda c: None),
         resolve=bot.resolve_command)
-    r.register("msg", lambda c: hits.append((c.user_id, c.server.config.key)))
-    r.dispatch(ctx_for("/msg hi", user=MEMBER, chat="-5"))
+    r.register("say", lambda c: hits.append((c.user_id, c.server.config.key)))
+    r.dispatch(ctx_for("/say hi", user=MEMBER, chat="-5"))
     check(hits[-1:] == [(MEMBER, "b")], "authorised-group member -> bound server")
-    r.dispatch(ctx_for("/msg hi", user=MEMBER, chat="-9"))
+    r.dispatch(ctx_for("/say hi", user=MEMBER, chat="-9"))
     check(len(hits) == 1, "unauthorised group ignored")
-    r.dispatch(ctx_for("/msg hi", user=STRANGER, chat=STRANGER, private=True))
+    r.dispatch(ctx_for("/say hi", user=STRANGER, chat=STRANGER, private=True))
     check(len(hits) == 1, "stranger's DM ignored")
-    r.dispatch(ctx_for("/msg hi", user=MOD, chat=MOD, private=True))
+    r.dispatch(ctx_for("/say hi", user=MOD, chat=MOD, private=True))
     check(hits[-1:] == [(MOD, "a")], "moderator DM -> their server")
 
 
@@ -594,7 +594,7 @@ def test_cmd_log_single_line():
     c = ctx_for("/x", label="evil\n[bot] Admin claimed")
     c.chat_label = "group\nforged"
     c.bot.log = types.SimpleNamespace(info=lambda fmt, *a: lines.append(fmt % a))
-    cmds._cmd_log(c, "Msg")
+    cmds._cmd_log(c, "Say")
     check(len(lines) == 1 and "\n" not in lines[0],
           f"one line even with newlines in the labels ({lines[0]!r})")
 

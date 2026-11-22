@@ -335,7 +335,7 @@ class BedrockBackend(ServerBackend):
         # work stays outside this lock, which every Bedrock server shares), so
         # the echo can't land between a `list` header and its names line
         # (query_online_players) and be read as a player, and so concurrent
-        # /msgs are serialised. It is taken BEFORE the lifecycle guard: /msg
+        # /say messages are serialised. It is taken BEFORE the lifecycle guard: /say
         # never holds a lifecycle lock while waiting out another (possibly
         # another server's) capture. Elsewhere the order is lifecycle ->
         # capture (/start, /allowlist, restore); that's safe because the guard

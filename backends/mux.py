@@ -42,7 +42,7 @@ class ConsoleMultiplexer:
         command is either a fixed literal (``save hold``, ``list``, …) or
         ``allowlist <sub> <name>`` whose ``<name>`` /allowlist validated as words
         of ``[A-Za-z0-9_]`` separated by single spaces (double-quoted when it has
-        a space), or a /msg ``tellraw`` whose text is ``[A-Za-z0-9]`` plus
+        a space), or a /say ``tellraw`` whose text is ``[A-Za-z0-9]`` plus
         ``\\uXXXX`` escapes only (backends/bedrock.py ``_rawtext_escape``) — all
         inert even at a shell prompt. A control char here means the input was
         not what the caller thinks. Refuse rather than send a partial or a second
