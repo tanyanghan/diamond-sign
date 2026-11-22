@@ -470,7 +470,9 @@ and `/mods` stay admin-only, and operational alerts still go only to the admin.
 3. The moderator runs the commands **in a DM with the bot**, like the admin. They
    only ever reach their granted servers: `/use` and `/status` list just those, a
    single granted server is picked automatically, and any command aimed at another
-   server is refused.
+   server is refused. In that DM they also get the read-only commands anyone can
+   use in an authorised group (`/list`, `/stats`, `/deaths`, …), for their
+   servers only.
 
 `/mods` lists moderators (with their names once they've used the bot) and their
 servers; `/mods remove <user_id> [<server>]` revokes one server, or all of them
@@ -535,7 +537,10 @@ commands stay Java-only (they scan log history, which Bedrock doesn't keep).
 `/allowlist` runs the server's allow/whitelist command and pipes the response
 back — `whitelist` on Java (via RCON) and `allowlist` on Bedrock (via tmux/screen,
 read back from `console.log`). Subcommands are identical on both: `on`, `off`,
-`add <player>`, `remove <player>`, `list`, `reload`.
+`add <player>`, `remove <player>`, `list`, `reload`. Player names may contain only
+letters, digits and `_` (a Bedrock gamertag with a space is typed as two words):
+on Bedrock the line is typed into the server's tmux/screen pane, so nothing a
+shell could interpret is accepted.
 
 ---
 

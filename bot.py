@@ -229,7 +229,9 @@ class Bot:
         if server is None:
             allowed = self.allowed_servers(ctx) if ctx.is_private else None
             if allowed == []:
-                ctx.reply("You're not a moderator of any server on this bot.")
+                ctx.reply("No servers are running on this bot."
+                          if is_admin(ctx.platform, ctx.user_id, self.auth)
+                          else "You're not a moderator of any server on this bot.")
                 return False
             sel = self.by_key.get(
                 (self._admin_session.get(ctx.platform) or {}).get(ctx.user_id))

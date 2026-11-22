@@ -83,6 +83,11 @@ class Server:
         # chain marker lives in the world dir (so an offline restore is
         # detectable). incr_timer is the self-rescheduling incremental cycle.
         self.backup_lock = threading.Lock()
+        # Held by whatever is stopping/starting/replacing the server process or
+        # its directory: /restore, /update_server, a Bedrock /restore_player,
+        # /start. Separate from backup_lock so a slow /start can't make a
+        # scheduled backup skip, and so /allowlist waits only on these.
+        self.lifecycle_lock = threading.Lock()
         self.incr_lock = threading.Lock()      # protects incr_timer
         self.incr_timer: threading.Timer | None = None
         # Files excluded from backups and the change manifest in addition to the

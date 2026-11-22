@@ -8,7 +8,9 @@ admin-claim handler. Auth writes go through ctx.bot.auth_doc.
 """
 
 import gzip
+import os
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -152,17 +154,19 @@ def _scan_logs(scan_fn, server) -> int:
         if not m:
             continue
         date_str = m.group(1)
-        extracted = gz_path.with_suffix("")  # remove .gz
+        # A private temp file, never "<name>.log" beside the archive: that name
+        # can be a real log, which writing then unlinking it would destroy.
+        fd, tmp_name = tempfile.mkstemp(prefix="dsign_scan_", suffix=".log")
+        extracted = Path(tmp_name)
         try:
             with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_f:
-                with open(extracted, "w", encoding="utf-8") as out_f:
+                with os.fdopen(fd, "w", encoding="utf-8") as out_f:
                     out_f.write(gz_f.read())
             total += scan_fn(extracted, date_str, server)
         except Exception as e:
             server.log.warning("Scan: failed to process %s: %s", gz_path.name, e)
         finally:
-            if extracted.exists():
-                extracted.unlink()
+            extracted.unlink(missing_ok=True)
     if log_path.exists():
         total += scan_fn(log_path, datetime.now().strftime("%Y-%m-%d"), server)
     return total
@@ -318,10 +322,13 @@ def _clear_pending_player_restore(user_id: int) -> None:
 
 
 def _version_id(version: dict) -> tuple:
-    """What makes a /restore_player version the one the operator chose: its
-    time, source and backing file. Matching on this, not on the row number,
-    keeps a confirm from landing on a backup that arrived after the listing."""
-    return (version["timestamp"], version["source"], str(version.get("path")))
+    """What makes a /restore_player version the one the operator chose: the
+    file it comes from and the entry within it. Not the row number (a backup
+    landing after the listing shifts rows), and not the display label or
+    timestamp either: ``source`` gains "(old chain)" once a new full backup
+    starts a chain, and a live file's timestamp is its mtime."""
+    return (str(version.get("path")), str(version.get("entry")),
+            version.get("kind"))
 
 
 # One log scan per server at a time: _scan_logs unpacks each archive to a
@@ -454,7 +461,9 @@ def register_commands(router, auth: dict) -> None:
         if ctx.is_private:
             servers = ctx.bot.allowed_servers(ctx)
             if not servers:
-                ctx.reply("You're not a moderator of any server on this bot.")
+                ctx.reply("No servers are running on this bot."
+                          if is_admin(ctx.platform, ctx.user_id, auth)
+                          else "You're not a moderator of any server on this bot.")
                 return
         else:
             server = ctx.bot.resolve_target_server(ctx)
@@ -755,7 +764,8 @@ def register_commands(router, auth: dict) -> None:
 
         def run():
             try:
-                updates.update_server(server, release, say=say)
+                with server.lifecycle_lock:
+                    updates.update_server(server, release, say=say)
             finally:
                 server.backup_lock.release()
 
@@ -767,6 +777,9 @@ def register_commands(router, auth: dict) -> None:
 
     # --- /allowlist (server whitelist/allowlist passthrough) ---
     _ALLOWLIST_SUBS = {"on", "off", "add", "remove", "list", "reload"}
+    # Java names are [A-Za-z0-9_]{3,16}; Bedrock gamertags are letters, digits
+    # and spaces (each word arrives as its own argument).
+    _RE_ALLOWLIST_NAME = re.compile(r"[A-Za-z0-9_]{1,32}")
 
     def cmd_allowlist(ctx):
         backend = ctx.server.backend
@@ -783,27 +796,45 @@ def register_commands(router, auth: dict) -> None:
         if sub in ("add", "remove") and len(ctx.args) < 2:
             ctx.reply(f"Usage: /allowlist {sub} <player>")
             return
+        if sub not in ("add", "remove") and len(ctx.args) > 1:
+            ctx.reply(f"/allowlist {sub} takes no player name.")
+            return
+        # Player names only: on Bedrock the line is typed into the server's
+        # tmux/screen pane, which is a shell prompt if the server has just
+        # exited -- so nothing a shell would interpret may get through.
+        bad = [a for a in ctx.args[1:] if not _RE_ALLOWLIST_NAME.fullmatch(a)]
+        if bad:
+            ctx.reply(f"Invalid player name '{bad[0]}' — use letters, digits "
+                      "and _ only.")
+            return
         if not backend.is_available():
             ctx.reply("Server is not reachable right now — try again once it's up.")
             return
-        # A change made while a restore or update swaps the server directory
-        # would be lost with the old directory; a backup only briefly holds
-        # the lock, so asking again shortly is cheap.
-        if sub != "list" and ctx.server.backup_lock.locked():
-            ctx.reply("A backup, restore or update is running — try again in "
-                      "a moment.")
-            return
-        ctx.server.log.info("Allowlist: '%s %s' by [%s] on [%s]", verb,
-                            " ".join(ctx.args), ctx.sender_label, ctx.chat_label)
+        server = ctx.server
+        server.log.info("Allowlist: '%s %s' by [%s] on [%s]", verb,
+                        " ".join(ctx.args), ctx.sender_label, ctx.chat_label)
 
         # Run in a thread: Bedrock capture polls the log for up to a few seconds.
         def run():
+            # Held while the command is sent, so a restore/update/start can't
+            # stop or replace the server between the check and the send (a
+            # change made mid-swap would also be lost with the old directory).
+            if not server.lifecycle_lock.acquire(blocking=False):
+                ctx.adapter.send(ctx.chat_id, "A restore, update or start is "
+                                 "running — try again once it's finished.")
+                return
             try:
+                if not backend.is_online():
+                    ctx.adapter.send(ctx.chat_id, f"{server.config.name} went "
+                                     "offline — nothing was sent.")
+                    return
                 resp = backend.allowlist_command(ctx.args)
             except Exception as e:
-                ctx.server.log.exception("Allowlist command failed")
+                server.log.exception("Allowlist command failed")
                 ctx.adapter.send(ctx.chat_id, f"{verb} command failed: {e}")
                 return
+            finally:
+                server.lifecycle_lock.release()
             ctx.adapter.send(ctx.chat_id,
                              resp.strip() or "(server returned no output)",
                              monospace=True)
@@ -892,8 +923,8 @@ def register_commands(router, auth: dict) -> None:
             version = next((v for v in versions if _version_id(v) == chosen), None)
             if version is None:
                 _clear_pending_player_restore(pkey)
-                ctx.reply(f"The selected backup ({chosen[0]}) is no longer "
-                          f"available. Run /restore_player {canonical} again.")
+                ctx.reply("The selected backup is no longer available. "
+                          f"Run /restore_player {canonical} again.")
                 return
             server.log.info("RestorePlayer: [%s] on [%s] confirmed restore of %s "
                         "to %s (source: %s)", ctx.sender_label, ctx.chat_label,
@@ -907,7 +938,8 @@ def register_commands(router, auth: dict) -> None:
                     say("A backup or restore is in progress.")
                     return
                 try:
-                    backend.restore_player(canonical, uuid, version, say)
+                    with server.lifecycle_lock:
+                        backend.restore_player(canonical, uuid, version, say)
                     # A Bedrock restore restarts the server (stop -> edit ->
                     # start), kicking everyone with no "disconnect" lines, so the
                     # in-memory online set would be left stale. Resync it against
@@ -1098,7 +1130,8 @@ def register_commands(router, auth: dict) -> None:
                 say("A backup or restore is already in progress.")
                 return
             try:
-                server.restore_world(chain, point_idx, say=say)
+                with server.lifecycle_lock:
+                    server.restore_world(chain, point_idx, say=say)
             finally:
                 server.backup_lock.release()
 
@@ -1113,18 +1146,6 @@ def register_commands(router, auth: dict) -> None:
     def cmd_start(ctx):
         server = ctx.server
         _cmd_log(ctx, "Start")
-        # Held through the relaunch: a restore or update stops the server
-        # while holding it, and starting it then would bring it up on a
-        # half-replaced world or binary. It also stops two /starts racing.
-        if not server.backup_lock.acquire(blocking=False):
-            ctx.reply("A backup, restore or update is running — "
-                      f"{server.config.name} will be started by it if needed.")
-            return
-        if server.backend.is_online():
-            server.backup_lock.release()
-            ctx.reply(f"{server.config.name} is already running.")
-            return
-        ctx.reply(f"Starting {server.config.name}...")
 
         def say(m):
             server.log.info("Start: %s", m)
@@ -1137,7 +1158,7 @@ def register_commands(router, auth: dict) -> None:
             try:
                 ok = server.backend.relaunch(say)
             finally:
-                server.backup_lock.release()
+                server.lifecycle_lock.release()
             if ok:
                 reconcile_online(server, reason="after /start")
                 say(f"{server.config.name} is up.")
@@ -1145,7 +1166,26 @@ def register_commands(router, auth: dict) -> None:
                 say(f"Could not start {server.config.name}. Check the mux "
                     f"session / start command:\n  {server.config.mux_start_cmd}")
 
-        threading.Thread(target=run, daemon=True).start()
+        # lifecycle_lock is held through the relaunch: a restore or update
+        # holds it while the server is down, and starting it then would bring
+        # it up on a half-replaced world or binary. It also stops two /starts
+        # racing. (Not backup_lock: a slow start mustn't make backups skip.)
+        if not server.lifecycle_lock.acquire(blocking=False):
+            ctx.reply("A restore, update or start is already running — "
+                      f"{server.config.name} will be started by it if needed.")
+            return
+        handed_off = False
+        try:
+            if server.backend.is_online():
+                ctx.reply(f"{server.config.name} is already running.")
+                return
+            ctx.reply(f"Starting {server.config.name}...")
+            threading.Thread(target=run, daemon=True).start()
+            handed_off = True
+        finally:
+            if not handed_off:
+                server.lifecycle_lock.release()
+
     router.register("start", cmd_start, private_only=True, admin_only=True,
                     moderator=True,
                     cap=lambda ctx: ctx.server.backend.can_restart,
@@ -1332,6 +1372,23 @@ def register_commands(router, auth: dict) -> None:
         ctx.reply(f"{usage}\nServers: {', '.join(sorted(ctx.bot.by_name))}")
         return None
 
+    def _snapshot_mods(ns):
+        return ({u: list(k) for u, k in ns["moderators"].items()},
+                dict(ns["moderator_names"]))
+
+    def _save_mods(ctx, ns, before):
+        """Persist a /mods change made under auth_lock; on failure put the
+        in-memory grants back, so they never differ from auth.json (a revoke
+        that only lived in memory would come back on the next restart)."""
+        try:
+            save_auth(ctx.bot.auth_doc, AUTH_PATH)
+            return True
+        except Exception as e:
+            ns["moderators"], ns["moderator_names"] = before
+            ctx.bot.log.exception("Mods: could not save auth.json")
+            ctx.reply(f"Could not save auth.json ({e}) — nothing was changed.")
+            return False
+
     def _mods_add(ctx, args):
         multi = len(ctx.bot.servers) > 1
         usage = ("Usage: /mods add <user_id> <server>" if multi
@@ -1348,12 +1405,13 @@ def register_commands(router, auth: dict) -> None:
             return
         key = server.config.key
         with auth_lock:
-            mods = auth_ns(auth, ctx.platform)["moderators"]
-            granted = mods.setdefault(uid, [])
-            already = key in granted
+            ns = auth_ns(auth, ctx.platform)
+            already = key in ns["moderators"].get(uid, [])
             if not already:
-                granted.append(key)
-                save_auth(ctx.bot.auth_doc, AUTH_PATH)
+                before = _snapshot_mods(ns)
+                ns["moderators"].setdefault(uid, []).append(key)
+                if not _save_mods(ctx, ns, before):
+                    return
         if already:
             ctx.reply(f"{uid} is already a moderator of {server.config.name}.")
             return
@@ -1381,12 +1439,14 @@ def register_commands(router, auth: dict) -> None:
                 where = f" of {server.config.name}" if server else ""
                 ctx.reply(f"{uid} is not a moderator{where}.")
                 return
+            before = _snapshot_mods(ns)
             if server is not None:
                 granted.remove(server.config.key)
             if server is None or not granted:
                 ns["moderators"].pop(uid, None)
                 ns["moderator_names"].pop(uid, None)
-            save_auth(ctx.bot.auth_doc, AUTH_PATH)
+            if not _save_mods(ctx, ns, before):
+                return
         # Drop any /use selection so nothing stays pointed at a server they
         # lost (resolution would refuse it anyway).
         ctx.bot.clear_use(ctx.platform, uid)

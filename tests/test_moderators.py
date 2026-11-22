@@ -313,60 +313,131 @@ def b_log():
     return types.SimpleNamespace(info=lambda *a, **k: None)
 
 
-# --- concurrency: /start, scans, /restore_player ---------------------------
+# --- concurrency: /start, /allowlist, scans, /restore_player ----------------
 def _server(online=True):
     calls = []
     backend = types.SimpleNamespace(
-        is_online=lambda: online, can_restart=True,
+        is_online=lambda: online, can_restart=True, is_available=lambda: True,
+        ALLOWLIST_VERB="allowlist",
+        allowlist_command=lambda args: calls.append(("allowlist", args)) or "ok",
         relaunch=lambda say: calls.append("relaunch") or True)
     return types.SimpleNamespace(
         config=types.SimpleNamespace(key="a", name="A", mux_start_cmd="x"),
         backend=backend, backup_lock=threading.Lock(),
+        lifecycle_lock=threading.Lock(),
         log=types.SimpleNamespace(info=lambda *a, **k: None,
                                   warning=lambda *a, **k: None,
                                   exception=lambda *a, **k: None)), calls
 
 
-def test_start_lock():
-    print("/start and backup_lock")
+def _wait_free(lock):
+    for _ in range(100):
+        if not lock.locked():
+            return True
+        threading.Event().wait(0.02)
+    return False
+
+
+def _handlers():
     r = _Router()
     cmds.register_commands(r, make_auth())
-    start = r.handlers["start"]
+    return r.handlers
+
+
+def test_start_lock():
+    print("/start and lifecycle_lock")
+    start = _handlers()["start"]
     srv, calls = _server(online=False)
-    srv.backup_lock.acquire()
+    srv.lifecycle_lock.acquire()
     c = ctx_for(MOD)
     c.server = srv
     start(c)
-    check("running" in c.replies[-1] and not calls,
-          "refused while a backup/restore/update holds the lock")
-    srv.backup_lock.release()
+    check("A restore, update or start" in c.replies[-1] and not calls,
+          "refused while a restore/update/start holds the lock")
+    srv.lifecycle_lock.release()
+
+    srv, calls = _server(online=False)
+    srv.backup_lock.acquire()          # a backup is running
+    c = ctx_for(MOD)
+    c.server = srv
+    real = cmds.reconcile_online
+    cmds.reconcile_online = lambda *a, **k: None
+    try:
+        start(c)
+        check(_wait_free(srv.lifecycle_lock) and calls == ["relaunch"],
+              "a running backup doesn't block /start, and /start doesn't take "
+              "backup_lock (so it can't make a scheduled backup skip)")
+    finally:
+        cmds.reconcile_online = real
+        srv.backup_lock.release()
 
     srv, calls = _server(online=True)
     c = ctx_for(MOD)
     c.server = srv
     start(c)
-    check("already running" in c.replies[-1] and not srv.backup_lock.locked(),
+    check("already running" in c.replies[-1] and not srv.lifecycle_lock.locked(),
           "already running: lock released")
 
-    real = cmds.reconcile_online
-    cmds.reconcile_online = lambda *a, **k: None
+    srv, calls = _server(online=False)
+    srv.backend.is_online = lambda: 1 / 0
+    c = ctx_for(MOD)
+    c.server = srv
     try:
-        srv, calls = _server(online=False)
-        c = ctx_for(MOD)
-        c.server = srv
         start(c)
-        for _ in range(100):
-            if not srv.backup_lock.locked():
-                break
-            threading.Event().wait(0.02)
-        check(calls == ["relaunch"] and not srv.backup_lock.locked(),
-              "relaunch runs under the lock and releases it")
-    finally:
-        cmds.reconcile_online = real
+    except ZeroDivisionError:
+        pass
+    check(not srv.lifecycle_lock.locked(),
+          "a failing online check doesn't leave the lock held")
 
 
-def test_scan_lock():
-    print("one log scan per server")
+def test_allowlist_input_and_lock():
+    print("/allowlist: names and lifecycle_lock")
+    allow = _handlers()["allowlist"]
+
+    def send(srv, *args):
+        c = ctx_for(MOD, args=list(args))
+        c.server = srv
+        sent = []
+        c.adapter = types.SimpleNamespace(send=lambda cid, m, **k: sent.append(m))
+        allow(c)
+        _wait_free(srv.lifecycle_lock)
+        threading.Event().wait(0.05)
+        return c.replies, sent
+
+    for evil in ("$(reboot)", "a;rm", "`id`", "x|y", "a&b", "a>b", "../x"):
+        srv, calls = _server()
+        replies, _ = send(srv, "add", evil)
+        check(not calls and "Invalid player name" in replies[-1],
+              f"refused: {evil!r}")
+    srv, calls = _server()
+    send(srv, "add", "Lean", "Beetle_24102")
+    check(calls == [("allowlist", ["add", "Lean", "Beetle_24102"])],
+          "a gamertag with a space (two words) is sent")
+    srv, calls = _server()
+    replies, _ = send(srv, "list", "extra")
+    check(not calls and "takes no player name" in replies[-1],
+          "extra words after list are refused")
+
+    srv, calls = _server()
+    srv.lifecycle_lock.acquire()
+    _, sent = send(srv, "add", "Steve")
+    srv.lifecycle_lock.release()
+    check(not calls and sent and "try again" in sent[-1],
+          "nothing is sent while a restore/update/start is running")
+    srv, calls = _server()
+    srv.backup_lock.acquire()
+    send(srv, "add", "Steve")
+    srv.backup_lock.release()
+    check(calls == [("allowlist", ["add", "Steve"])],
+          "a plain backup no longer blocks /allowlist")
+    srv, calls = _server(online=False)
+    _, sent = send(srv, "add", "Steve")
+    check(not calls and sent and "went offline" in sent[-1],
+          "server stopped before the send: nothing is typed into the pane")
+
+
+def test_scan_lock_and_temp_file():
+    print("log scans")
     srv, _ = _server()
     lock = cmds._scan_lock(srv)
     lock.acquire()
@@ -379,16 +450,29 @@ def test_scan_lock():
     finally:
         lock.release()
 
+    import gzip
+    logs = _TMP / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "latest.log").write_text("live\n")
+    with gzip.open(logs / "2026-11-20-1.log.gz", "wt") as f:
+        f.write("archived\n")
+    (logs / "2026-11-20-1.log").write_text("a real log, not ours\n")
+    seen = []
+    srv.config.log_path = logs / "latest.log"
+    cmds._scan_logs(lambda path, date, s: seen.append(path.read_text()) or 0, srv)
+    check("archived\n" in seen, "the archive is scanned")
+    check((logs / "2026-11-20-1.log").read_text() == "a real log, not ours\n",
+          "a same-named .log beside the archive is left untouched")
+
 
 def test_restore_player_pin():
     print("/restore_player confirms the version that was selected")
-    r = _Router()
-    cmds.register_commands(r, make_auth())
-    cmd = r.handlers["restore_player"]
+    cmd = _handlers()["restore_player"]
     cmds._pending_player_restore.clear()
 
-    v = lambda ts: {"timestamp": ts, "source": "incremental backup",
-                    "path": Path(f"/b/{ts}.zip"), "sort_key": 0}
+    v = lambda ts, src="incremental backup": {
+        "timestamp": ts, "source": src, "path": Path(f"/b/{ts}.zip"),
+        "kind": "zip", "entry": "playerdata/u-1.dat", "sort_key": 0}
     versions = [v("2026-11-17 18:12:24"), v("2026-11-17 17:00:00")]
     restored = []
     done = threading.Event()
@@ -405,7 +489,6 @@ def test_restore_player_pin():
     def send(*args):
         c = ctx_for(MOD, args=list(args))
         c.server = srv
-        c.bot = types.SimpleNamespace(config=types.SimpleNamespace(name="bot"))
         cmd(c)
         return c.replies[-1]
 
@@ -418,6 +501,19 @@ def test_restore_player_pin():
         check(restored and restored[0]["timestamp"] == "2026-11-17 17:00:00",
               f"the selected version is restored, not the new row 2 ({restored})")
 
+        # A new full backup starts a chain: the same archive's label gains
+        # "(old chain)". It's still the selected backup.
+        restored.clear()
+        done.clear()
+        send("Hongy1618")
+        send("Hongy1618", "3")
+        versions[:] = [dict(x, source=x["source"] + " (old chain)")
+                       for x in versions]
+        send("Hongy1618", "3", "confirm")
+        done.wait(2)
+        check(restored and restored[0]["timestamp"] == "2026-11-17 17:00:00",
+              "still found after a chain rollover relabels it")
+
         restored.clear()
         send("Hongy1618")
         send("Hongy1618", "1")
@@ -427,6 +523,41 @@ def test_restore_player_pin():
               "a selected version that disappeared is refused")
     finally:
         cmds.reconcile_online = real
+
+
+def test_mods_save_failure_rolls_back():
+    print("/mods when auth.json can't be saved")
+    auth = make_auth({MOD: ["a"]})
+    b = make_bot(auth)
+    r = _Router()
+    cmds.register_commands(r, auth)
+    real = cmds.save_auth
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    cmds.save_auth = boom
+    try:
+        for args in (["remove", MOD], ["add", MOD, "b"]):
+            c = ctx_for(ADMIN, args=args)
+            c.bot = b
+            b.log = types.SimpleNamespace(info=lambda *a, **k: None,
+                                          exception=lambda *a, **k: None)
+            r.handlers["mods"](c)
+            check("Could not save auth.json" in c.replies[-1]
+                  and auth["telegram"]["moderators"] == {MOD: ["a"]},
+                  f"/mods {args[0]}: in-memory grants unchanged")
+    finally:
+        cmds.save_auth = real
+
+
+def test_admin_with_no_servers_up():
+    print("admin on a bot whose servers all failed")
+    auth = make_auth()
+    b = make_bot(auth, keys=())
+    c = ctx_for(ADMIN, text="/list")
+    check(not b.resolve_command(c)
+          and c.replies[-1] == "No servers are running on this bot.",
+          "the admin isn't told they're not a moderator")
 
 
 if __name__ == "__main__":
