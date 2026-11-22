@@ -200,6 +200,7 @@ playtime - Playtime leaderboard
 achievements - Player achievements
 deaths - Death history
 death_summary - Deaths grouped by cause
+msg - Send a message to players in game
 scan_achievements - Scan logs for achievements
 scan_deaths - Scan logs for deaths
 backup - Trigger a backup now
@@ -253,6 +254,7 @@ both `slack.bot_token` (`xoxb-…`) and `slack.app_token` (`xapp-…`).
       { "command": "/achievements", "description": "Player achievements", "should_escape": false },
       { "command": "/deaths", "description": "Death history", "should_escape": false },
       { "command": "/death_summary", "description": "Deaths grouped by cause", "should_escape": false },
+      { "command": "/say", "description": "Send a message to players in game", "should_escape": false },
       { "command": "/scan_achievements", "description": "Scan logs for achievements", "should_escape": false },
       { "command": "/scan_deaths", "description": "Scan logs for deaths", "should_escape": false },
       { "command": "/backup", "description": "Trigger a backup now", "should_escape": false },
@@ -496,6 +498,7 @@ send it from, so a Slack moderator is added from Slack — and are stored in
 | `/achievements [player]` | Show player achievements with timestamps |
 | `/deaths [player]` | Show death history |
 | `/death_summary` | Deaths grouped by cause (the killer, e.g. `Iron Golem`, or `Lava`, `Falls`, …), listing each death with player and time |
+| `/msg <text>` | Show a message to every player in game as *<ethereal voice> your-handle: text* (on Slack: `/say`). See [Messages into the game](#messages-into-the-game) |
 | `/chat_id` | Show the current chat's ID and your user ID (for `/mods add`) |
 | `/use [<server>]` | *(Admin/Mod)* Pick which server your commands act on; bare `/use` lists servers (multi-server bots only; a moderator sees only theirs) |
 | `/chats` | *(Admin)* List authorised chats, numbered (name + bound server + pause state) |
@@ -522,9 +525,9 @@ it up with `/start`). Read commands (`/list`, `/stats`, `/deaths`, …) read sto
 data/world files and work whether the server is up or down. `/restore` works
 offline (it's the recovery path).
 
-**Slack note.** Slack reserves `/status` and `/help`, so on Slack they're
-`/online` and `/commands` respectively (the bot maps them back internally). Every
-other command name is the same on both platforms.
+**Slack note.** Slack reserves `/status`, `/help` and `/msg`, so on Slack they're
+`/online`, `/commands` and `/say` respectively (the bot maps them back
+internally). Every other command name is the same on both platforms.
 
 **Edition notes.** On **Bedrock**, `/achievements` and `/scan_achievements` are
 unavailable (achievements are Xbox-bound and not exposed to servers). `/deaths`
@@ -533,6 +536,24 @@ pack](#bedrock-chat--death-events) + `edition.bedrock_script_events: true`; the 
 commands stay Java-only (they scan log history, which Bedrock doesn't keep).
 `/restore_player` works on both, via different mechanisms (see
 [Per-player restore](#restoring-a-single-player)).
+
+### Messages into the game
+
+`/msg <text>` (Slack: `/say <text>`) shows a line to every player on the chat's
+server — `<ethereal voice> your-handle:` in grey italics, then your text — via the
+server's `tellraw` command. Anyone who can run commands in a chat can use it: members
+of an authorised group/channel (its bound server), and the admin and moderators in a
+DM (their servers). The name is your chat handle (Telegram username, or full name if
+you have none; Slack handle). One message per person every 5 seconds; long messages
+are shortened to fit (the reply says so). "Sent." means the line was typed into the
+server console — nothing confirms players saw it.
+
+On **Bedrock** the line is typed into the server's tmux/screen pane, which is a shell
+prompt if the server has just stopped. So everything in the message except letters
+and digits — including spaces and punctuation — is written as a `\uXXXX` escape that
+BDS decodes: the line can't run anything at a shell prompt, and its echo in
+`console.log` can't be mistaken for a join, leave or save message. This is verified
+with tmux; `screen` may show the escapes literally on some versions.
 
 `/allowlist` runs the server's allow/whitelist command and pipes the response
 back — `whitelist` on Java (via RCON) and `allowlist` on Bedrock (via tmux/screen,

@@ -29,7 +29,7 @@ from utils.config import get_level_name
 from utils.logtail import split_complete_lines
 from .base import (
     ServerBackend, BackendUnavailable, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH,
-    CAP_PLAYER_RESTORE, CAP_STATS,
+    CAP_PLAYER_RESTORE, CAP_STATS, MSG_PREFIX,
 )
 from .mux import detect
 
@@ -48,6 +48,24 @@ _stats_lock = threading.Lock()
 # Serialises response-capturing commands so two concurrent captures can't read
 # each other's console.log output.
 _capture_lock = threading.Lock()
+
+
+def _rawtext_escape(text: str) -> str:
+    """JSON-string body for a Bedrock rawtext value in which only [A-Za-z0-9]
+    appears literally; everything else is \\uXXXX (a surrogate pair beyond the
+    BMP). See BedrockBackend._tellraw_line for why."""
+    out = []
+    for ch in text:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+            continue
+        cp = ord(ch)
+        if cp > 0xFFFF:
+            cp -= 0x10000
+            out.append(f"\\u{0xD800 + (cp >> 10):04x}\\u{0xDC00 + (cp & 0x3FF):04x}")
+        else:
+            out.append(f"\\u{cp:04x}")
+    return "".join(out)
 
 
 def _load_players(path) -> dict:
@@ -296,6 +314,34 @@ class BedrockBackend(ServerBackend):
     def send_command(self, cmd: str) -> str:
         self._mux.send(cmd)
         return ""
+
+    # Screen's command buffer is 768 bytes; keep the whole line well inside it.
+    MSG_LINE_LIMIT = 600
+
+    def _tellraw_line(self, name: str, message: str) -> str:
+        # Typed into the tmux/screen pane -- a bash prompt if BDS has just
+        # exited, maybe mid-input -- and echoed into console.log, where the log
+        # parsers and expect_line() waiters look for phrases like
+        # "Player connected:" or "A previous save has not been completed".
+        # So only [A-Za-z0-9] is written literally (not even space): the line is
+        # printable ASCII with no shell metacharacter, inert in any quote state,
+        # and can't contain any watched phrase. BDS decodes the \uXXXX escapes.
+        text = f"\u00a77\u00a7o{MSG_PREFIX} {name}: \u00a7r{message}"
+        return ('tellraw @a {"rawtext":[{"text":"' + _rawtext_escape(text)
+                + '"}]}')
+
+    def tell_all(self, name: str, message: str, guard):
+        # Hold _capture_lock for the send, so the echo can't land between a
+        # `list` header and its names line (query_online_players) and be read
+        # as a player, and so concurrent /msgs are serialised. It is taken
+        # BEFORE the lifecycle guard: /msg never holds a lifecycle lock while
+        # waiting out another (possibly another server's) capture. Elsewhere
+        # the order is lifecycle -> capture (/start, /allowlist, restore);
+        # that's safe because the guard here is taken without waiting.
+        # (Not inside send_command: _capture_raw calls that while holding this
+        # non-reentrant lock.)
+        with _capture_lock:
+            return super().tell_all(name, message, guard)
 
     def _capture_raw(self, full_cmd: str, timeout: float = 3.0) -> str:
         """Send a command and return the RAW console.log output it produced.

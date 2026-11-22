@@ -19,6 +19,7 @@ import re
 import secrets
 import shlex
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -55,6 +56,19 @@ class NotSupported(Exception):
     """Raised by a backend method that an edition does not implement (e.g.
     per-player restore on Bedrock). Callers should gate on ``CAPABILITIES``
     rather than relying on catching this, but it guards against misuse."""
+
+
+MSG_PREFIX = "<ethereal voice>"
+
+
+def clean_chat_text(text: str) -> str:
+    """Make chat-supplied text safe to show in game or write to a log: drop
+    ``§`` (Minecraft formatting codes), turn every control/format character
+    (Unicode category C*: newlines, bidi overrides, zero-width marks, …) into
+    a space, then collapse whitespace to single spaces."""
+    kept = "".join(" " if unicodedata.category(ch).startswith("C") else ch
+                   for ch in str(text) if ch != "\u00a7")
+    return " ".join(kept.split())
 
 
 class ServerBackend(ABC):
@@ -191,6 +205,47 @@ class ServerBackend(ABC):
         """
         return strip_minecraft_formatting(
             self.capture_command("seed", timeout=timeout))
+
+    # --- /msg: a chat user's line in the game chat ---
+    # Encoded line budget (bytes), per edition; subclasses set their own.
+    MSG_LINE_LIMIT = 600
+    # Longest message considered before fitting it to the budget.
+    _MSG_MAX_INPUT = 2000
+
+    def _tellraw_line(self, name: str, message: str) -> str:
+        """The console command that shows ``<ethereal voice> name: message``
+        to every player. Edition-specific; ``name`` and ``message`` are
+        already cleaned by ``clean_chat_text``."""
+        raise NotImplementedError
+
+    def tell_all(self, name: str, message: str, guard):
+        """Show a chat user's message to every player via ``tellraw``.
+
+        ``guard`` is the server's ``lifecycle_lock``: it is taken without
+        waiting, only around the send, so a restore/update/start already under
+        way blocks the message but a message never blocks them for longer than
+        the send. Returns None if ``guard`` was busy (nothing sent), else
+        ``(sent_text, trimmed)`` -- the message is shortened, never the
+        encoded line cut, to fit ``MSG_LINE_LIMIT``."""
+        line, sent, trimmed = self._fit_tellraw(name, message)
+        if not guard.acquire(blocking=False):
+            return None
+        try:
+            self.send_command(line)
+        finally:
+            guard.release()
+        return sent, trimmed
+
+    def _fit_tellraw(self, name: str, message: str):
+        text = message[:self._MSG_MAX_INPUT]
+        trimmed = len(text) < len(message)
+        line = self._tellraw_line(name, text + ("…" if trimmed else ""))
+        while len(line.encode("utf-8")) > self.MSG_LINE_LIMIT and text:
+            # Drop whole characters (an emoji stays whole), then re-encode.
+            text = text[:-1].rstrip()
+            trimmed = True
+            line = self._tellraw_line(name, text + "…")
+        return line, (text + "…" if trimmed else text), trimmed
 
     def broadcast(self, message: str) -> None:
         """Announce ``message`` to all players in-game via the console ``say``

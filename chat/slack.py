@@ -77,7 +77,7 @@ class _SlackNetworkErrorFilter(logging.Filter):
 # in an app manifest. Those commands are declared under alternate names in the
 # manifest (see README) and mapped back to the bot's canonical command here, so
 # routing — and parity with Telegram — is unchanged. Canonical name -> Slack name.
-_RENAMED = {"status": "online", "help": "commands"}
+_RENAMED = {"status": "online", "help": "commands", "msg": "say"}
 _RENAMED_INV = {slack: canon for canon, slack in _RENAMED.items()}
 
 

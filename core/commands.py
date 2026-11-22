@@ -9,6 +9,7 @@ admin-claim handler. Auth writes go through ctx.bot.auth_doc.
 
 import copy
 import gzip
+import html
 import os
 import re
 import tempfile
@@ -18,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backends import CAP_PLAYER_RESTORE, CAP_STATS, EVENT_DEATH, EVENT_ACHIEVEMENT
+from backends.base import clean_chat_text
 from utils import restore_core
 from core import updates
 from core.auth import (
@@ -375,6 +377,13 @@ def _claim_pending(store: dict, lock, pkey: str, entry: dict, **expect) -> bool:
         return True
 
 
+# /msg: one message per user per _MSG_COOLDOWN seconds, so a group can't flood
+# the game (or the shared Bedrock console) with them.
+_MSG_COOLDOWN = 5.0
+_msg_last: dict = {}
+_msg_last_lock = threading.Lock()
+
+
 # One log scan per server at a time: _scan_logs unpacks each archive to a
 # fixed path beside it, which two concurrent scans would fight over.
 _scan_locks: dict = {}
@@ -410,8 +419,11 @@ def _cmd_log(ctx, action: str, extra: str = "") -> None:
     """Uniform command audit line, prefixed with the handling bot:
     ``[<bot>] <action>: requested by [<sender>] on [<chat>]<extra>`` — where
     <chat> is the group/channel name (or 'direct' for a DM)."""
-    ctx.bot.log.info("%s: requested by [%s] on [%s]%s",
-                     action, ctx.sender_label, ctx.chat_label, extra)
+    # Labels come from the chat platform (display names, group titles), so
+    # they're cleaned: a newline in one must not forge a line in the log.
+    ctx.bot.log.info("%s: requested by [%s] on [%s]%s", action,
+                     clean_chat_text(ctx.sender_label),
+                     clean_chat_text(ctx.chat_label), extra)
 
 
 def _status_line(server) -> str:
@@ -463,6 +475,8 @@ def register_commands(router, auth: dict) -> None:
                 "/deaths [player] — death history",
                 "/death_summary — deaths grouped by cause",
             ]
+        lines.append(f"{ctx.adapter.command_label('msg')} <text> — send a message "
+                     "to players in game")
         lines.append("/chat_id — show this chat's ID and your user ID")
         admin = ctx.is_private and is_admin(ctx.platform, ctx.user_id, auth)
         mod = ctx.is_private and not admin and is_moderator(
@@ -864,7 +878,9 @@ def register_commands(router, auth: dict) -> None:
         args = [sub]
         if sub in ("add", "remove"):
             # One name: the rest of the line, with any quotes the user typed
-            # dropped. Letters, digits, _ and single spaces only: on Bedrock
+            # dropped. (The other user text typed into the pane is /msg, which
+            # Bedrock escapes to [A-Za-z0-9] + \uXXXX.) Letters, digits, _ and
+            # single spaces only: on Bedrock
             # the line is typed into the server's tmux/screen pane, which is a
             # shell prompt if the server has just exited, so nothing a shell
             # would interpret may get through. A name with a space (a Bedrock
@@ -1285,6 +1301,65 @@ def register_commands(router, auth: dict) -> None:
         _cmd_log(ctx, "ChatID", f" (chat_id={ctx.chat_id})")
         ctx.reply(f"Chat ID: {ctx.chat_id}\nYour user ID: {ctx.user_id}")
     router.register("chat_id", cmd_chat_id, public=True, needs_server=False)
+
+    # --- /msg (Slack: /say) — a chat user's line in the game chat ---
+    # Shown to every player as "<ethereal voice> <handle>: <text>". Open to
+    # anyone who can run commands here: an authorised group (its bound server)
+    # or the admin/moderators in a DM (their servers).
+    def cmd_msg(ctx):
+        server = ctx.server
+        label = ctx.adapter.command_label("msg")
+        parts = (ctx.text or "").split(maxsplit=1)
+        text = parts[1] if len(parts) > 1 else ""
+        if ctx.platform == "slack":
+            text = html.unescape(text)  # Slack sends & < > as entities
+        text = clean_chat_text(text)
+        if not text:
+            ctx.reply(f"Usage: {label} <message> — shows it to everyone in "
+                      f"game on {server.config.name}.")
+            return
+        key = (ctx.platform, ctx.user_id)
+        now = time.monotonic()
+        with _msg_last_lock:
+            last = _msg_last.get(key)
+            if last is not None and now - last < _MSG_COOLDOWN:
+                ctx.reply("Please wait a few seconds between messages.")
+                return
+            _msg_last[key] = now
+        name = (clean_chat_text(str(ctx.sender_label).lstrip("@"))[:32].strip()
+                or str(ctx.user_id))
+        _cmd_log(ctx, "Msg")
+
+        def run():
+            backend = server.backend
+            try:
+                # Probed WITHOUT the lifecycle lock (a Bedrock probe takes ~3 s);
+                # tell_all takes the lock only around the send.
+                if not backend.is_online():
+                    ctx.adapter.send(ctx.chat_id, f"\u26a0\ufe0f {server.config.name} "
+                                     "is offline — the message wasn't sent.")
+                    return
+                result = backend.tell_all(name, text, server.lifecycle_lock)
+            except Exception as e:
+                server.log.exception("Msg failed")
+                ctx.adapter.send(ctx.chat_id, f"Couldn't send the message: {e}")
+                return
+            if result is None:
+                ctx.adapter.send(ctx.chat_id, "A restore, update or start is "
+                                 "running — try again once it's finished.")
+                return
+            sent, trimmed = result
+            server.log.info("Msg: [%s] (%s) on [%s] -> %s: %s",
+                            clean_chat_text(ctx.sender_label), ctx.user_id,
+                            clean_chat_text(ctx.chat_label), server.config.name,
+                            sent)
+            # Typed into the console; nothing confirms players saw it.
+            ctx.adapter.send(ctx.chat_id,
+                             f"Sent (shortened to {len(sent)} characters)."
+                             if trimmed else "Sent.")
+
+        threading.Thread(target=run, daemon=True).start()
+    router.register("msg", cmd_msg)
 
     # --- /use (multi-server: pick this user's target server) ---
     def cmd_use(ctx):

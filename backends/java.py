@@ -41,7 +41,7 @@ from utils.backup_utils import RE_FULL, RE_INCR, wait_for_settle
 from utils.config import read_server_properties, get_level_name, backup_exclude_names
 from .base import (
     ServerBackend, EVENT_JOIN, EVENT_LEAVE, EVENT_DEATH, EVENT_ACHIEVEMENT,
-    CAP_PLAYER_RESTORE, CAP_STATS,
+    CAP_PLAYER_RESTORE, CAP_STATS, MSG_PREFIX,
 )
 from .mux import detect
 
@@ -127,6 +127,20 @@ class JavaBackend(ServerBackend):
     # listener can close while worlds are still flushing).
 
     # --- command transport ---
+    # vanilla RCON accepts ~1446 bytes of command
+    MSG_LINE_LIMIT = 1400
+
+    def _tellraw_line(self, name: str, message: str) -> str:
+        # Leading "" so the message doesn't inherit the prefix's grey italics.
+        # No \u escapes (ensure_ascii=False): since 1.21.5 tellraw reads
+        # components as SNBT, and escapes would triple the size. RCON has no
+        # shell in the way, so plain JSON quoting is all that's needed.
+        component = ["", {"text": f"{MSG_PREFIX} {name}: ", "color": "gray",
+                          "italic": True},
+                     {"text": message, "color": "white"}]
+        return "tellraw @a " + json.dumps(component, ensure_ascii=False,
+                                          separators=(",", ":"))
+
     def send_command(self, cmd: str) -> str:
         """Send an RCON command and return the response.
 
