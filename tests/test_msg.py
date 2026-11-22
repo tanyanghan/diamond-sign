@@ -104,7 +104,7 @@ def watched_phrases():
 def test_bedrock_line_is_inert():
     print("Bedrock tellraw line")
     msg = clean_chat_text(HOSTILE)
-    name = clean_chat_text("@evil$(id)‮`x`".lstrip("@"))
+    name = clean_chat_text("@evil$(id)\u202e`x`".lstrip("@"))
     line = bedrock_backend()._tellraw_line(name, msg)
     head, tail = 'tellraw @a {"rawtext":[{"text":"', '"}]}'
     check(line.startswith(head) and line.endswith(tail), "fixed wrapper, ends with }")
@@ -131,7 +131,12 @@ def test_clean_chat_text():
     check(clean_chat_text("a\nb\r\nc") == "a b c", "newlines become spaces")
     check(clean_chat_text("§cred§r x") == "credr x",
           "§ removed, so its codes are plain letters")
-    check(clean_chat_text("a‮b​c") == "a b c", "bidi / zero-width removed")
+    check(clean_chat_text("a\u202eb\u2066c") == "a b c", "bidi controls become spaces")
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+    check(clean_chat_text(family) == family, "ZWJ emoji sequences stay whole")
+    check(clean_chat_text("a\ud800b") == "ab", "a lone surrogate is dropped")
+    check(clean_chat_text("\U0001fabf") == "\U0001fabf",
+          "a code point this Python may not know (e.g. a new emoji) is kept")
     check(clean_chat_text("  a   b  ") == "a b", "whitespace collapsed")
 
 
@@ -153,7 +158,7 @@ def test_size_caps():
             check(False, "no lone surrogate at the cut")
             break
     else:
-        check(True, "no lone surrogate at the cut (any cut position)")
+        check(True, "valid JSON at every cut position")
     normal = ("Hello everyone, meet at spawn in five minutes for the build. "
               "Bring wood and stone please! ") * 2
     normal = normal[:200]
@@ -161,6 +166,14 @@ def test_size_caps():
     check(not trimmed and sent == normal,
           f"a normal 200-char message from a 32-char name isn't trimmed "
           f"({len(line.encode())} bytes)")
+    worst = "\U0001f600" * 32
+    line, _, _ = b._fit_tellraw(worst, "hi")
+    check(len(line.encode()) <= 600, "the longest /msg name (32 emoji) still fits")
+    try:
+        b._fit_tellraw("\u4e2d" * 200, "hi")
+        check(False, "a name too long for any line is refused")
+    except ValueError:
+        check(True, "a name too long for any line is refused")
 
 
 def test_java_line():
@@ -173,6 +186,22 @@ def test_java_line():
     check(comp[2] == {"text": 'It\'s $5 "q" \\ \U0001f600', "color": "white"},
           "white message, intact")
     check("\\u" not in line, "no \\u escapes (SNBT since 1.21.5)")
+
+
+def test_real_tell_all_busy():
+    print("tell_all with the lifecycle lock held")
+    for backend in (java_backend(), bedrock_backend()):
+        typed = []
+        backend.send_command = lambda cmd, typed=typed: typed.append(cmd) or ""
+        guard = threading.Lock()
+        guard.acquire()
+        result = backend.tell_all("n", "hi", guard)
+        guard.release()
+        check(result is None and not typed,
+              f"{type(backend).__name__}: busy -> None, nothing typed")
+        check(backend.tell_all("n", "hi", guard) == ("hi", False) and typed,
+              f"{type(backend).__name__}: free -> sent")
+        check(not guard.locked(), f"{type(backend).__name__}: lock released")
 
 
 # --- /msg command --------------------------------------------------------------
@@ -260,7 +289,7 @@ def test_text_extraction_and_name():
     srv = make_server()
     run_msg(ctx_for("/msg a &lt; b &amp;&amp; c", platform="slack"), srv)
     check(srv.backend.told == [("u300", "a < b && c")], "Slack entities unescaped")
-    for bare in ("/msg", "/msg   ", "/msg §‮"):
+    for bare in ("/msg", "/msg   ", "/msg §\u202e", "/msg \u200b\u200d"):
         srv = make_server()
         c = ctx_for(bare)
         c.server = srv
@@ -272,7 +301,7 @@ def test_text_extraction_and_name():
     run_msg(ctx_for("/msg hi", label="@" + "x" * 50), srv)
     check(srv.backend.told[0][0] == "x" * 32, "@ dropped, name capped at 32")
     srv = make_server()
-    run_msg(ctx_for("/msg hi", user="777", label="‮​"), srv)
+    run_msg(ctx_for("/msg hi", user="777", label="\u202e\u200b"), srv)
     check(srv.backend.told[0][0] == "777", "empty name after cleaning -> user id")
     check(SlackAdapter.command_label(None, "msg") == "/say"
           and _RENAMED_INV.get("say") == "msg",
@@ -301,6 +330,15 @@ def test_cooldown_busy_offline():
     srv.lifecycle_lock.release()
     check(not srv.backend.told and "try again" in c.sent[-1],
           "busy lifecycle lock: nothing sent")
+    c = ctx_for("/msg hi again")             # no _msg_last.clear(): a real retry
+    c.server = srv
+    msg_handler()(c)
+    for _ in range(100):
+        if c.sent:
+            break
+        time.sleep(0.02)
+    check(srv.backend.told == [("u300", "hi again")],
+          "...and an immediate retry isn't refused by the cooldown")
     srv = make_server(online=False)
     c = run_msg(ctx_for("/msg hi"), srv)
     check(not srv.backend.told and "offline" in c.sent[-1],
@@ -346,7 +384,7 @@ def test_bedrock_concurrency_and_capture():
     b.send_command = fake_send
     guard = threading.Lock()
     results = []
-    threads = [threading.Thread(target=lambda: results.append(
+    threads = [threading.Thread(target=lambda i=i: results.append(
         b.tell_all("n", f"m{i}", guard))) for i in range(2)]
     for t in threads:
         t.start()
@@ -354,6 +392,32 @@ def test_bedrock_concurrency_and_capture():
         t.join(5)
     check(len(results) == 2 and all(r is not None for r in results),
           "two concurrent /msgs are both sent (no false busy)")
+
+    # A tellraw must not be typed while a `list` capture is reading its reply.
+    in_list, finish_list = threading.Event(), threading.Event()
+
+    def slow_send(cmd):
+        typed.append(cmd)
+        if cmd == "list":
+            in_list.set()
+            finish_list.wait(5)
+            with open(log, "a") as f:
+                f.write("[x INFO] There are 0/10 players online:\n\n")
+        return ""
+    b.send_command = slow_send
+    typed.clear()
+    cap = threading.Thread(target=b.is_online)
+    cap.start()
+    in_list.wait(5)
+    msg = threading.Thread(target=lambda: b.tell_all("n", "x", guard))
+    msg.start()
+    time.sleep(0.3)
+    early = [c for c in typed if c.startswith("tellraw")]
+    finish_list.set()
+    cap.join(10)
+    msg.join(10)
+    check(not early and typed[0] == "list" and typed[-1].startswith("tellraw"),
+          f"tellraw waits until the list capture is done ({typed})")
     done = []
     t = threading.Thread(target=lambda: done.append(b.is_online()))
     t.start()

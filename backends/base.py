@@ -61,14 +61,31 @@ class NotSupported(Exception):
 MSG_PREFIX = "<ethereal voice>"
 
 
+# Bidi embedding/override/isolate controls: they can make a line read
+# differently from what it says (U+202A-202E, U+2066-2069).
+_BIDI_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+
+
 def clean_chat_text(text: str) -> str:
     """Make chat-supplied text safe to show in game or write to a log: drop
-    ``§`` (Minecraft formatting codes), turn every control/format character
-    (Unicode category C*: newlines, bidi overrides, zero-width marks, …) into
-    a space, then collapse whitespace to single spaces."""
-    kept = "".join(" " if unicodedata.category(ch).startswith("C") else ch
-                   for ch in str(text) if ch != "\u00a7")
-    return " ".join(kept.split())
+    ``§`` (Minecraft formatting codes) and lone surrogates, turn control
+    characters (newlines, tabs, …) and bidi controls into spaces, then
+    collapse whitespace to single spaces.
+
+    Other format characters are kept on purpose: ZWJ/ZWNJ and tag characters
+    build emoji (family sequences, flags) and some scripts' words, and
+    unassigned code points may just be emoji newer than this Python. Neither
+    encoder relies on this for safety (Bedrock escapes all but [A-Za-z0-9],
+    Java goes through json.dumps)."""
+    out = []
+    for ch in str(text):
+        if ch == "\u00a7":
+            continue
+        cat = unicodedata.category(ch)
+        if cat == "Cs":
+            continue
+        out.append(" " if cat == "Cc" or ord(ch) in _BIDI_CONTROLS else ch)
+    return " ".join("".join(out).split())
 
 
 class ServerBackend(ABC):
@@ -245,6 +262,10 @@ class ServerBackend(ABC):
             text = text[:-1].rstrip()
             trimmed = True
             line = self._tellraw_line(name, text + "…")
+        if len(line.encode("utf-8")) > self.MSG_LINE_LIMIT:
+            # Only a name too long to leave room for any text gets here (/msg
+            # caps names at 32 characters, which always fits).
+            raise ValueError("name too long to fit a message line")
         return line, (text + "…" if trimmed else text), trimmed
 
     def broadcast(self, message: str) -> None:
