@@ -145,11 +145,22 @@ class Bot:
         ns = self.auth.get(ctx.platform) or {}
         if ns.get("moderator_names", {}).get(ctx.user_id) == ctx.sender_label:
             return  # unchanged — no write
+        # Best effort: a name that can't be saved must not stop the command
+        # the moderator sent, and is forgotten so the next one retries.
         with auth_lock:
             if not is_moderator(ctx.platform, ctx.user_id, self.auth):
                 return
-            ns.setdefault("moderator_names", {})[ctx.user_id] = ctx.sender_label
-            save_auth(self.auth_doc, AUTH_PATH)
+            names = ns.setdefault("moderator_names", {})
+            old = names.get(ctx.user_id)
+            names[ctx.user_id] = ctx.sender_label
+            try:
+                save_auth(self.auth_doc, AUTH_PATH)
+            except Exception:
+                if old is None:
+                    names.pop(ctx.user_id, None)
+                else:
+                    names[ctx.user_id] = old
+                self.log.exception("Could not save a moderator's name")
 
     def allowed_servers(self, ctx) -> list:
         """Servers a DM sender may act on: every server for the admin, otherwise

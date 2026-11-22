@@ -409,10 +409,29 @@ def test_allowlist_input_and_lock():
         replies, _ = send(srv, "add", evil)
         check(not calls and "Invalid player name" in replies[-1],
               f"refused: {evil!r}")
+    def line(calls):
+        return " ".join(["allowlist"] + calls[0][1]) if calls else None
+
     srv, calls = _server()
     send(srv, "add", "Lean", "Beetle_24102")
-    check(calls == [("allowlist", ["add", "Lean", "Beetle_24102"])],
-          "a gamertag with a space (two words) is sent")
+    check(line(calls) == 'allowlist add "Lean Beetle_24102"',
+          f"a gamertag with a space is sent quoted, as BDS needs ({line(calls)})")
+    srv, calls = _server()
+    send(srv, "add", '"Lean', 'Beetle_24102"')
+    check(line(calls) == 'allowlist add "Lean Beetle_24102"',
+          "...also when the user typed the quotes themselves")
+    srv, calls = _server()
+    send(srv, "remove", "Steve_1")
+    check(line(calls) == "allowlist remove Steve_1",
+          "a one-word name is sent as-is")
+    srv, calls = _server()
+    replies, _ = send(srv, "add", "Lean", '$(id)')
+    check(not calls and "Invalid player name" in replies[-1],
+          "a shell metacharacter in any word is refused")
+    srv, calls = _server()
+    replies, _ = send(srv, "add", "x" * 33)
+    check(not calls and "Invalid player name" in replies[-1],
+          "an over-long name is refused")
     srv, calls = _server()
     replies, _ = send(srv, "list", "extra")
     check(not calls and "takes no player name" in replies[-1],
@@ -514,6 +533,20 @@ def test_restore_player_pin():
         check(restored and restored[0]["timestamp"] == "2026-11-17 17:00:00",
               "still found after a chain rollover relabels it")
 
+        # A live Java player file is rewritten in place (logout save): same
+        # path, new mtime. Restoring it now would restore unseen content.
+        restored.clear()
+        live = {"timestamp": "2026-11-17 12:00:00", "source": "live .dat_old",
+                "path": Path("/w/playerdata/u-1.dat_old"), "kind": "live",
+                "entry": None, "sort_key": 0}
+        versions[:] = [live]
+        send("Hongy1618")
+        send("Hongy1618", "1")
+        versions[:] = [dict(live, timestamp="2026-11-17 12:30:00")]
+        msg = send("Hongy1618", "1", "confirm")
+        check("no longer available" in msg and not restored,
+              "a live file that changed since it was listed is refused")
+
         restored.clear()
         send("Hongy1618")
         send("Hongy1618", "1")
@@ -548,6 +581,72 @@ def test_mods_save_failure_rolls_back():
                   f"/mods {args[0]}: in-memory grants unchanged")
     finally:
         cmds.save_auth = real
+
+
+def test_mods_publish_after_save():
+    print("/mods publishes a grant only once it's saved")
+    auth = make_auth()
+    b = make_bot(auth)
+    r = _Router()
+    cmds.register_commands(r, auth)
+    real = cmds.save_auth
+    seen = []
+
+    def spy(doc, path):
+        seen.append((is_moderator("telegram", MOD, auth),
+                     doc["bot"]["telegram"]["moderators"].get(MOD)))
+        return real(doc, path)
+    cmds.save_auth = spy
+    try:
+        c = ctx_for(ADMIN, args=["add", MOD, "a"])
+        c.bot = b
+        r.handlers["mods"](c)
+    finally:
+        cmds.save_auth = real
+    check(seen == [(False, ["a"])],
+          f"saved with the grant, but not live during the save ({seen})")
+    check(is_moderator("telegram", MOD, auth, "a"), "live once saved")
+
+
+def test_moderator_name_save_is_best_effort():
+    print("a moderator's name that can't be saved")
+    auth = make_auth({MOD: ["a"]})
+    b = make_bot(auth)
+    b.log = types.SimpleNamespace(exception=lambda *a, **k: None,
+                                  info=lambda *a, **k: None)
+    real = botmod.save_auth
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    botmod.save_auth = boom
+    try:
+        c = ctx_for(MOD)
+        c.sender_label = "NewName"
+        b.note_moderator_name(c)       # must not raise
+        check(True, "no exception reaches the command")
+        check("NewName" not in auth["telegram"]["moderator_names"].values(),
+              "the unsaved name is forgotten, so the next command retries")
+    except Exception as e:
+        check(False, f"no exception reaches the command ({e!r})")
+    finally:
+        botmod.save_auth = real
+
+
+def test_lifecycle_fail_fast():
+    print("restore/update don't queue behind /start holding backup_lock")
+    srv, _ = _server()
+    srv.lifecycle_lock.acquire()       # a /start relaunch in progress
+    said = []
+    check(not cmds._acquire_both(srv, said.append)
+          and not srv.backup_lock.locked() and "being started" in said[-1],
+          "refused at once, backup_lock left free for scheduled backups")
+    srv.lifecycle_lock.release()
+    check(cmds._acquire_both(srv, said.append)
+          and srv.backup_lock.locked() and srv.lifecycle_lock.locked(),
+          "both taken when free")
+    cmds._release_both(srv)
+    check(not srv.backup_lock.locked() and not srv.lifecycle_lock.locked(),
+          "both released")
 
 
 def test_admin_with_no_servers_up():

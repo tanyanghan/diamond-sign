@@ -538,9 +538,10 @@ commands stay Java-only (they scan log history, which Bedrock doesn't keep).
 back — `whitelist` on Java (via RCON) and `allowlist` on Bedrock (via tmux/screen,
 read back from `console.log`). Subcommands are identical on both: `on`, `off`,
 `add <player>`, `remove <player>`, `list`, `reload`. Player names may contain only
-letters, digits and `_` (a Bedrock gamertag with a space is typed as two words):
-on Bedrock the line is typed into the server's tmux/screen pane, so nothing a
-shell could interpret is accepted.
+letters, digits, `_` and single spaces — a Bedrock gamertag with a space can be
+typed with or without quotes, and the bot sends it quoted as BDS requires. On
+Bedrock the line is typed into the server's tmux/screen pane, so nothing a shell
+could interpret is accepted.
 
 ---
 
