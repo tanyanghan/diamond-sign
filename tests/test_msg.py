@@ -66,7 +66,7 @@ import core.commands as cmds
 import core.logparse as logparse
 import core.logwatch as logwatch
 import backends.bedrock as bedrock
-from backends.base import clean_chat_text
+from backends.base import clean_chat_name, clean_chat_text, has_visible_text
 from backends.bedrock import BedrockBackend
 from backends.java import JavaBackend
 from chat.base import CommandRouter
@@ -365,6 +365,74 @@ def test_lock_only_around_send():
         srv.lifecycle_lock.release()
     check(free, "a /start or /restore during the probe isn't refused")
     release.set()
+
+
+def test_visibility_and_names():
+    print("visible text and names")
+    for blank in ("\u3164", "\u115f", "\u2800", "\u034f", "\u0301", "\u200b\u200d",
+                  "\ufe0f", "  "):
+        check(not has_visible_text(blank), f"{blank!r} shows nothing")
+    for shown in ("a", "\u4e2d", "!", "\U0001f600", "\u0661"):
+        check(has_visible_text(shown), f"{shown!r} shows something")
+    check(clean_chat_name("Al\u200bice") == "Alice", "a zero-width space can't fake a name")
+    check(clean_chat_name("\u3164Bob\u2800") == "Bob", "blank-looking padding dropped")
+    check(clean_chat_text("a\u200eb\u200fc\u061cd") == "a b c d",
+          "LRM/RLM/ALM direction marks become spaces")
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+    check(clean_chat_text(family) == family, "...while messages keep ZWJ emoji")
+
+
+def test_trim_keeps_sequences_and_content():
+    print("trimming emoji sequences")
+    b = bedrock_backend()
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+    for n in range(1, 40):
+        _, sent, trimmed = b._fit_tellraw("n", "x" * n + family * 30)
+        body = sent[:-1] if trimmed else sent
+        if body and (body[-1] == "\u200d" or 0xfe00 <= ord(body[-1]) <= 0xfe0f):
+            check(False, "a cut never leaves a dangling ZWJ / variation selector")
+            break
+    else:
+        check(True, "a cut never leaves a dangling ZWJ / variation selector")
+    try:
+        b._fit_tellraw("n", "\u200b" * 400 + "a")
+        check(False, "a message whose only visible text was cut off is refused")
+    except ValueError:
+        check(True, "a message whose only visible text was cut off is refused")
+
+
+def test_cooldown_in_flight():
+    print("/msg cooldown while a send is in flight")
+    srv = make_server()
+    probing, release = threading.Event(), threading.Event()
+
+    def slow_probe():
+        probing.set()
+        release.wait(3)
+        return True
+    srv.backend.is_online = slow_probe
+    cmds._msg_last.clear()
+    h = msg_handler()
+    c1 = ctx_for("/msg first")
+    c1.server = srv
+    h(c1)
+    probing.wait(2)
+    c2 = ctx_for("/msg second")
+    c2.server = srv
+    h(c2)
+    check("wait a few seconds" in c2.replies[-1],
+          "a second /msg is refused while the first is still in flight")
+    release.set()
+    for _ in range(100):
+        if c1.sent:
+            break
+        time.sleep(0.02)
+    check(srv.backend.told == [("u300", "first")], "the first is sent")
+    c3 = ctx_for("/msg third")
+    c3.server = srv
+    h(c3)
+    check("wait a few seconds" in c3.replies[-1],
+          "after a send, the 5 s cooldown applies")
 
 
 def test_bedrock_concurrency_and_capture():

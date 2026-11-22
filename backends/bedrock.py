@@ -330,18 +330,19 @@ class BedrockBackend(ServerBackend):
         return ('tellraw @a {"rawtext":[{"text":"' + _rawtext_escape(text)
                 + '"}]}')
 
-    def tell_all(self, name: str, message: str, guard):
-        # Hold _capture_lock for the send, so the echo can't land between a
-        # `list` header and its names line (query_online_players) and be read
-        # as a player, and so concurrent /msgs are serialised. It is taken
-        # BEFORE the lifecycle guard: /msg never holds a lifecycle lock while
-        # waiting out another (possibly another server's) capture. Elsewhere
-        # the order is lifecycle -> capture (/start, /allowlist, restore);
-        # that's safe because the guard here is taken without waiting.
-        # (Not inside send_command: _capture_raw calls that while holding this
-        # non-reentrant lock.)
+    def _send_guarded(self, line: str, guard) -> bool:
+        # Hold _capture_lock for the send (the line is already fitted -- that
+        # work stays outside this lock, which every Bedrock server shares), so
+        # the echo can't land between a `list` header and its names line
+        # (query_online_players) and be read as a player, and so concurrent
+        # /msgs are serialised. It is taken BEFORE the lifecycle guard: /msg
+        # never holds a lifecycle lock while waiting out another (possibly
+        # another server's) capture. Elsewhere the order is lifecycle ->
+        # capture (/start, /allowlist, restore); that's safe because the guard
+        # here is taken without waiting. (Not inside send_command: _capture_raw
+        # calls that while holding this non-reentrant lock.)
         with _capture_lock:
-            return super().tell_all(name, message, guard)
+            return super()._send_guarded(line, guard)
 
     def _capture_raw(self, full_cmd: str, timeout: float = 3.0) -> str:
         """Send a command and return the RAW console.log output it produced.

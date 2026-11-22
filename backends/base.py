@@ -63,7 +63,8 @@ MSG_PREFIX = "<ethereal voice>"
 
 # Bidi embedding/override/isolate controls: they can make a line read
 # differently from what it says (U+202A-202E, U+2066-2069).
-_BIDI_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+_BIDI_CONTROLS = (frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+                  | {0x200E, 0x200F, 0x061C})  # + LRM, RLM, ALM
 
 
 def clean_chat_text(text: str) -> str:
@@ -86,6 +87,38 @@ def clean_chat_text(text: str) -> str:
             continue
         out.append(" " if cat == "Cc" or ord(ch) in _BIDI_CONTROLS else ch)
     return " ".join("".join(out).split())
+
+
+# Characters that render as nothing (or a blank) although their category says
+# letter/symbol/mark: Hangul fillers, the braille blank, the combining
+# grapheme joiner, Khmer inherent vowels.
+_BLANK_LOOKING = frozenset({0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x034F,
+                            0x17B4, 0x17B5})
+
+
+def has_visible_text(text: str) -> bool:
+    """True if ``text`` would show something: at least one letter, number,
+    punctuation or symbol that isn't one of the blank-looking ones. (Marks,
+    format characters and separators alone show nothing.)"""
+    return any(unicodedata.category(c)[0] in "LNPS"
+               and ord(c) not in _BLANK_LOOKING for c in text)
+
+
+def clean_chat_name(name: str) -> str:
+    """``clean_chat_text`` for a sender name, stricter: also drop every format
+    character and blank-looking character, so "Al<ZWSP>ice" shows as "Alice"
+    rather than as a look-alike of someone else's name."""
+    kept = "".join(c for c in clean_chat_text(name)
+                   if unicodedata.category(c) != "Cf"
+                   and ord(c) not in _BLANK_LOOKING)
+    return " ".join(kept.split())
+
+
+# Trailing pieces of an emoji sequence that a cut can leave dangling: ZWJ,
+# variation selectors, tag characters.
+def _dangling(c: str) -> bool:
+    cp = ord(c)
+    return (cp == 0x200D or 0xFE00 <= cp <= 0xFE0F or 0xE0000 <= cp <= 0xE007F)
 
 
 class ServerBackend(ABC):
@@ -244,24 +277,39 @@ class ServerBackend(ABC):
         the send. Returns None if ``guard`` was busy (nothing sent), else
         ``(sent_text, trimmed)`` -- the message is shortened, never the
         encoded line cut, to fit ``MSG_LINE_LIMIT``."""
+        # Fitting can take a while (re-encoding per dropped character), so
+        # it's done before any lock is taken.
         line, sent, trimmed = self._fit_tellraw(name, message)
-        if not guard.acquire(blocking=False):
+        if not self._send_guarded(line, guard):
             return None
+        return sent, trimmed
+
+    def _send_guarded(self, line: str, guard) -> bool:
+        """Send ``line`` holding ``guard`` (taken without waiting); False if
+        it was busy and nothing was sent."""
+        if not guard.acquire(blocking=False):
+            return False
         try:
             self.send_command(line)
         finally:
             guard.release()
-        return sent, trimmed
+        return True
 
     def _fit_tellraw(self, name: str, message: str):
         text = message[:self._MSG_MAX_INPUT]
         trimmed = len(text) < len(message)
         line = self._tellraw_line(name, text + ("…" if trimmed else ""))
         while len(line.encode("utf-8")) > self.MSG_LINE_LIMIT and text:
-            # Drop whole characters (an emoji stays whole), then re-encode.
-            text = text[:-1].rstrip()
+            # Drop a whole code point (never half an escape or surrogate
+            # pair), plus any ZWJ / variation selector / tag it leaves
+            # dangling, then re-encode.
+            text = text[:-1]
+            while text and (_dangling(text[-1]) or text[-1].isspace()):
+                text = text[:-1]
             trimmed = True
             line = self._tellraw_line(name, text + "…")
+        if trimmed and not has_visible_text(text):
+            raise ValueError("nothing visible is left after shortening")
         if len(line.encode("utf-8")) > self.MSG_LINE_LIMIT:
             # Only a name too long to leave room for any text gets here (/msg
             # caps names at 32 characters, which always fits).

@@ -15,12 +15,11 @@ import re
 import tempfile
 import threading
 import time
-import unicodedata
 from datetime import datetime
 from pathlib import Path
 
 from backends import CAP_PLAYER_RESTORE, CAP_STATS, EVENT_DEATH, EVENT_ACHIEVEMENT
-from backends.base import clean_chat_text
+from backends.base import clean_chat_name, clean_chat_text, has_visible_text
 from utils import restore_core
 from core import updates
 from core.auth import (
@@ -376,13 +375,6 @@ def _claim_pending(store: dict, lock, pkey: str, entry: dict, **expect) -> bool:
             return False
         store.pop(pkey)
         return True
-
-
-def _has_visible(text: str) -> bool:
-    """True if ``text`` shows anything: clean_chat_text keeps format
-    characters (ZWJ etc.), so a name or message of only those would pass an
-    emptiness check yet display as nothing."""
-    return any(not unicodedata.category(c).startswith(("C", "Z")) for c in text)
 
 
 # /msg: one message per user per _MSG_COOLDOWN seconds, so a group can't flood
@@ -1322,7 +1314,7 @@ def register_commands(router, auth: dict) -> None:
         if ctx.platform == "slack":
             text = html.unescape(text)  # Slack sends & < > as entities
         text = clean_chat_text(text)
-        if not _has_visible(text):
+        if not has_visible_text(text):
             ctx.reply(f"Usage: {label} <message> — shows it to everyone in "
                       f"game on {server.config.name}.")
             return
@@ -1333,18 +1325,22 @@ def register_commands(router, auth: dict) -> None:
             if last is not None and now - last < _MSG_COOLDOWN:
                 ctx.reply("Please wait a few seconds between messages.")
                 return
-            _msg_last[key] = now
-        name = clean_chat_text(str(ctx.sender_label).lstrip("@"))[:32].strip()
-        if not _has_visible(name):
+            # In flight until the worker finishes (inf never ages out), so a
+            # slow send can't let the same user's next message through early.
+            _msg_last[key] = float("inf")
+        name = clean_chat_name(str(ctx.sender_label).lstrip("@"))[:32].strip()
+        if not has_visible_text(name):
             name = str(ctx.user_id)
         _cmd_log(ctx, "Msg")
 
-        def give_back_slot():
-            # A refused or failed send shouldn't count against the cooldown
-            # ("try again" must mean now) -- unless a newer /msg took it since.
+        def finish(stamp):
+            # stamp=None: refused or failed -- give the slot back, "try again"
+            # must mean now. Otherwise the cooldown runs from ``stamp``.
             with _msg_last_lock:
-                if _msg_last.get(key) == now:
+                if stamp is None:
                     _msg_last.pop(key, None)
+                else:
+                    _msg_last[key] = stamp
 
         def run():
             backend = server.backend
@@ -1353,22 +1349,22 @@ def register_commands(router, auth: dict) -> None:
                 # tell_all takes the lock only around the send. An offline
                 # reply keeps the cooldown: it still typed a probe into the pane.
                 if not backend.is_online():
+                    finish(now)
                     ctx.adapter.send(ctx.chat_id, f"\u26a0\ufe0f {server.config.name} "
                                      "is offline — the message wasn't sent.")
                     return
                 result = backend.tell_all(name, text, server.lifecycle_lock)
             except Exception as e:
-                give_back_slot()
+                finish(None)
                 server.log.exception("Msg failed")
                 ctx.adapter.send(ctx.chat_id, f"Couldn't send the message: {e}")
                 return
             if result is None:
-                give_back_slot()
+                finish(None)
                 ctx.adapter.send(ctx.chat_id, "A restore, update or start is "
                                  "running — try again once it's finished.")
                 return
-            with _msg_last_lock:  # spacing counts from the actual send
-                _msg_last[key] = time.monotonic()
+            finish(time.monotonic())  # spacing counts from the actual send
             sent, trimmed = result
             server.log.info("Msg: [%s] (%s) on [%s] -> %s: %s",
                             clean_chat_text(ctx.sender_label), ctx.user_id,
